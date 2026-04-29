@@ -283,12 +283,15 @@ BEGIN {
                 eg_s = sprintf("%7d", ts_ar_eg[ts])
                 in_s = sprintf("%7d", ts_ar_in[ts])
                 dir_s = ts_ar_dir[ts]
+                # Show Dir: ▲/▼ at probe, O if probe but no change, - otherwise
+                if (dir_s == "." || dir_s == "") show_dir = "O";
+                else show_dir = dir_s;
             } else {
-                # Use last known autorate value (hold previous)
-                eg_s = last_eg_s; in_s = last_in_s; dir_s = last_dir_s
+                # Use last known autorate value (hold previous), but Dir is always '-'
+                eg_s = last_eg_s; in_s = last_in_s; show_dir = "-"
             }
             last_eg_s = eg_s; last_in_s = in_s; last_dir_s = dir_s
-            printf "%-8s │ %s %s │ %s │ %s %s │ %s\n", ts, dl_s, ul_s, rtt_s, eg_s, in_s, dir_s
+            printf "%-8s │ %s %s │ %s │ %s %s │ %s\n", ts, dl_s, ul_s, rtt_s, eg_s, in_s, show_dir
         } else {
             printf "%-8s │ %s %s │ %s\n", ts, dl_s, ul_s, rtt_s
         }
