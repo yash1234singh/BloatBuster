@@ -9,6 +9,7 @@ Three scripts for detecting, mitigating, and benchmarking bufferbloat on Linux n
 | **bufferManager.sh** | Apply/remove traffic shaping strategies (CAKE, HTB, fq_codel) and TCP tuning (BBR, ECN) | `tc`, `ip`, `sysctl`, `jq`, root |
 | **bufferTest.sh** | Measure bufferbloat via per-hop traceroute + iperf3 stress testing | `iperf3`, `traceroute`, `jq`, iperf3 server |
 | **bufferScenarioTest.sh** | Orchestrate A/B comparisons: apply strategy → run test → record results → compare | Both scripts above, `jq`, `bc` |
+| **bloatChart.sh** | ASCII time-series chart: overlay throughput, RTT, and autorate limits | `jq`, `awk` (runs automatically or standalone) |
 
 All scripts read their configuration from a single **`config.json`** file (requires `jq`).
 
@@ -548,6 +549,106 @@ scenario_logs/
 | **Latency measurement** | `traceroute` (ICMP) | Per-hop latency at 1-second intervals |
 | **Throughput stress** | `iperf3` (TCP/UDP) | Saturate the link for bloat detection |
 | **Rate adaptation** | ICMP ping + linear interpolation | RTT-driven CAKE bandwidth adjustment |
+| **Visualization** | `bloatChart.sh` (AWK + ASCII) | Time-series overlay of throughput, RTT, rate limits |
+
+---
+
+## bloatChart.sh
+
+ASCII time-series overlay chart showing iperf throughput, RTT, and autorate adjustments on a unified timeline. Runs automatically at the end of `bufferTest.sh` or standalone.
+
+### What It Shows
+
+Three data series aligned by time (1-second intervals):
+1. **iperf3 throughput** — DL (▓) and UL (░) in Mbps
+2. **End-to-end RTT** — latency in ms (●) from traceroute probes
+3. **Autorate limits** — egress (E) and ingress (I) rate caps applied by CAKE, with direction indicators (▲ increasing, ▼ decreasing, . stable)
+
+### Sample Output
+
+```
+════════════════════════════════════════════════════════════════════════════════
+             TIME-SERIES DATA (1-second intervals)
+════════════════════════════════════════════════════════════════════════════════
+Time     │ DL Mbps UL Mbps │  RTT ms │ Eg mbit In mbit │ Dir
+─────────┼─────────────────┼─────────┼─────────────────┼────
+10:30:01 │    4.82    2.10 │    62.0 │      10      25 │ .
+10:30:02 │    4.91    2.15 │    85.0 │      10      25 │ .
+10:30:03 │    3.20    1.95 │   142.0 │       9      23 │ ▼
+10:30:04 │    4.10    2.01 │   110.0 │       8      21 │ ▼
+10:30:05 │    4.65    2.08 │    75.0 │       9      23 │ ▲
+...
+
+════════════════════════════════════════════════════════════════════════════════
+             ASCII CHART: Throughput (DL ▓, UL ░) + RTT (●)
+════════════════════════════════════════════════════════════════════════════════
+  Y-axis left: Throughput (0-7 Mbps)   Y-axis right: RTT (0-500 ms)
+
+   7.0│ ▓                         ●                          │  500
+   6.0│ ▓▓   ▓                  ●   ●                       │  428
+   5.0│ ▓▓▓▓▓▓▓▓▓  ▓▓▓▓       ●       ●     ▓▓▓▓▓▓        │  357
+   4.0│ ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓  ●          ● ▓▓▓▓▓▓▓▓▓▓▓▓    │  285
+   3.0│ ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓●▓▓▓▓▓▓▓▓▓▓▓●▓▓▓▓▓▓▓▓▓▓▓▓▓▓  │  214
+   2.0│ ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  │  142
+   1.0│ ░░░░░░░░░░░░░░░░░─────────────────────░░░░░░░░░░░░  │   71
+   0.0│ ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  │    0
+      └────────────────────────────────────────────────────  ┘
+       10:30:01    10:30:50    10:31:40    10:32:30    10:33:20
+
+  Legend: ▓ DL Mbps   ░ UL Mbps   ● RTT (ms)   ─ Egress Rate Limit
+
+════════════════════════════════════════════════════════════════════════════════
+             ASCII CHART: Autorate Adjustment
+════════════════════════════════════════════════════════════════════════════════
+  Egress (E) and Ingress (I) rate limits over time.
+  Range: 0-25 mbit   Direction: ▲=increase ▼=decrease .=stable
+
+   25 │ IIIIIIIIIIIIIIIIII            IIIIIIIIIIIII
+   20 │                   III     IIII
+   15 │                      IIIII
+   10 │ EEEEEEEEEEEEEEEEEEE         EEEEEEEEEEEEEEE
+    7 │                    EEE   EEEE
+    5 │                       EEE
+    0 │
+      └──────────────────────────────────────────────
+       ..........▼▼▼▼▼▼....▲▲▲▲▲▲▲......▼▼▼.▲▲...  ← Direction
+
+  Legend: E=Egress rate  I=Ingress rate  ▲▼.=Direction
+```
+
+### Usage
+
+```bash
+# Runs automatically at the end of bufferTest.sh
+
+# Or run standalone after a test
+./bloatChart.sh
+
+# Custom files and dimensions
+./bloatChart.sh -r my_results.log -a autorate.log -w 120 -H 25
+
+# Without autorate (just throughput + RTT)
+./bloatChart.sh -r bloat_results.log -d iperf_tcp_downlink.log -u iperf_tcp_uplink.log
+```
+
+### Options
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `-r FILE` | RTT/latency CSV log | `bloat_results.log` |
+| `-d FILE` | iperf3 downlink log | `iperf_<type>_downlink.log` |
+| `-u FILE` | iperf3 uplink log | `iperf_<type>_uplink.log` |
+| `-a FILE` | Autorate log (optional) | `autorate.log` |
+| `-w WIDTH` | Chart width in columns | `80` |
+| `-H HEIGHT` | Chart height in rows | `20` |
+| `-h` | Help | — |
+
+### How It Helps
+
+- **Correlate RTT spikes with throughput drops** — see exactly when bloat causes performance degradation
+- **Verify autorate is responding** — watch rate limits decrease as RTT rises, and recover when RTT drops
+- **Identify oscillation** — rapid ▲▼▲▼ patterns indicate dampen_pct is too high or probe interval too short
+- **Compare baseline vs stress visually** — flat RTT in baseline, spikes under load = classic bufferbloat
 
 ---
 
@@ -582,6 +683,94 @@ Use `bufferScenarioTest.sh` to quantify the impact of different strategies on yo
 # "Is CAKE actually helping on my link?"
 ./bufferScenarioTest.sh -r 5 -s "baseline:remove;cake:tune,cake-bidir"
 ```
+
+---
+
+## Comparison with Other Bufferbloat Tools
+
+### Why BloatBuster vs Flent / betterspeedtest / web tests?
+
+Most existing bufferbloat tools (Flent, netperfrunner, web tests) tell you **"you have bloat"** but don't tell you **where in the network path** the bloat occurs. BloatBuster's per-hop traceroute under load pinpoints the exact link (hop) that's buffering — so you know whether the problem is your router, your ISP's DSLAM, or a backhaul node.
+
+Additionally, Flent and netperf-based tools require **both a client and a dedicated server** (netperf/iperf running on both ends). BloatBuster only needs a standard iperf3 server on the remote end — no custom daemon, no Flent installation on the server, no coordination. You can point it at any existing iperf3 endpoint.
+
+### Where in the Network You See Bloat
+
+BloatBuster's per-hop analysis shows **incremental delay per link segment**:
+
+```
+Hop  Segment                     Link Base    Link P95     Bloat
+--------------------------------------------------------------------
+2    (source) -> 10.1.2.1        17.30        491.37       474.07  ← YOUR UPLINK BUFFER
+3    10.1.2.1 -> 10.1.3.1         0.88         23.51        22.63  ← ISP backhaul
+4    10.1.3.1 -> 10.1.2.1         0.79         21.38        20.59  ← Core network
+```
+
+- **Hop 2 has 474ms of bloat** → the modem/router uplink FIFO is the problem
+- **Hops 3-4 have minimal bloat** → ISP core is fine
+- Other tools only show end-to-end latency and can't distinguish where the queue is
+
+### Detailed Comparison Table
+
+| Feature | BloatBuster | Flent (RRUL) | betterspeedtest.sh | Web Tests (Waveform/Cloudflare) |
+|---------|-------------|--------------|--------------------|---------------------------------|
+| **Measures bloat location (per-hop)** | Yes — traceroute under load | No — end-to-end only | No — end-to-end only | No — end-to-end only |
+| **Server requirement** | iperf3 server only | netperf server + Flent install | netperf server | None (uses CDN) |
+| **Client-only operation** | Yes (just needs iperf3 server) | No (Flent needed on both ends) | Yes (needs netperf server) | Yes |
+| **Identifies bloating hop** | Yes — ranked by severity | No | No | No |
+| **Simultaneous DL + UL stress** | Yes (TCP/UDP, configurable streams) | Yes (RRUL: 4 up + 4 down) | Yes (sequential, not simultaneous) | Varies by test |
+| **Latency measurement method** | ICMP traceroute per-hop | ICMP/UDP ping (end-to-end) | ICMP ping (end-to-end) | Proprietary |
+| **Built-in traffic shaping** | Yes — CAKE/HTB/fq_codel + autorate | No (measurement only) | No (measurement only) | No |
+| **Adaptive rate control** | Yes — RTT-based live CAKE adjustment | No | No | No |
+| **A/B scenario comparison** | Yes — automated multi-strategy benchmark | Manual (re-run + compare plots) | No | No |
+| **Graphical output** | ASCII diagrams + tables | Yes — matplotlib plots | Text summary | Web UI |
+| **Repeatability / scripted runs** | Yes — automated N-run averaging | Yes — repeatable via CLI | Partially | No |
+| **Protocol support** | TCP + UDP (configurable) | TCP (netperf) | TCP (netperf) | HTTP/HTTPS |
+| **High bandwidth (>1Gbps)** | Depends on iperf3 | Yes (tested to 40GigE) | Limited | No |
+| **Dependencies** | iperf3, traceroute, jq, tc | Flent, netperf, matplotlib, Python | netperf | Browser |
+| **Works on embedded/router** | Yes (bash + basic tools) | No (Python + heavy deps) | Yes | No |
+| **Centralized config** | Yes — config.json for all scripts | No (CLI flags per run) | No (hardcoded) | N/A |
+| **ECN / qdisc counter tracking** | Yes — per-test delta analysis | No | No | No |
+
+### BloatBuster Advantages
+
+1. **Per-hop bloat localization** — The key differentiator. Traceroute under load reveals which specific link in the path is bloated. Other tools only give you a single end-to-end latency number.
+
+2. **Client-side only** — No Flent/netperf installation on the server. Any iperf3 endpoint works (even public ones).
+
+3. **Integrated shaping + measurement** — Test, shape, re-test in one workflow. Flent measures but doesn't fix; you need separate SQM/CAKE setup.
+
+4. **Adaptive rate control (autorate)** — Continuous RTT-based bandwidth adjustment for variable links (LTE/5G). Similar to [cake-autorate](https://github.com/lynxthecat/cake-autorate) but integrated into the test/shape workflow.
+
+5. **Automated A/B benchmarking** — `bufferScenarioTest.sh` runs N strategies × M repetitions and produces a comparison table. Flent requires manual re-runs and eyeballing plots.
+
+6. **Lightweight / embeddable** — Pure bash + standard Linux tools. Runs on routers, embedded devices, containers. Flent needs Python 3, matplotlib, and netperf compiled on both ends.
+
+7. **Qdisc counter analysis** — Tracks dropped/overlimit/ECN-marked packets per test run to understand AQM behavior, not just throughput/latency.
+
+### What Flent Does Better (gaps to consider)
+
+| Flent Strength | BloatBuster Gap | Potential Improvement |
+|----------------|-----------------|----------------------|
+| Beautiful matplotlib graphs (time-series) | ASCII tables only | Add CSV export for external plotting (gnuplot/grafana) |
+| RRUL test is an industry standard benchmark | Custom test, not directly comparable | Document methodology for reproducibility |
+| Tested to 40GigE | Limited by iperf3 single-stream performance | Use DPDK or other ways to flood network |
+| CDF/percentile plots over time | Summary statistics only | Add time-series CSV logging per interval |
+| Metadata (kernel version, qdisc, etc.) in output | Not captured automatically | Add system info capture to logs |
+| Large community + academic citations | New project | Publish methodology, invite comparison |
+
+### When to Use What
+
+| Scenario | Recommended Tool |
+|----------|-----------------|
+| "Where in my network is the bloat?" | **BloatBuster** |
+| Quick letter-grade check | Web test (Waveform) |
+| Academic/publishable benchmark | Flent (RRUL) |
+| Apply + test shaping in one workflow | **BloatBuster** |
+| Router/embedded device (no Python) | **BloatBuster** |
+| 10-40GigE data center testing | Flent |
+| LTE/5G with variable bandwidth | **BloatBuster** (autorate) |
+| Pretty graphs for a presentation | Flent |
 
 ---
 

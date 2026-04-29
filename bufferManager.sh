@@ -254,6 +254,10 @@ autorate() {
     [ "$min_eg" -lt 1 ] && min_eg=1
     [ "$min_in" -lt 1 ] && min_in=1
 
+    # Autorate log file (CSV for chart overlay)
+    AUTORATE_LOG="${AUTORATE_LOG:-$SCRIPT_DIR/autorate.log}"
+    echo "Timestamp,RTT_ms,Egress_mbit,Ingress_mbit,Direction" > "$AUTORATE_LOG"
+
     # Start at MAX rates
     EGRESS_RATE="${max_eg}mbit"
     INGRESS_RATE="${max_in}mbit"
@@ -261,7 +265,8 @@ autorate() {
     echo -e "${B}[Autorate]${N} Probing $gw  baseline=${BASELINE_RTT}ms  max=${MAX_RTT}ms  dampen=${DAMPEN_PCT}%"
     echo -e "  Egress:  ${min_eg}-${max_eg}mbit"
     echo -e "  Ingress: ${min_in}-${max_in}mbit"
-    echo -e "  Probe every ${AUTORATE_INTERVAL}s — Ctrl+C to stop\n"
+    echo -e "  Probe every ${AUTORATE_INTERVAL}s — Ctrl+C to stop"
+    echo -e "  Logging to: $AUTORATE_LOG\n"
 
     local cur_eg=$max_eg cur_in=$max_in
 
@@ -327,6 +332,7 @@ autorate() {
 
         printf "  RTT: %4dms  %s  egress: %dmbit  ingress: %dmbit\n" \
             "$rtt" "${changed:-.}" "$cur_eg" "$cur_in"
+        echo "$(date +%H:%M:%S),$rtt,$cur_eg,$cur_in,${changed:-.}" >> "$AUTORATE_LOG"
         sleep "$AUTORATE_INTERVAL"
     done
 }

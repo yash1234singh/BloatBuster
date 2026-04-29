@@ -612,3 +612,21 @@ done
 if [[ "$IPERF_HAS_DATA" != true ]]; then
     echo "  No iperf3 throughput data found. Ensure ENABLE_STRESS=true and iperf3 server is reachable."
 fi
+
+# ==============================================================================
+# ASCII TIME-SERIES CHART (overlay)
+# ==============================================================================
+CHART_SCRIPT="$SCRIPT_DIR/bloatChart.sh"
+if [ -x "$CHART_SCRIPT" ]; then
+    echo ""
+    "$CHART_SCRIPT" -r "$MAIN_LOG" \
+        -d "iperf_${STRESS_TYPE}_downlink.log" \
+        -u "iperf_${STRESS_TYPE}_uplink.log" \
+        -a "${AUTORATE_LOG:-autorate.log}"
+elif [ -f "$CHART_SCRIPT" ]; then
+    echo ""
+    bash "$CHART_SCRIPT" -r "$MAIN_LOG" \
+        -d "iperf_${STRESS_TYPE}_downlink.log" \
+        -u "iperf_${STRESS_TYPE}_uplink.log" \
+        -a "${AUTORATE_LOG:-autorate.log}"
+fi
