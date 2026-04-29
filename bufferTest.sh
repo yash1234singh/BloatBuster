@@ -1,66 +1,127 @@
 #!/bin/bash
 
-# ==============================================================================
-# CONFIG PROFILES — select active profile with USE_CONFIG
-# ==============================================================================
-USE_CONFIG="config1"          # "config1" or "config2"
+# ══════════════════════════════════════════════════════════════════════════════
+# LOAD CONFIG FROM config.json (requires jq)
+# ══════════════════════════════════════════════════════════════════════════════
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+CONFIG_FILE="${CONFIG_FILE:-$SCRIPT_DIR/config.json}"
 
-# --- config1: LTE / low-bandwidth link ---
-config1() {
-    TARGET="10.1.2.3"        # Remote Server IP
-    BIND_IP="10.2.2.1"         # Local Interface IP
-    UDP_BW_DL="15M"              # Downlink Bandwidth (-b)
-    UDP_BW_UL="5M"               # Uplink Bandwidth (-b)
-}
+if [ ! -f "$CONFIG_FILE" ]; then
+    echo "ERROR: config.json not found at $CONFIG_FILE" >&2
+    exit 1
+fi
+if ! command -v jq &>/dev/null; then
+    echo "ERROR: jq is required but not installed. Install with: apt install jq" >&2
+    exit 1
+fi
 
-# --- config2: 5G / higher-bandwidth link ---
-config2() {
-    TARGET="10.1.2.4"        # Remote Server IP
-    BIND_IP="10.3.3.1"        # Local Interface IP
-    UDP_BW_DL="65M"              # Downlink Bandwidth (-b)
-    UDP_BW_UL="15M"              # Uplink Bandwidth (-b)
-}
+# Read active profile
+ACTIVE_PROFILE=$(jq -r '.active_profile' "$CONFIG_FILE")
+PROFILE=".profiles.$ACTIVE_PROFILE.test"
 
-# Load selected config
-$USE_CONFIG
+# --- Profile-specific settings ---
+TARGET=$(jq -r "$PROFILE.target" "$CONFIG_FILE")
+BIND_IP=$(jq -r "$PROFILE.bind_ip" "$CONFIG_FILE")
+UDP_BW_DL=$(jq -r "$PROFILE.udp_bw_dl" "$CONFIG_FILE")
+UDP_BW_UL=$(jq -r "$PROFILE.udp_bw_ul" "$CONFIG_FILE")
 
-# ==============================================================================
-# 1. GENERAL CONFIGURATION (Network & Path)
-# ==============================================================================
-BASELINE_SEC=30             # Phase 1 Duration (Seconds)
-STRESS_SEC=200              # Phase 2 Duration (Seconds)
-POLL_INTERVAL=1             # Traceroute frequency (Seconds)
-TIMEOUT=2                   # Traceroute wait time (Seconds)
+# --- General configuration ---
+BASELINE_SEC=$(jq -r '.test.general.baseline_sec' "$CONFIG_FILE")
+STRESS_SEC=$(jq -r '.test.general.stress_sec' "$CONFIG_FILE")
+POLL_INTERVAL=$(jq -r '.test.general.poll_interval' "$CONFIG_FILE")
+TIMEOUT=$(jq -r '.test.general.timeout' "$CONFIG_FILE")
 
-# ==============================================================================
-# 2. LOGGING CONFIGURATION
-# ==============================================================================
-MAIN_LOG="bloat_results.log"
-STRESS_TYPE="tcp"           # Options: "udp" or "tcp"
+# --- Logging configuration ---
+MAIN_LOG=$(jq -r '.test.logging.main_log' "$CONFIG_FILE")
+STRESS_TYPE=$(jq -r '.test.logging.stress_type' "$CONFIG_FILE")
 IPERF_LOG_DL="iperf_${STRESS_TYPE}_downlink.log"
 IPERF_LOG_UL="iperf_${STRESS_TYPE}_uplink.log"
 
-# ==============================================================================
-# 3. IPERF COMMON SETTINGS (Irrespective of Protocol)
-# ==============================================================================
-ENABLE_STRESS=true          # true = Run iperf3, false = Monitor only
-REPORT_INT=1                # iperf report interval (-i)
-SHOW_DIAGRAM=true           # true = Show ASCII network diagram
+# --- iperf common settings ---
+ENABLE_STRESS=$(jq -r '.test.iperf_common.enable_stress' "$CONFIG_FILE")
+REPORT_INT=$(jq -r '.test.iperf_common.report_interval' "$CONFIG_FILE")
+SHOW_DIAGRAM=$(jq -r '.test.iperf_common.show_diagram' "$CONFIG_FILE")
 
-# ==============================================================================
-# 4. IPERF UDP SPECIFIC SETTINGS (ports only — bandwidth set in config profile)
-# ==============================================================================
-UDP_PORT_DL=5991            # Downlink Port (Server -> Client)
-UDP_PORT_UL=5992            # Uplink Port (Client -> Server)
-UDP_PARALLEL=1              # Parallel streams per UDP session (-P)
+# --- UDP settings ---
+UDP_PORT_DL=$(jq -r '.test.udp.port_dl' "$CONFIG_FILE")
+UDP_PORT_UL=$(jq -r '.test.udp.port_ul' "$CONFIG_FILE")
+UDP_PARALLEL=$(jq -r '.test.udp.parallel' "$CONFIG_FILE")
 
-# ==============================================================================
-# 5. IPERF TCP SPECIFIC SETTINGS
-# ==============================================================================
-TCP_PORT_DL=5991            # Downlink Port
-TCP_PORT_UL=5992            # Uplink Port
-TCP_PARALLEL=4              # Parallel streams per TCP session (-P)
-# ==============================================================================
+# --- TCP settings ---
+TCP_PORT_DL=$(jq -r '.test.tcp.port_dl' "$CONFIG_FILE")
+TCP_PORT_UL=$(jq -r '.test.tcp.port_ul' "$CONFIG_FILE")
+TCP_PARALLEL=$(jq -r '.test.tcp.parallel' "$CONFIG_FILE")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# USAGE / HELP
+# ══════════════════════════════════════════════════════════════════════════════
+usage() {
+    cat <<EOF
+Usage: $0 [-h]
+
+Two-phase bufferbloat measurement: traceroute latency at idle (baseline) and
+under iperf3 load (stress). Can run independently or via bufferScenarioTest.sh.
+
+Options:
+  -h    Show this help and exit
+
+Prerequisites:
+  - jq, iperf3, traceroute installed
+  - iperf3 server running on the remote target host
+    (e.g., iperf3 -s -p 5991 && iperf3 -s -p 5992)
+  - iperf3 3.9+ recommended (for --timestamps)
+
+Configuration (config.json):
+  All settings are read from config.json (or CONFIG_FILE env var).
+
+  active_profile                  Which profile to load (config1/config2)
+
+  profiles.<name>.test:
+    target                        Remote iperf3 server IP
+    bind_ip                       Local interface IP to bind
+    udp_bw_dl                     UDP downlink bandwidth (e.g. "15M")
+    udp_bw_ul                     UDP uplink bandwidth (e.g. "5M")
+
+  test.general:
+    baseline_sec                  Phase 1 duration in seconds (default: 30)
+    stress_sec                    Phase 2 duration in seconds (default: 200)
+    poll_interval                 Traceroute frequency in seconds (default: 1)
+    timeout                       Traceroute wait time in seconds (default: 2)
+
+  test.logging:
+    main_log                      Output CSV filename (default: bloat_results.log)
+    stress_type                   "tcp" or "udp"
+
+  test.iperf_common:
+    enable_stress                 true = run iperf3, false = monitor-only
+    report_interval               iperf3 -i interval (default: 1)
+    show_diagram                  true = show ASCII network diagram
+
+  test.udp:
+    port_dl / port_ul             Server ports for UDP DL/UL
+    parallel                      Parallel streams per UDP session
+
+  test.tcp:
+    port_dl / port_ul             Server ports for TCP DL/UL
+    parallel                      Parallel streams per TCP session
+
+Current config (profile: $ACTIVE_PROFILE):
+  TARGET=$TARGET  BIND_IP=$BIND_IP
+  STRESS_TYPE=$STRESS_TYPE  BASELINE=${BASELINE_SEC}s  STRESS=${STRESS_SEC}s
+  UDP_BW_DL=$UDP_BW_DL  UDP_BW_UL=$UDP_BW_UL
+  TCP_PARALLEL=$TCP_PARALLEL  UDP_PARALLEL=$UDP_PARALLEL
+
+Override config path:
+  CONFIG_FILE=/path/to/config.json $0
+
+Output files:
+  $MAIN_LOG (CSV), $IPERF_LOG_DL, $IPERF_LOG_UL
+EOF
+    exit 0
+}
+
+# Handle -h flag
+[[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && usage
 
 # --- SETUP ---
 WORK_DIR=$(mktemp -d "/tmp/bloat_XXXXXX")

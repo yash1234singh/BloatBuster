@@ -3,61 +3,54 @@
 # Rate-shape below bottleneck speed so queuing happens at YOUR smart qdisc
 # instead of at the upstream router's dumb FIFO.
 
-IFB_DEVICE="ifb0"
-
 # ══════════════════════════════════════════════════════════════════════════════
-# CONFIG PROFILES — edit values below, select active profile with USE_CONFIG
+# LOAD CONFIG FROM config.json (requires jq)
 # ══════════════════════════════════════════════════════════════════════════════
-USE_CONFIG="config1"          # "config1" or "config2"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+CONFIG_FILE="${CONFIG_FILE:-$SCRIPT_DIR/config.json}"
 
-# --- config1: LTE / low-bandwidth link ---
-config1() {
-    INTERFACE="eth1"              # Network interface to shape
-    MODE="adaptive"               # "static" = fixed rates, "adaptive" = RTT-based
-    # Static mode rates (used when MODE=static)
-    EGRESS_RATE="2mbit"           # Fixed upload shaping rate
-    INGRESS_RATE="5mbit"          # Fixed download shaping rate
-    # Adaptive mode rates (used when MODE=adaptive)
-    MAX_EGRESS="10mbit"           # Ceiling: max upload rate
-    MAX_INGRESS="25mbit"          # Ceiling: max download rate
-    MIN_EGRESS_PCT="2"            # Floor: min rate as % of MAX
-    MIN_INGRESS_PCT="5"           # Floor: min rate as % of MAX
-    BASELINE_RTT="60"             # Known good RTT in ms (no bloat)
-    MAX_RTT="150"                 # RTT at which rates hit the floor
-    AUTORATE_TARGET="10.1.2.3"  # Probe host (empty = auto-detect gateway)
-    AUTORATE_INTERVAL="5"         # Seconds between RTT probes
-    DAMPEN_PCT="10"               # Max rate change per step as % of current rate
-}
+if [ ! -f "$CONFIG_FILE" ]; then
+    echo "ERROR: config.json not found at $CONFIG_FILE" >&2
+    exit 1
+fi
+if ! command -v jq &>/dev/null; then
+    echo "ERROR: jq is required but not installed. Install with: apt install jq" >&2
+    exit 1
+fi
 
-# --- config2: 5G / higher-bandwidth link ---
-config2() {
-    INTERFACE="eth3"              # Network interface to shape
-    MODE="adaptive"               # "static" = fixed rates, "adaptive" = RTT-based
-    # Static mode rates (used when MODE=static)
-    EGRESS_RATE="3mbit"           # Fixed upload shaping rate
-    INGRESS_RATE="60mbit"         # Fixed download shaping rate
-    # Adaptive mode rates (used when MODE=adaptive)
-    MAX_EGRESS="15mbit"           # Ceiling: max upload rate
-    MAX_INGRESS="65mbit"          # Ceiling: max download rate
-    MIN_EGRESS_PCT="2"            # Floor: min rate as % of MAX
-    MIN_INGRESS_PCT="5"           # Floor: min rate as % of MAX
-    BASELINE_RTT="60"             # Known good RTT in ms (no bloat)
-    MAX_RTT="150"                 # RTT at which rates hit the floor
-    AUTORATE_TARGET="10.1.2.4"   # Probe host (empty = auto-detect gateway)
-    AUTORATE_INTERVAL="5"         # Seconds between RTT probes
-    DAMPEN_PCT="10"               # Max rate change per step as % of current rate
-}
+# Read active profile
+ACTIVE_PROFILE=$(jq -r '.active_profile' "$CONFIG_FILE")
+PROFILE=".profiles.$ACTIVE_PROFILE.manager"
 
-# Load selected config
-$USE_CONFIG
+# --- Device & profile settings ---
+IFB_DEVICE=$(jq -r '.ifb_device' "$CONFIG_FILE")
+INTERFACE=$(jq -r "$PROFILE.interface" "$CONFIG_FILE")
+MODE=$(jq -r "$PROFILE.mode" "$CONFIG_FILE")
+EGRESS_RATE=$(jq -r "$PROFILE.egress_rate" "$CONFIG_FILE")
+INGRESS_RATE=$(jq -r "$PROFILE.ingress_rate" "$CONFIG_FILE")
+MAX_EGRESS=$(jq -r "$PROFILE.max_egress" "$CONFIG_FILE")
+MAX_INGRESS=$(jq -r "$PROFILE.max_ingress" "$CONFIG_FILE")
+MIN_EGRESS_PCT=$(jq -r "$PROFILE.min_egress_pct" "$CONFIG_FILE")
+MIN_INGRESS_PCT=$(jq -r "$PROFILE.min_ingress_pct" "$CONFIG_FILE")
+BASELINE_RTT=$(jq -r "$PROFILE.baseline_rtt" "$CONFIG_FILE")
+MAX_RTT=$(jq -r "$PROFILE.max_rtt" "$CONFIG_FILE")
+AUTORATE_TARGET=$(jq -r "$PROFILE.autorate_target" "$CONFIG_FILE")
+AUTORATE_INTERVAL=$(jq -r "$PROFILE.autorate_interval" "$CONFIG_FILE")
+DAMPEN_PCT=$(jq -r "$PROFILE.dampen_pct" "$CONFIG_FILE")
 
 # --- fq_codel params ---
-TARGET="5ms"; INTERVAL="100ms"; LIMIT="1000"
-FLOWS="1024"; QUANTUM="1514"; MEM_LIMIT="32Mb"
+TARGET=$(jq -r '.fq_codel.target' "$CONFIG_FILE")
+INTERVAL=$(jq -r '.fq_codel.interval' "$CONFIG_FILE")
+LIMIT=$(jq -r '.fq_codel.limit' "$CONFIG_FILE")
+FLOWS=$(jq -r '.fq_codel.flows' "$CONFIG_FILE")
+QUANTUM=$(jq -r '.fq_codel.quantum' "$CONFIG_FILE")
+MEM_LIMIT=$(jq -r '.fq_codel.mem_limit' "$CONFIG_FILE")
 
 # --- CAKE params ---
-CAKE_RTT="50ms"; CAKE_OVERHEAD="0"; CAKE_MPU="0"
-CAKE_DIFFSERV="diffserv4"
+CAKE_RTT=$(jq -r '.cake.rtt' "$CONFIG_FILE")
+CAKE_OVERHEAD=$(jq -r '.cake.overhead' "$CONFIG_FILE")
+CAKE_MPU=$(jq -r '.cake.mpu' "$CONFIG_FILE")
+CAKE_DIFFSERV=$(jq -r '.cake.diffserv' "$CONFIG_FILE")
 
 # --- Colors ---
 R='\033[0;31m'; G='\033[0;32m'; Y='\033[1;33m'
@@ -802,20 +795,20 @@ case "$1" in
         echo "  remove         Remove all, return to default"
         echo ""
         echo -e "${B}Quick start (static):${N}"
-        echo "  1. Set EGRESS_RATE and INGRESS_RATE in the script"
+        echo "  1. Edit config.json: set profiles.<name>.manager.egress_rate/ingress_rate"
         echo "  2. $0 tune && $0 cake-bidir && $0 diagnose"
         echo ""
         echo -e "${B}Quick start (adaptive):${N}"
-        echo "  1. Set MODE=\"adaptive\" in the script"
-        echo "  2. Set AUTORATE_TARGET to a pingable host (gateway or 8.8.8.8)"
+        echo "  1. Edit config.json: set profiles.<name>.manager.mode to \"adaptive\""
+        echo "  2. Set autorate_target to a pingable host (gateway or 8.8.8.8)"
         echo "     Run '$0 probe' to verify it responds"
-        echo "  3. Set MAX_EGRESS / MAX_INGRESS to your ISP plan limits"
-        echo "  4. Set BASELINE_RTT (good RTT in ms) and MAX_RTT (worst RTT)"
+        echo "  3. Set max_egress / max_ingress to your ISP plan limits"
+        echo "  4. Set baseline_rtt (good RTT in ms) and max_rtt (worst RTT)"
         echo "     Run 'ping <target>' with no load to find your baseline"
         echo "  5. $0 tune && $0 adapt          (one-shot)"
         echo "     $0 tune && $0 cake-bidir && $0 autorate  (continuous)"
         echo ""
-        echo -e "${B}Current config:${N}"
+        echo -e "${B}Current config:${N} (from $CONFIG_FILE, profile: $ACTIVE_PROFILE)"
         echo "  MODE=$MODE  INTERFACE=$INTERFACE"
         if [ "$MODE" = "adaptive" ]; then
             echo "  AUTORATE_TARGET=${AUTORATE_TARGET:-(auto-detect gateway)}"
@@ -824,5 +817,26 @@ case "$1" in
         else
             echo "  EGRESS_RATE=$EGRESS_RATE  INGRESS_RATE=$INGRESS_RATE"
         fi
+        echo ""
+        echo -e "${B}Config file:${N} $CONFIG_FILE"
+        echo -e "${B}Active profile:${N} $ACTIVE_PROFILE"
+        echo ""
+        echo -e "${B}config.json keys used by this script:${N}"
+        echo "  active_profile              Which profile to load (config1/config2)"
+        echo "  profiles.<name>.manager:"
+        echo "    interface                 Network interface to shape"
+        echo "    mode                      \"static\" or \"adaptive\""
+        echo "    egress_rate / ingress_rate Fixed rates (static mode)"
+        echo "    max_egress / max_ingress  Rate ceilings (adaptive mode)"
+        echo "    min_egress_pct / min_ingress_pct  Rate floors as % of max"
+        echo "    baseline_rtt / max_rtt    RTT thresholds (ms) for rate mapping"
+        echo "    autorate_target           Host to ping for RTT probes"
+        echo "    autorate_interval         Seconds between probes"
+        echo "    dampen_pct                Max rate change per step (%)"
+        echo "  ifb_device                  IFB device name for ingress shaping"
+        echo "  fq_codel.*                  fq_codel parameters (target, interval, etc.)"
+        echo "  cake.*                      CAKE parameters (rtt, overhead, diffserv, etc.)"
+        echo ""
+        echo -e "${B}Override config path:${N} CONFIG_FILE=/path/to/config.json $0 <command>"
         exit 1 ;;
 esac

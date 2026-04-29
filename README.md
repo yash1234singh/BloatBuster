@@ -6,9 +6,11 @@ Three scripts for detecting, mitigating, and benchmarking bufferbloat on Linux n
 
 | Script | Purpose | Requires |
 |--------|---------|----------|
-| **bufferManager.sh** | Apply/remove traffic shaping strategies (CAKE, HTB, fq_codel) and TCP tuning (BBR, ECN) | `tc`, `ip`, `sysctl`, root |
-| **bufferTest.sh** | Measure bufferbloat via per-hop traceroute + iperf3 stress testing | `iperf3`, `traceroute`, iperf3 server |
-| **bufferScenarioTest.sh** | Orchestrate A/B comparisons: apply strategy → run test → record results → compare | Both scripts above |
+| **bufferManager.sh** | Apply/remove traffic shaping strategies (CAKE, HTB, fq_codel) and TCP tuning (BBR, ECN) | `tc`, `ip`, `sysctl`, `jq`, root |
+| **bufferTest.sh** | Measure bufferbloat via per-hop traceroute + iperf3 stress testing | `iperf3`, `traceroute`, `jq`, iperf3 server |
+| **bufferScenarioTest.sh** | Orchestrate A/B comparisons: apply strategy → run test → record results → compare | Both scripts above, `jq`, `bc` |
+
+All scripts read their configuration from a single **`config.json`** file (requires `jq`).
 
 ```
 bufferScenarioTest.sh
@@ -19,6 +21,103 @@ bufferScenarioTest.sh
   ├─ bufferManager.sh counters                          (read counters)
   └─ Compare all scenarios in a table
 ```
+
+---
+
+## Configuration (config.json)
+
+All settings are centralized in `config.json`. Each script reads the keys it needs at startup.
+
+To switch profiles, change `"active_profile"` — no need to edit any script.
+
+To use a different config file: `CONFIG_FILE=/path/to/config.json ./bufferManager.sh <cmd>`
+
+### Structure
+
+```json
+{
+  "active_profile": "config1",       // Select which profile to use
+
+  "profiles": {
+    "config1": {
+      "manager": { ... },            // bufferManager.sh settings
+      "test": { ... }                // bufferTest.sh settings
+    },
+    "config2": { ... }
+  },
+
+  "ifb_device": "ifb0",             // IFB device for ingress shaping
+  "fq_codel": { ... },              // fq_codel qdisc parameters
+  "cake": { ... },                  // CAKE qdisc parameters
+  "test": { ... },                  // bufferTest.sh general/logging/iperf settings
+  "scenario": { ... }               // bufferScenarioTest.sh settings
+}
+```
+
+### Profile: manager (bufferManager.sh)
+
+| Key | Description | Example |
+|-----|-------------|---------|
+| `interface` | Network interface to shape | `"eth1"` |
+| `mode` | `"static"` (fixed rates) or `"adaptive"` (RTT-based) | `"adaptive"` |
+| `egress_rate` / `ingress_rate` | Fixed shaping rates (static mode) | `"2mbit"` |
+| `max_egress` / `max_ingress` | Rate ceilings (adaptive mode) | `"10mbit"` |
+| `min_egress_pct` / `min_ingress_pct` | Rate floors as % of max | `2` |
+| `baseline_rtt` | Known good RTT in ms (no bloat) | `60` |
+| `max_rtt` | RTT at which rates hit the floor | `150` |
+| `autorate_target` | Host to ping for RTT probes | `"10.1.2.1"` |
+| `autorate_interval` | Seconds between RTT probes | `5` |
+| `dampen_pct` | Max rate change per step (%) | `10` |
+
+### Profile: test (bufferTest.sh)
+
+| Key | Description | Example |
+|-----|-------------|---------|
+| `target` | Remote iperf3 server IP | `"10.1.2.1"` |
+| `bind_ip` | Local interface IP to bind | `"192.168.1.1"` |
+| `udp_bw_dl` | UDP downlink bandwidth | `"15M"` |
+| `udp_bw_ul` | UDP uplink bandwidth | `"5M"` |
+
+### Shared: fq_codel / cake
+
+| Key | Description | Default |
+|-----|-------------|---------|
+| `fq_codel.target` | AQM target delay | `"5ms"` |
+| `fq_codel.interval` | AQM interval | `"100ms"` |
+| `fq_codel.limit` | Queue packet limit | `1000` |
+| `fq_codel.flows` | Flow count | `1024` |
+| `fq_codel.quantum` | Bytes per round | `1514` |
+| `fq_codel.mem_limit` | Memory limit | `"32Mb"` |
+| `cake.rtt` | CAKE RTT estimate | `"50ms"` |
+| `cake.overhead` | Link-layer overhead | `0` |
+| `cake.mpu` | Min packet unit | `0` |
+| `cake.diffserv` | Diffserv mode | `"diffserv4"` |
+
+### Shared: test settings (bufferTest.sh)
+
+| Key | Description | Default |
+|-----|-------------|---------|
+| `test.general.baseline_sec` | Phase 1 duration (s) | `30` |
+| `test.general.stress_sec` | Phase 2 duration (s) | `200` |
+| `test.general.poll_interval` | Traceroute frequency (s) | `1` |
+| `test.general.timeout` | Traceroute wait (s) | `2` |
+| `test.logging.main_log` | CSV output filename | `"bloat_results.log"` |
+| `test.logging.stress_type` | `"tcp"` or `"udp"` | `"tcp"` |
+| `test.iperf_common.enable_stress` | Run iperf3 or monitor-only | `true` |
+| `test.iperf_common.report_interval` | iperf3 -i value | `1` |
+| `test.iperf_common.show_diagram` | Show ASCII diagram | `true` |
+| `test.udp.port_dl` / `port_ul` | UDP server ports | `5991` / `5992` |
+| `test.udp.parallel` | UDP parallel streams | `1` |
+| `test.tcp.port_dl` / `port_ul` | TCP server ports | `5991` / `5992` |
+| `test.tcp.parallel` | TCP parallel streams | `4` |
+
+### Shared: scenario (bufferScenarioTest.sh)
+
+| Key | Description | Default |
+|-----|-------------|---------|
+| `scenario.runs` | Repetitions per scenario | `1` |
+| `scenario.log_dir` | Output log directory | `"scenario_logs"` |
+| `scenario.default_scenarios` | Array of `"label:cmd1,cmd2"` entries | (see config.json) |
 
 ---
 
@@ -78,21 +177,28 @@ Every 5s:
 
 ### Config Profiles
 
-Edit the script to define link-specific profiles:
+Edit `config.json` to define link-specific profiles:
 
-```bash
-USE_CONFIG="config1"    # Select active profile
-
-config1() {
-    INTERFACE="eth1"
-    MODE="adaptive"
-    MAX_EGRESS="10mbit"
-    MAX_INGRESS="25mbit"
-    BASELINE_RTT="60"
-    MAX_RTT="150"
-    AUTORATE_TARGET="10.1.3.1"
+```json
+{
+  "active_profile": "config1",
+  "profiles": {
+    "config1": {
+      "manager": {
+        "interface": "eth1",
+        "mode": "adaptive",
+        "max_egress": "10mbit",
+        "max_ingress": "25mbit",
+        "baseline_rtt": 60,
+        "max_rtt": 150,
+        "autorate_target": "10.1.2.1"
+      }
+    }
+  }
 }
 ```
+
+Switch profiles by changing `"active_profile"` — no script edits needed.
 
 ### Quick Start
 
@@ -231,22 +337,31 @@ uplink     TCP         43.5       2.06    12.60     2.10     1.05     3.15     1
 
 ### Config
 
-```bash
-USE_CONFIG="config1"
+All settings are read from `config.json`. Key parameters for this script:
 
-config1() {
-    TARGET="10.1.2.3"        # Remote Server IP
-    BIND_IP="10.2.2.1"         # Local Interface IP
-    UDP_BW_DL="15M"              # Downlink Bandwidth (-b)
-    UDP_BW_UL="5M"               # Uplink Bandwidth (-b)
+```json
+{
+  "active_profile": "config1",
+  "profiles": {
+    "config1": {
+      "test": {
+        "target": "10.1.2.1",
+        "bind_ip": "192.168.1.1",
+        "udp_bw_dl": "15M",
+        "udp_bw_ul": "5M"
+      }
+    }
+  },
+  "test": {
+    "general": { "baseline_sec": 30, "stress_sec": 200 },
+    "logging": { "stress_type": "tcp" },
+    "iperf_common": { "enable_stress": true },
+    "tcp": { "parallel": 4, "port_dl": 5991, "port_ul": 5992 }
+  }
 }
-
-BASELINE_SEC=30
-STRESS_SEC=200
-STRESS_TYPE="tcp"              # "tcp" or "udp"
-TCP_PARALLEL=4                 # Parallel streams
-ENABLE_STRESS=true             # false = monitor-only mode
 ```
+
+Run `./bufferTest.sh -h` for a full list of config keys.
 
 ### Prerequisites
 
@@ -474,6 +589,7 @@ Use `bufferScenarioTest.sh` to quantify the impact of different strategies on yo
 
 - Linux kernel 4.9+ (BBR support), 4.19+ (CAKE module)
 - `tc`, `ip`, `sysctl` (iproute2 package)
+- `jq` (JSON parser — `apt install jq`)
 - `iperf3` (3.9+ recommended)
 - `traceroute`
 - `bc` (for arithmetic in scenario comparisons)
@@ -485,18 +601,32 @@ Use `bufferScenarioTest.sh` to quantify the impact of different strategies on yo
 ## Quick Reference
 
 ```bash
-# 1. Configure profiles in bufferManager.sh and bufferTest.sh
-#    (set INTERFACE, TARGET, BIND_IP, rates)
+# 1. Edit config.json: set active_profile, interface, target, rates
+#    (no script edits needed)
 
 # 2. Verify connectivity
 ./bufferManager.sh probe
 
-# 3. Run a quick before/after comparison
+# 3. Run bufferTest.sh independently (measures bloat without shaping)
+./bufferTest.sh
+
+# 4. Run bufferManager.sh independently (apply shaping)
+./bufferManager.sh tune && ./bufferManager.sh cake-bidir
+
+# 5. Run a quick before/after comparison
 ./bufferScenarioTest.sh -s "before:remove;after:tune,cake-bidir,autorate"
 
-# 4. Run a thorough benchmark (3 repetitions)
+# 6. Run a thorough benchmark (3 repetitions)
 ./bufferScenarioTest.sh -r 3
 
-# 5. Check results
+# 7. Check results
 cat scenario_logs/summary_*.txt
+
+# Show help for each script
+./bufferManager.sh          # (no args shows help)
+./bufferTest.sh -h
+./bufferScenarioTest.sh -h
+
+# Override config file path
+CONFIG_FILE=/etc/bloatbuster/config.json ./bufferManager.sh cake-bidir
 ```

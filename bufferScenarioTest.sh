@@ -6,29 +6,31 @@
 set -u
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CONFIG
+# LOAD CONFIG FROM config.json (requires jq)
 # ══════════════════════════════════════════════════════════════════════════════
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+CONFIG_FILE="${CONFIG_FILE:-$SCRIPT_DIR/config.json}"
 BM="$SCRIPT_DIR/bufferManager.sh"
 BT="$SCRIPT_DIR/bufferTest.sh"
 
-RUNS=1                          # Repetitions per scenario (override with -r)
-LOG_DIR="$SCRIPT_DIR/scenario_logs"
+if [ ! -f "$CONFIG_FILE" ]; then
+    echo "ERROR: config.json not found at $CONFIG_FILE" >&2
+    exit 1
+fi
+if ! command -v jq &>/dev/null; then
+    echo "ERROR: jq is required but not installed. Install with: apt install jq" >&2
+    exit 1
+fi
+
+ACTIVE_PROFILE=$(jq -r '.active_profile' "$CONFIG_FILE")
+RUNS=$(jq -r '.scenario.runs' "$CONFIG_FILE")
+LOG_DIR="$SCRIPT_DIR/$(jq -r '.scenario.log_dir' "$CONFIG_FILE")"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 LOG_FILE="$LOG_DIR/scenario_${TIMESTAMP}.log"
 SUMMARY_FILE="$LOG_DIR/summary_${TIMESTAMP}.txt"
 
-# Scenarios to run (override with -s). Format: "label:cmd1,cmd2,..."
-# Commands are bufferManager.sh subcommands executed in order.
-# "autorate" is special: runs in background, killed after bufferTest.sh finishes.
-DEFAULT_SCENARIOS=(
-    "no-queue:remove"
-    "fq_codel:fq_codel"
-    "cake-bidir:tune,cake-bidir"
-    "cake-bidir+autorate:tune,cake-bidir,autorate"
-    "htb+tune:tune,htb"
-    "aggressive:tune,aggressive"
-)
+# Load default scenarios from config.json into array
+mapfile -t DEFAULT_SCENARIOS < <(jq -r '.scenario.default_scenarios[]' "$CONFIG_FILE")
 
 # Colors
 R='\033[0;31m'; G='\033[0;32m'; Y='\033[1;33m'
@@ -43,7 +45,7 @@ usage() {
 ${B}Usage:${N} $0 [OPTIONS]
 
 Run bufferbloat test scenarios, record qdisc counters & iperf throughput,
-and display a comparison table.
+and display a comparison table. Can run independently.
 
 ${B}Options:${N}
   -r RUNS       Number of repetitions per scenario (default: $RUNS)
@@ -53,7 +55,21 @@ ${B}Options:${N}
   -l            List built-in scenarios and exit
   -h            Show this help
 
-${B}Built-in Scenarios:${N}
+${B}Configuration (config.json):${N}
+  All settings are read from config.json (or CONFIG_FILE env var).
+
+  scenario.runs                 Default repetitions per scenario
+  scenario.log_dir              Output directory for logs
+  scenario.default_scenarios    Array of "label:cmd1,cmd2" entries
+
+  This script also invokes bufferManager.sh and bufferTest.sh, which
+  read their own settings from the same config.json:
+    - profiles.<name>.manager.*   (shaping: interface, rates, mode)
+    - profiles.<name>.test.*      (testing: target, bind_ip, bandwidth)
+    - test.*                      (timing, ports, iperf settings)
+    - fq_codel.* / cake.*        (qdisc parameters)
+
+${B}Built-in Scenarios:${N} (from config.json)
 EOF
     for s in "${DEFAULT_SCENARIOS[@]}"; do
         local label="${s%%:*}"
@@ -81,6 +97,9 @@ ${B}Examples:${N}
   # Custom output directory
   $0 -o /tmp/bloat_results -s "base:remove;htb:tune,htb"
 
+  # Override config file
+  CONFIG_FILE=/path/to/config.json $0
+
 ${B}Available bufferManager.sh Commands (for -s):${N}
   remove        Remove all qdiscs (no shaping)
   tune          BBR + ECN + reduced TCP buffers
@@ -91,6 +110,9 @@ ${B}Available bufferManager.sh Commands (for -s):${N}
   fq_codel      fq_codel only (no shaping)
   aggressive    Tight fq_codel (last resort)
   autorate      Continuous RTT-based CAKE adaptation (runs in background)
+
+${B}Current config:${N} (from $CONFIG_FILE, profile: $ACTIVE_PROFILE)
+  RUNS=$RUNS  LOG_DIR=$LOG_DIR
 
 ${B}Notes:${N}
   - "autorate" command runs in background and is killed after the test.

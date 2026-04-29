@@ -1,0 +1,111 @@
+{
+  "active_profile": "config1",
+
+  "profiles": {
+    "config1": {
+      "manager": {
+        "interface": "eth1",
+        "mode": "adaptive",
+        "egress_rate": "2mbit",
+        "ingress_rate": "5mbit",
+        "max_egress": "10mbit",
+        "max_ingress": "25mbit",
+        "min_egress_pct": 2,
+        "min_ingress_pct": 5,
+        "baseline_rtt": 60,
+        "max_rtt": 150,
+        "autorate_target": "10.1.2.1",
+        "autorate_interval": 5,
+        "dampen_pct": 10
+      },
+      "test": {
+        "target": "10.1.2.1",
+        "bind_ip": "192.168.1.1",
+        "udp_bw_dl": "15M",
+        "udp_bw_ul": "5M"
+      }
+    },
+    "config2": {
+      "manager": {
+        "interface": "eth3",
+        "mode": "adaptive",
+        "egress_rate": "3mbit",
+        "ingress_rate": "60mbit",
+        "max_egress": "15mbit",
+        "max_ingress": "65mbit",
+        "min_egress_pct": 2,
+        "min_ingress_pct": 5,
+        "baseline_rtt": 60,
+        "max_rtt": 150,
+        "autorate_target": "10.1.2.2",
+        "autorate_interval": 5,
+        "dampen_pct": 10
+      },
+      "test": {
+        "target": "10.1.2.2",
+        "bind_ip": "192.168.1.2",
+        "udp_bw_dl": "65M",
+        "udp_bw_ul": "15M"
+      }
+    }
+  },
+
+  "ifb_device": "ifb0",
+
+  "fq_codel": {
+    "target": "5ms",
+    "interval": "100ms",
+    "limit": 1000,
+    "flows": 1024,
+    "quantum": 1514,
+    "mem_limit": "32Mb"
+  },
+
+  "cake": {
+    "rtt": "50ms",
+    "overhead": 0,
+    "mpu": 0,
+    "diffserv": "diffserv4"
+  },
+
+  "test": {
+    "general": {
+      "baseline_sec": 30,
+      "stress_sec": 200,
+      "poll_interval": 1,
+      "timeout": 2
+    },
+    "logging": {
+      "main_log": "bloat_results.log",
+      "stress_type": "tcp"
+    },
+    "iperf_common": {
+      "enable_stress": true,
+      "report_interval": 1,
+      "show_diagram": true
+    },
+    "udp": {
+      "port_dl": 5991,
+      "port_ul": 5992,
+      "parallel": 1
+    },
+    "tcp": {
+      "port_dl": 5991,
+      "port_ul": 5992,
+      "parallel": 4
+    }
+  },
+
+  "scenario": {
+    "runs": 1,
+    "log_dir": "scenario_logs",
+    "default_scenarios": [
+      "no-queue:remove",
+      "fq_codel:fq_codel",
+      "cake-bidir:tune,cake-bidir",
+      "cake-bidir+autorate:tune,cake-bidir,autorate",
+      "htb+tune:tune,htb",
+      "aggressive:tune,aggressive"
+    ]
+  }
+}
