@@ -230,7 +230,21 @@ parse_iperf_summary() {
         fi
         [ "$in_table" -eq 0 ] && continue
 
-        if echo "$line" | grep -qi "downlink"; then
+        # Skip header decoration lines (=== or --- immediately after title)
+        if echo "$line" | grep -qE '^[-─]{10,}'; then
+            continue
+        fi
+
+        # Stop at next section boundary ONLY after we've read data lines
+        if echo "$line" | grep -qE '^[=═]{10,}'; then
+            # If we haven't found any data yet, this is the closing border of the title
+            if [ -n "$dl_mean" ] || [ -n "$ul_mean" ]; then
+                break
+            fi
+            continue
+        fi
+
+        if echo "$line" | grep -qiE '^\s*downlink\s'; then
             dl_data=$(echo "$line" | awk '{print $3}')
             dl_mean=$(echo "$line" | awk '{print $4}')
             dl_max=$(echo "$line" | awk '{print $5}')
@@ -238,7 +252,7 @@ parse_iperf_summary() {
             dl_p10=$(echo "$line" | awk '{print $7}')
             dl_p90=$(echo "$line" | awk '{print $8}')
         fi
-        if echo "$line" | grep -qi "uplink"; then
+        if echo "$line" | grep -qiE '^\s*uplink\s'; then
             ul_data=$(echo "$line" | awk '{print $3}')
             ul_mean=$(echo "$line" | awk '{print $4}')
             ul_max=$(echo "$line" | awk '{print $5}')

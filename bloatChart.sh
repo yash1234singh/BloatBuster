@@ -128,7 +128,7 @@ extract_iperf_per_sec() {
         else if (bps_unit ~ /^Kbits/) bps /= 1000
         else if (bps_unit ~ /^bits/)  bps /= 1000000
 
-        if (bps > 0) {
+        if (bps_unit != "") {
             n++
             if (ts != "") printf "%s,%.2f\n", ts, bps
             else          printf "%d,%.2f\n", n, bps
@@ -189,9 +189,37 @@ BEGIN {
     close(ar_file)
 
     # ─── Determine total data points (use max series length) ───
-    total = n_rtt
-    if (n_dl > total) total = n_dl
-    if (n_ul > total) total = n_ul
+    # Build unified timeline by timestamp (HH:MM:SS)
+    # Merge all timestamps into a single sorted sequence
+    for (i = 1; i <= n_rtt; i++) { ts = rtt_ts[i]; if (ts != "" && !(ts in seen)) { seen[ts] = 1; n_all++; all_ts[n_all] = ts } }
+    for (i = 1; i <= n_dl; i++)  { ts = dl_ts[i];  if (ts != "" && !(ts in seen)) { seen[ts] = 1; n_all++; all_ts[n_all] = ts } }
+    for (i = 1; i <= n_ul; i++)  { ts = ul_ts[i];  if (ts != "" && !(ts in seen)) { seen[ts] = 1; n_all++; all_ts[n_all] = ts } }
+    for (i = 1; i <= n_ar; i++)  { ts = ar_ts[i];  if (ts != "" && !(ts in seen)) { seen[ts] = 1; n_all++; all_ts[n_all] = ts } }
+
+    # Sort timestamps (insertion sort on HH:MM:SS strings — lexicographic works)
+    for (j = 2; j <= n_all; j++) {
+        key = all_ts[j]; k = j - 1
+        while (k >= 1 && all_ts[k] > key) { all_ts[k+1] = all_ts[k]; k-- }
+        all_ts[k+1] = key
+    }
+
+    # Build lookup maps: ts → value
+    for (i = 1; i <= n_rtt; i++) ts_rtt[rtt_ts[i]] = rtt_val[i]
+    for (i = 1; i <= n_dl; i++)  ts_dl[dl_ts[i]] = dl_val[i]
+    for (i = 1; i <= n_ul; i++)  ts_ul[ul_ts[i]] = ul_val[i]
+    for (i = 1; i <= n_ar; i++) {
+        ts_ar_eg[ar_ts[i]] = ar_egress[i]
+        ts_ar_in[ar_ts[i]] = ar_ingress[i]
+        ts_ar_dir[ar_ts[i]] = ar_dir[i]
+    }
+
+    total = n_all
+    if (total == 0) {
+        # Fallback: no timestamps parsed, use index-based
+        total = n_rtt
+        if (n_dl > total) total = n_dl
+        if (n_ul > total) total = n_ul
+    }
     if (total == 0) {
         print "ERROR: No data found in any log file."
         exit 1
@@ -233,45 +261,51 @@ BEGIN {
         print "─────────┼─────────────────┼────────"
     }
 
-    # Merge by index (all series are 1-sec aligned from test start)
+    # Merge by timestamp (all series aligned by actual time)
     max_rows = total
-    if (n_ar > max_rows) max_rows = n_ar
     # Limit table to 60 rows, sample if needed
     show_rows = max_rows
     sample = 1
     if (show_rows > 60) { sample = int(show_rows / 60); if (sample < 1) sample = 1 }
 
+    last_eg_s = "      -"; last_in_s = "      -"; last_dir_s = " "
     for (i = 1; i <= max_rows; i += sample) {
-        # Determine timestamp (prefer RTT, then DL, then AR)
-        ts = ""
-        if (i <= n_rtt && rtt_ts[i] != "") ts = rtt_ts[i]
-        else if (i <= n_dl && dl_ts[i] != "") ts = dl_ts[i]
-        else if (i <= n_ar && ar_ts[i] != "") ts = ar_ts[i]
-        else ts = sprintf("%ds", i)
+        ts = all_ts[i]
+        if (ts == "") ts = sprintf("%ds", i)
 
-        dl_s = (i <= n_dl) ? sprintf("%7.2f", dl_val[i]) : "      -"
-        ul_s = (i <= n_ul) ? sprintf("%7.2f", ul_val[i]) : "      -"
-        rtt_s = (i <= n_rtt) ? sprintf("%7.1f", rtt_val[i]) : "      -"
+        dl_s = (ts in ts_dl) ? sprintf("%7.2f", ts_dl[ts]) : "      -"
+        ul_s = (ts in ts_ul) ? sprintf("%7.2f", ts_ul[ts]) : "      -"
+        rtt_s = (ts in ts_rtt) ? sprintf("%7.1f", ts_rtt[ts]) : "      -"
 
         if (has_ar) {
-            # Find nearest autorate entry (autorate runs every N seconds)
-            ar_idx = 0
-            for (j = 1; j <= n_ar; j++) {
-                if (j <= i) ar_idx = j
-            }
-            if (ar_idx > 0) {
-                eg_s = sprintf("%7d", ar_egress[ar_idx])
-                in_s = sprintf("%7d", ar_ingress[ar_idx])
-                dir_s = ar_dir[ar_idx]
+            # Find autorate entry at or before this timestamp
+            if (ts in ts_ar_eg) {
+                eg_s = sprintf("%7d", ts_ar_eg[ts])
+                in_s = sprintf("%7d", ts_ar_in[ts])
+                dir_s = ts_ar_dir[ts]
             } else {
-                eg_s = "      -"; in_s = "      -"; dir_s = " "
+                # Use last known autorate value (hold previous)
+                eg_s = last_eg_s; in_s = last_in_s; dir_s = last_dir_s
             }
+            last_eg_s = eg_s; last_in_s = in_s; last_dir_s = dir_s
             printf "%-8s │ %s %s │ %s │ %s %s │ %s\n", ts, dl_s, ul_s, rtt_s, eg_s, in_s, dir_s
         } else {
             printf "%-8s │ %s %s │ %s\n", ts, dl_s, ul_s, rtt_s
         }
     }
     if (sample > 1) printf "\n  (Showing every %d-th sample, %d total data points)\n", sample, max_rows
+
+    # Data availability summary
+    printf "\n  Data coverage: DL=%d samples  UL=%d samples  RTT=%d samples  Autorate=%d samples\n", \
+        n_dl, n_ul, n_rtt, n_ar
+    if (n_ul < n_dl * 0.5) {
+        printf "  ⚠  UL iperf3 ran for only %d/%d seconds — likely crashed due to severe bloat\n", n_ul, n_dl
+        printf "     (TCP connections reset when queue overflow drops cause repeated retransmits)\n"
+    }
+    if (n_rtt < n_dl * 0.5) {
+        printf "  ⚠  RTT probes lost under load — %d/%d probes reached target\n", n_rtt, n_dl
+        printf "     (ICMP traceroute dropped by congested buffers; this itself confirms bloat)\n"
+    }
 
     # ─── ASCII CHART: Throughput ───
     print ""
@@ -289,17 +323,18 @@ BEGIN {
         }
     }
 
-    # Map data to chart columns (sample data to fit plot width)
+    # Map data to chart columns (sample unified timeline to fit plot width)
     step = 1
     if (total > plot_w) step = total / plot_w
 
     for (col = 0; col < plot_w; col++) {
         idx = int(col * step) + 1
         if (idx > total) idx = total
+        ts = all_ts[idx]
 
         # DL throughput bar (▓)
-        if (idx <= n_dl && dl_val[idx] > 0) {
-            dl_row = int((dl_val[idx] / max_throughput) * (height - 1))
+        if ((ts in ts_dl) && ts_dl[ts] > 0) {
+            dl_row = int((ts_dl[ts] / max_throughput) * (height - 1))
             if (dl_row >= height) dl_row = height - 1
             for (r = 0; r <= dl_row; r++) {
                 grid[height - 1 - r, col] = "▓"
@@ -307,8 +342,8 @@ BEGIN {
         }
 
         # UL throughput bar (░) — only where DL not already drawn
-        if (idx <= n_ul && ul_val[idx] > 0) {
-            ul_row = int((ul_val[idx] / max_throughput) * (height - 1))
+        if ((ts in ts_ul) && ts_ul[ts] > 0) {
+            ul_row = int((ts_ul[ts] / max_throughput) * (height - 1))
             if (ul_row >= height) ul_row = height - 1
             for (r = 0; r <= ul_row; r++) {
                 if (grid[height - 1 - r, col] == " ")
@@ -317,19 +352,15 @@ BEGIN {
         }
 
         # RTT marker (●) at the row corresponding to RTT value
-        if (idx <= n_rtt && rtt_val[idx] > 0) {
-            rtt_row = int((rtt_val[idx] / max_rtt_val) * (height - 1))
+        if ((ts in ts_rtt) && ts_rtt[ts] > 0) {
+            rtt_row = int((ts_rtt[ts] / max_rtt_val) * (height - 1))
             if (rtt_row >= height) rtt_row = height - 1
             grid[height - 1 - rtt_row, col] = "●"
         }
 
         # Autorate egress line (─) if available
-        if (n_ar > 0 && max_rate > 0) {
-            # Find nearest autorate point
-            ar_i = int(idx * n_ar / total)
-            if (ar_i < 1) ar_i = 1
-            if (ar_i > n_ar) ar_i = n_ar
-            eg_row = int((ar_egress[ar_i] / max_rate) * (height - 1) * (max_rate / max_throughput))
+        if (n_ar > 0 && max_rate > 0 && (ts in ts_ar_eg)) {
+            eg_row = int((ts_ar_eg[ts] / max_rate) * (height - 1) * (max_rate / max_throughput))
             if (eg_row >= 0 && eg_row < height) {
                 cur = grid[height - 1 - eg_row, col]
                 if (cur == " " || cur == "░")
@@ -366,9 +397,9 @@ BEGIN {
     for (m = 0; m < marks; m++) {
         pos = int(m * plot_w / (marks - 1))
         idx = int(pos * step) + 1
-        if (idx > n_rtt) idx = n_rtt
+        if (idx > total) idx = total
         if (idx < 1) idx = 1
-        ts = rtt_ts[idx]
+        ts = all_ts[idx]
         if (ts == "") ts = sprintf("%ds", idx)
         # Pad to position
         if (m == 0) printf "%-*s", int(plot_w / marks), ts
