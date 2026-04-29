@@ -87,15 +87,27 @@ done
 WORK_DIR=$(mktemp -d "/tmp/bloatChart_XXXXXX")
 trap 'rm -rf "$WORK_DIR"' EXIT
 
-# Extract per-second RTT to target (last hop, highest latency per timestamp)
+# Extract per-second RTT to target (last hop, highest latency per timestamp).
+# If all hops at a timestamp timed out (no valid response), report timeout_ms
+# so the chart shows worst-case latency instead of a missing ("-") entry.
+CHART_TIMEOUT_MS=$(( $(jq -r '.test.general.timeout' "$CONFIG_FILE") * 1000 ))
 if [ -f "$RTT_LOG" ]; then
-    awk -F, 'NR>1 && $3 != "No-Response" && $4+0 > 0 {
+    awk -F, -v tms="$CHART_TIMEOUT_MS" 'NR>1 {
         ts = $1
-        lat = $4 + 0
-        if (lat > max[ts]) max[ts] = lat
-        if (!(ts in order)) { order[ts] = ++n; ts_list[n] = ts }
+        if ($3 != "No-Response" && $3 != "Timeout" && $4+0 > 0) {
+            lat = $4 + 0
+            if (lat > max[ts]) max[ts] = lat
+            if (!(ts in order)) { order[ts] = ++n; ts_list[n] = ts }
+            has_valid[ts] = 1
+        } else if ($3 == "Timeout") {
+            if (!(ts in order)) { order[ts] = ++n; ts_list[n] = ts }
+        }
     } END {
-        for (i = 1; i <= n; i++) printf "%s,%.2f\n", ts_list[i], max[ts_list[i]]
+        for (i = 1; i <= n; i++) {
+            t = ts_list[i]
+            if (has_valid[t]) printf "%s,%.2f\n", t, max[t]
+            else printf "%s,%.2f\n", t, tms
+        }
     }' "$RTT_LOG" > "$WORK_DIR/rtt.csv"
 fi
 

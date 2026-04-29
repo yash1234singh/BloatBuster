@@ -381,6 +381,10 @@ run_scenario() {
     "$BM" remove >> "$LOG_FILE" 2>&1 || true
     "$BM" untune >> "$LOG_FILE" 2>&1 || true
 
+    # Isolate autorate.log to this run's directory so stale logs from prior
+    # scenarios/sessions never contaminate the chart for a non-autorate scenario.
+    export AUTORATE_LOG="$run_dir/autorate.log"
+
     # Step 2: Apply scenario commands
     IFS=',' read -ra CMD_LIST <<< "$cmds_csv"
     local AUTORATE_PID=""

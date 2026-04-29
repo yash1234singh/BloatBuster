@@ -164,7 +164,8 @@ probe_hop() {
     LINE=$(traceroute -I -n -q 1 -w "$timeout" -f "$hop" -m "$hop" "$target" 2>/dev/null | grep "^ *${hop}")
 
     if [[ -z "$LINE" || "$LINE" == *"*"* ]]; then
-        echo "$timestamp,$hop,No-Response,0,$phase" > "$outfile"
+        local timeout_ms=$(( timeout * 1000 ))
+        echo "$timestamp,$hop,Timeout,${timeout_ms},$phase" > "$outfile"
     else
         IP=$(echo "$LINE" | awk '{print $2}')
         MS=$(echo "$LINE" | awk '{for(i=2;i<=NF;i++) if($i ~ /^[0-9.]+$/ && $i !~ /\..*\./) {print $i; break}}')
@@ -248,7 +249,7 @@ fi
 RANK_FILE="$WORK_DIR/rank.tmp"
 
 # Step 1: Find canonical (most common) IP per hop
-awk -F, 'NR>1 && $3 != "No-Response" {
+awk -F, 'NR>1 && $3 != "No-Response" && $3 != "Timeout" {
     count[$2","$3]++
 } END {
     for (k in count) {
@@ -282,7 +283,7 @@ NR == 1 { next }
     ip = $3
     phase = $5
 
-    if (ip != "No-Response" && lat > 0) {
+    if (ip != "No-Response" && ip != "Timeout" && lat > 0) {
         rnd_lat[r, h] = lat
     }
     rnd_phase[r] = phase
@@ -480,7 +481,7 @@ for phase in BASELINE STRESS; do
     }
     NR>1 && $5 == ph && ($2 in target_hops) {
         total++
-        if ($3 == "No-Response" || $4 + 0 <= 0) { lost++ }
+        if ($3 == "No-Response" || $3 == "Timeout" || $4 + 0 <= 0) { lost++ }
         else { print $4 }
     }
     END {

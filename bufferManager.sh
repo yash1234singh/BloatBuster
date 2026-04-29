@@ -37,6 +37,7 @@ MAX_RTT=$(jq -r "$PROFILE.max_rtt" "$CONFIG_FILE")
 AUTORATE_TARGET=$(jq -r "$PROFILE.autorate_target" "$CONFIG_FILE")
 AUTORATE_INTERVAL=$(jq -r "$PROFILE.autorate_interval" "$CONFIG_FILE")
 DAMPEN_PCT=$(jq -r "$PROFILE.dampen_pct" "$CONFIG_FILE")
+PROBE_TIMEOUT=$(jq -r '.test.general.timeout' "$CONFIG_FILE")
 
 # --- fq_codel params ---
 TARGET=$(jq -r '.fq_codel.target' "$CONFIG_FILE")
@@ -275,9 +276,8 @@ autorate() {
     while true; do
         local rtt=$(_measure_rtt_ms "$gw" 3)
         if [ -z "$rtt" ]; then
-            printf "  RTT: ----ms  .  egress: %dmbit  ingress: %dmbit  (probe failed)\n" "$cur_eg" "$cur_in"
-            sleep "$AUTORATE_INTERVAL"
-            continue
+            rtt=$(( PROBE_TIMEOUT * 1000 ))
+            printf "  RTT: timeout(%dms)  egress: %dmbit  ingress: %dmbit  (probe lost — assuming worst-case RTT)\n" "$rtt" "$cur_eg" "$cur_in"
         fi
 
         local target_eg=$(_rtt_to_rate "$rtt" "$max_eg" "$min_eg")
