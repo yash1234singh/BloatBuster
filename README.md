@@ -779,14 +779,61 @@ Hop  Segment                     Link Base    Link P95     Bloat
 
 ## Requirements
 
-- Linux kernel 4.9+ (BBR support), 4.19+ (CAKE module)
-- `tc`, `ip`, `sysctl` (iproute2 package)
-- `jq` (JSON parser — `apt install jq`)
-- `iperf3` (3.9+ recommended)
-- `traceroute`
-- `bc` (for arithmetic in scenario comparisons)
-- Root access (traffic control and sysctl operations)
-- An iperf3 server running on the remote target host
+### System
+
+| Requirement | Notes |
+|-------------|-------|
+| Linux kernel 4.9+ | BBR congestion control (`tcp_bbr` module) |
+| Linux kernel 4.19+ | CAKE qdisc (`sch_cake` module) |
+| Root / sudo | Required by `tc`, `ip link`, `sysctl`, `modprobe` |
+| Writable log directory | Scripts write CSV logs, iperf output, and scenario results to the working directory (or `scenario.log_dir`). The path must be writable by the running user. |
+
+### Required Tools
+
+| Tool | Package (Debian/Ubuntu) | Used By | Purpose |
+|------|------------------------|---------|---------|
+| `bash` 4+ | pre-installed | all scripts | Script interpreter |
+| `tc` | `iproute2` | `bufferManager.sh` | Traffic control — create/modify qdiscs and filters |
+| `ip` | `iproute2` | `bufferManager.sh` | Manage IFB device (`ip link add/set/del`) |
+| `sysctl` | `procps` | `bufferManager.sh` | Apply TCP stack settings (BBR, ECN, buffer sizes) |
+| `modprobe` | `kmod` | `bufferManager.sh` | Load `ifb` kernel module for ingress shaping |
+| `ping` | `iputils-ping` | `bufferManager.sh` | RTT probes for autorate adaptation |
+| `iperf3` 3.9+ | `iperf3` | `bufferTest.sh` | Saturate the link (TCP/UDP stress test). Version 3.9+ needed for `--timestamps`. |
+| `traceroute` | `traceroute` | `bufferTest.sh` | Per-hop ICMP latency measurement (needs `-I` flag support) |
+| `jq` | `jq` | all scripts | Parse and read `config.json` |
+| `awk` | `gawk` / `mawk` | `bufferTest.sh`, `bloatChart.sh` | Log parsing and ASCII chart rendering |
+| `bc` | `bc` | `bufferScenarioTest.sh` | Floating-point arithmetic in scenario comparisons |
+
+Install everything at once on Debian/Ubuntu:
+
+```bash
+apt install iproute2 procps kmod iputils-ping iperf3 traceroute jq gawk bc
+```
+
+### Kernel Modules
+
+The following modules must be loadable (built-in or available as `.ko`):
+
+| Module | Required For |
+|--------|-------------|
+| `sch_cake` | `cake`, `cake-bidir` strategies |
+| `sch_fq_codel` | `fq_codel`, `htb`, `aggressive` strategies |
+| `sch_htb` | `htb` strategy |
+| `ifb` | Ingress shaping (`cake-bidir`) — loaded automatically via `modprobe ifb` |
+| `tcp_bbr` | BBR congestion control (`tune` command) |
+
+Check availability: `modinfo sch_cake` / `modinfo tcp_bbr`
+
+### Remote iperf3 Server
+
+`bufferTest.sh` requires an **iperf3 server** listening on the target host. Run on the remote machine:
+
+```bash
+iperf3 -s -p 5991 &   # downlink port
+iperf3 -s -p 5992 &   # uplink port
+```
+
+Ports are configurable via `test.tcp.port_dl` / `test.tcp.port_ul` (or UDP equivalents) in `config.json`.
 
 ---
 
