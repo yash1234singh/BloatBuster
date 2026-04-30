@@ -283,9 +283,10 @@ autorate() {
         local target_eg=$(_rtt_to_rate "$rtt" "$max_eg" "$min_eg")
         local target_in=$(_rtt_to_rate "$rtt" "$max_in" "$min_in")
 
-        # Dampen: cap change per step to DAMPEN_PCT% of current rate
-        local max_step_eg=$(( cur_eg * DAMPEN_PCT / 100 ))
-        local max_step_in=$(( cur_in * DAMPEN_PCT / 100 ))
+        # Dampen: cap change per step to DAMPEN_PCT% of current rate.
+        # Use ceiling division (x*pct+99)/100 to avoid truncation toward zero at low rates.
+        local max_step_eg=$(( (cur_eg * DAMPEN_PCT + 99) / 100 ))
+        local max_step_in=$(( (cur_in * DAMPEN_PCT + 99) / 100 ))
         [ "$max_step_eg" -lt 1 ] && max_step_eg=1
         [ "$max_step_in" -lt 1 ] && max_step_in=1
 

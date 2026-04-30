@@ -281,9 +281,12 @@ BEGIN {
     if (show_rows > 60) { sample = int(show_rows / 60); if (sample < 1) sample = 1 }
 
     last_eg_s = "      -"; last_in_s = "      -"; last_dir_s = " "
-    for (i = 1; i <= max_rows; i += sample) {
+    for (i = 1; i <= max_rows; i++) {
         ts = all_ts[i]
         if (ts == "") ts = sprintf("%ds", i)
+        # Always show rows where autorate changed (▼/▲); sample all other rows
+        is_ar_change = (ts in ts_ar_eg && ts_ar_dir[ts] != "." && ts_ar_dir[ts] != "")
+        if ((i - 1) % sample != 0 && !is_ar_change) continue
 
         dl_s = (ts in ts_dl) ? sprintf("%7.2f", ts_dl[ts]) : "      -"
         ul_s = (ts in ts_ul) ? sprintf("%7.2f", ts_ul[ts]) : "      -"
