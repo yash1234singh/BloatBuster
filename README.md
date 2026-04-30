@@ -262,79 +262,72 @@ Phase 2: STRESS (200s)
 ========================================================================
 Hop  Segment                                Link Base    Link P95     Bloat
 ------------------------------------------------------------------------
-2    (source) -> 10.1.2.1                   17.30        491.37       474.07
-3    10.1.2.1 -> 10.1.3.1                   0.88         23.51        22.63
-4    10.1.3.1 -> 1.2.3.4                    0.79         21.38        20.59
-3    (source) -> 10.1.3.1                   0.00         517.01       517.01
+2    (source) -> 10.0.1.1                   17.08        513.28       496.20
+3    10.0.1.1 -> 10.0.2.1                   0.64         13.75        13.11
+4    10.0.2.1 -> 10.1.2.1                   0.55         11.52        10.98
 
 ========================================================================
             LINK SEGMENTS RANKED BY BLOAT (Worst First)
 ========================================================================
 IP Address         Bloat (ms)
 ------------------------------------------------------------------------
-10.1.3.1           517.01       ms
-10.1.2.1           474.07       ms
-10.1.3.1           22.63        ms
-1.2.3.4            20.59        ms
+10.0.1.1           496.20       ms
+10.0.2.1           13.11        ms
+10.1.2.1           10.98        ms
 
 ========================================================================
              NETWORK PATH DIAGRAM (Baseline / Stress)
 ========================================================================
 
 +---------------+
-|   (source)    |
+|  (source)    |
 +---------------+
-    |  Base:  17.30 ms
-    |  P95:  491.37 ms
-    |  Bloat: 474.07 ms  <<<
+    |  Base:  17.08 ms
+    |  P95:  513.28 ms
+    |  Bloat: 496.20 ms  <<<
     v
 +---------------+
-|  10.1.2.1     |
+| 10.0.1.1     |
 +---------------+
-    |  Base:   0.88 ms
-    |  P95:   23.51 ms
-    |  Bloat: 22.63 ms  <<<
+    |  Base:   0.64 ms
+    |  P95:   13.75 ms
+    |  Bloat: 13.11 ms  <<<
     v
 +---------------+
-|  10.1.3.1     |
+| 10.0.2.1     |
 +---------------+
-    |  Base:   0.79 ms
-    |  P95:   21.38 ms
-    |  Bloat: 20.59 ms  <<<
+    |  Base:   0.55 ms
+    |  P95:   11.52 ms
+    |  Bloat: 10.98 ms  <<<
     v
 +---------------+
-|   1.2.3.4     |
-+---------------+
-    |  Base:   0.00 ms
-    |  P95:  517.01 ms
-    |  Bloat: 517.01 ms  <<<
-    v
-+---------------+
-|  10.1.3.1     |
+| 10.1.2.1     |
 +---------------+
 
+
 ========================================================================
-             OVERALL LATENCY SUMMARY (End-to-End to 1.2.3.4)
+             OVERALL LATENCY SUMMARY (End-to-End to 10.1.2.1)
 ========================================================================
 Phase        Samples  Loss %     Avg (ms)   P95 (ms)   Max (ms)
 ------------------------------------------------------------------------
-BASELINE     10       0.0        17.76      18.83      20.31
-STRESS       97       1.0        197.38     494.30     533.06
+BASELINE     5        0.0        17.24      18.02      18.56
+STRESS       32       3.0        447.03     524.32     530.20
 
 ==========================================================================================
              IPERF3 THROUGHPUT SUMMARY
 ==========================================================================================
 Direction  Type   Data (MB)  Mean Mbps      Max   Median      P10      P90   Smpls
 ------------------------------------------------------------------------------------------
-downlink   TCP        169.0       4.68     7.34     4.19     4.19     6.29     303
-uplink     TCP         43.5       2.06    12.60     2.10     1.05     3.15     183
+downlink   TCP        119.0       4.82     8.39     5.24     3.15     6.29     204
+uplink     TCP         65.2       8.10    19.90     7.34     4.19    12.60      70
 ```
 
 **Reading the results:**
 - **Bloat column** shows added latency under load per hop — the `<<<` markers flag significant bloat
-- **Hop 2 (source → 10.1.2.1)** jumped from 17ms baseline to 491ms P95 — this is the primary bloating link (likely the LTE/modem uplink buffer)
-- **Overall**: baseline 18ms → stress P95 494ms = **~476ms of bufferbloat**
-- **Throughput**: 4.68 Mbps downlink, 2.06 Mbps uplink (expected for an LTE link)
+- **Hop 2 (source → 10.0.1.1)** jumped from 17ms baseline to 513ms P95 — this is the primary bloating link (the LTE/modem uplink buffer)
+- **Overall**: baseline 17ms → stress P95 524ms = **~507ms of bufferbloat**
+- **Throughput**: 4.82 Mbps downlink, 8.10 Mbps uplink (LTE link, uplink bursting without shaping)
+- **RTT probe loss**: only 38/204 traceroute probes got through — ICMP packets dropped by congested buffers (this itself confirms bloat)
 
 ### Config
 
@@ -397,33 +390,33 @@ Automated A/B testing wrapper. Runs multiple shaping strategies back-to-back, ca
 8. Kill autorate   → if it was running in background
 ```
 
-### Sample Result (10 runs, base vs shaped+autorate)
+### Sample Result (5 runs, base vs shaped+autorate)
 
-Command: `./bufferScenarioTest.sh -r 10 -s "base:remove;shaped+autorate:tune,cake-bidir,autorate"`
+Command: `./bufferScenarioTest.sh -r 5 -s "base:remove;shaped+autorate:tune,cake-bidir,autorate"`
 
 ```
 ════════════════════════════════════════════════════════════════
-  SCENARIO COMPARISON TABLE  (10 run(s) per scenario, averaged)
+  SCENARIO COMPARISON TABLE  (5 run(s) per scenario, averaged)
 ════════════════════════════════════════════════════════════════
 Metric                 │ base               │ shaped+autorate
 ────────────────────────────────────────────────────────────────
   IPERF3 THROUGHPUT
-  DL Mean (Mbps)         │ 4.80               │ 4.68
-  DL P90 (Mbps)          │ 6.29               │ 5.87 (-7%)
-  UL Mean (Mbps)         │ 11.44              │ 2.29 (-80%)
-  UL P90 (Mbps)          │ 17.52              │ 3.78 (-78%)
+  DL Mean (Mbps)         │ 4.78               │ 4.72
+  DL P90 (Mbps)          │ 6.29               │ 6.29
+  UL Mean (Mbps)         │ 7.72               │ 2.53 (-67%)
+  UL P90 (Mbps)          │ 12.38              │ 4.40 (-64%)
 ────────────────────────────────────────────────────────────────
   END-TO-END LATENCY
-  Baseline Avg (ms)      │ 17.70              │ 17.88
-  Baseline P95 (ms)      │ 19.14              │ 20.34 (+6%)
-  Stress Avg (ms)        │ 460.45             │ 194.17 (-58%)
-  Stress P95 (ms)        │ 520.23             │ 490.70 (-6%)
-  Stress Loss %          │ 2.36               │ 0.70 (-70%)
+  Baseline Avg (ms)      │ 18.14              │ 17.32
+  Baseline P95 (ms)      │ 18.18              │ 17.54
+  Stress Avg (ms)        │ 448.07             │ 347.58 (-22%)
+  Stress P95 (ms)        │ 512.99             │ 514.22
+  Stress Loss %          │ 2.42               │ 3.04 (+26%)
 ────────────────────────────────────────────────────────────────
   QDISC COUNTERS (delta during test)
-  Egress Pkts            │ 0.00               │ 110677.00
-  Egress Dropped         │ 0.00               │ 12.70
-  Egress Overlimits      │ 0.00               │ 199363.50
+  Egress Pkts            │ 0.00               │ 75999.40
+  Egress Dropped         │ 0.00               │ 21.80
+  Egress Overlimits      │ 0.00               │ 123474.60
   Egress ECN Marks       │ 0.00               │ 0.00
   Ingress Pkts           │ 0.00               │ 0.00
   Ingress Dropped        │ 0.00               │ 0.00
@@ -434,50 +427,40 @@ Metric                 │ base               │ shaped+autorate
   Green = better than 'base' baseline (>5% diff)
   Red   = worse than 'base' baseline (>5% diff)
   Values within 5% of baseline shown without color.
-  All values averaged across 10 run(s).
+  All values averaged across 5 run(s).
 
 
   Per-Run Detail: base
   Run      DL Mbps    UL Mbps  St Avg ms  St P95 ms    Eg Drop    In Drop     Eg ECN
   ───── ────────── ────────── ────────── ────────── ────────── ────────── ──────────
-  1           4.83      11.16     466.76     528.95          0          0          0
-  2           4.83      11.80     468.37     518.84          0          0          0
-  3           4.76      10.77     458.69     517.07          0          0          0
-  4           4.79       9.05     459.08     516.61          0          0          0
-  5           4.75      10.37     450.55     516.61          0          0          0
-  6           4.79      12.01     459.46     521.94          0          0          0
-  7           4.81      12.58     464.94     523.34          0          0          0
-  8           4.82      13.25     458.94     521.21          0          0          0
-  9           4.84      11.83     452.44     514.37          0          0          0
-  10          4.82      11.61     465.32     523.40          0          0          0
+  1           4.82       8.10     447.03     524.32          0          0          0
+  2           4.86       7.47     451.30     520.74          0          0          0
+  3           4.63       8.26     453.70     508.93          0          0          0
+  4           4.81       7.96     445.62     504.11          0          0          0
+  5           4.78       6.80     442.68     506.84          0          0          0
 
   Per-Run Detail: shaped+autorate
   Run      DL Mbps    UL Mbps  St Avg ms  St P95 ms    Eg Drop    In Drop     Eg ECN
   ───── ────────── ────────── ────────── ────────── ────────── ────────── ──────────
-  1           4.69       2.33     189.67     486.36         10          0          0
-  2           4.68       2.10     196.77     479.29          3          0          0
-  3           4.63       2.45     192.50     482.69         41          0          0
-  4           4.70       2.13     197.38     506.58         13          0          0
-  5           4.72       2.60     192.09     482.14          2          0          0
-  6           4.67       2.12     189.47     484.73         16          0          0
-  7           4.67       2.34     194.59     498.24         17          0          0
-  8           4.68       2.60     193.47     487.82         19          0          0
-  9           4.69       2.14     198.39     504.80          1          0          0
-  10          4.68       2.06     197.38     494.30          5          0          0
+  1           4.70       2.74     347.62     520.97         57          0          0
+  2           4.74       2.54     335.23     518.95         15          0          0
+  3           4.69       2.29     351.57     503.62         18          0          0
+  4           4.76       2.56     336.28     514.46         17          0          0
+  5           4.71       2.53     367.18     513.11          2          0          0
 
 Results saved to:
-  Full log:    /var/TEST/scenario_logs/scenario_20260429_015504.log
-  Summary:     /var/TEST/scenario_logs/summary_20260429_015504.txt
-  Raw data:    /var/TEST/scenario_logs/results_20260429_015504/
+  Full log:    /var/TEST/BLOATBUSTER/scenario_logs/scenario_20260429_220813.log
+  Summary:     /var/TEST/BLOATBUSTER/scenario_logs/summary_20260429_220813.txt
+  Raw data:    /var/TEST/BLOATBUSTER/scenario_logs/results_20260429_220813/
 ```
 
 **Reading the results:**
-- **Stress Avg latency** dropped from 460ms → 194ms (**-58%**) with CAKE+autorate shaping
-- **Stress Loss** dropped from 2.36% → 0.70% (**-70%**) — fewer packets dropped under load
-- **UL throughput** reduced from 11.44 → 2.29 Mbps (**-80%**) — this is the intended trade-off: CAKE rate-shapes upload below bottleneck to prevent upstream buffer filling
-- **DL throughput** nearly unchanged (4.80 → 4.68 Mbps) — download not impacted
-- **Egress Overlimits** (199k) shows CAKE actively delaying packets to enforce the shaped rate
-- **Per-run consistency**: shaped+autorate shows tight clustering (189-198ms stress avg vs 450-468ms for base)
+- **Stress Avg latency** dropped from 448ms → 348ms (**-22%**) with CAKE+autorate shaping
+- **UL throughput** reduced from 7.72 → 2.53 Mbps (**-67%**) — intended trade-off: CAKE rate-shapes upload below the bottleneck to prevent the upstream buffer from filling
+- **DL throughput** nearly unchanged (4.78 → 4.72 Mbps) — download not impacted
+- **Egress Overlimits** (123k) shows CAKE actively delaying packets to enforce the shaped rate
+- **Egress Drops** (avg 21.8/run) confirms CAKE is managing the queue at your device rather than the upstream FIFO
+- **Per-run consistency**: shaped+autorate shows tight clustering (335–367ms stress avg vs 442–454ms for base)
 
 ### Usage
 
@@ -572,28 +555,43 @@ Three data series aligned by time (1-second intervals):
 ════════════════════════════════════════════════════════════════════════════════
 Time     │ DL Mbps UL Mbps │  RTT ms │ Eg mbit In mbit │ Dir
 ─────────┼─────────────────┼─────────┼─────────────────┼────
-10:30:01 │    4.82    2.10 │    62.0 │      10      25 │ .
-10:30:02 │    4.91    2.15 │    85.0 │      10      25 │ .
-10:30:03 │    3.20    1.95 │   142.0 │       9      23 │ ▼
-10:30:04 │    4.10    2.01 │   110.0 │       8      21 │ ▼
-10:30:05 │    4.65    2.08 │    75.0 │       9      23 │ ▲
+22:45:19 │       -       - │    19.0 │      10      25 │ -
+22:45:27 │    4.20    0.00 │       - │      10      25 │ -
+22:45:30 │    4.19    0.00 │       - │       9      23 │ ▼
+22:45:45 │    5.24    0.00 │       - │       7      19 │ ▼
+22:46:00 │    5.24    1.05 │       - │       5      17 │ ▼
+22:46:15 │    4.19    6.29 │       - │       3      15 │ ▼
+22:46:30 │    5.24    1.05 │       - │       1      13 │ ▼
+22:46:45 │    4.19    0.00 │       - │       1      11 │ ▼
+22:47:00 │    8.39    0.00 │       - │       1       9 │ ▼
+22:47:15 │    3.15    0.00 │       - │       1       7 │ ▼
+22:47:30 │    7.34    2.10 │       - │       1       5 │ ▼
+22:48:06 │    3.15    0.00 │       - │       2       6 │ ▲
+22:48:21 │    5.25    1.05 │       - │       2       6 │ ▲
+22:48:36 │    5.24    2.10 │       - │       2       6 │ ▲
 ...
 
 ════════════════════════════════════════════════════════════════════════════════
              ASCII CHART: Throughput (DL ▓, UL ░) + RTT (●)
 ════════════════════════════════════════════════════════════════════════════════
-  Y-axis left: Throughput (0-7 Mbps)   Y-axis right: RTT (0-500 ms)
+  Y-axis left: Throughput (0-13 Mbps)   Y-axis right: RTT (0-521 ms)
 
-   7.0│ ▓                         ●                          │  500
-   6.0│ ▓▓   ▓                  ●   ●                       │  428
-   5.0│ ▓▓▓▓▓▓▓▓▓  ▓▓▓▓       ●       ●     ▓▓▓▓▓▓        │  357
-   4.0│ ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓  ●          ● ▓▓▓▓▓▓▓▓▓▓▓▓    │  285
-   3.0│ ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓●▓▓▓▓▓▓▓▓▓▓▓●▓▓▓▓▓▓▓▓▓▓▓▓▓▓  │  214
-   2.0│ ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  │  142
-   1.0│ ░░░░░░░░░░░░░░░░░─────────────────────░░░░░░░░░░░░  │   71
-   0.0│ ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  │    0
-      └────────────────────────────────────────────────────  ┘
-       10:30:01    10:30:50    10:31:40    10:32:30    10:33:20
+  12.6│                                                                        │  521
+  11.9│                                     ●     ● ●                          │  494
+  11.3│                                       ● ●                              │  466
+  10.6│                                                                        │  439
+   9.9│   ─                                                                    │  411
+   8.6│      ─                                                                 │  356
+   7.3│                      ▓    ▓                            ▓               │  302
+   6.6│           ─          ▓    ▓                            ▓               │  274
+   6.0│        ▓ ▓  ▓       ░▓    ▓          ▓  ▓   ▓     ▓   ▓▓        ▓      │  247
+   4.6│        ▓▓▓▓ ▓  ▓ ▓ ▓░▓▓ ▓▓▓       ▓▓ ▓  ▓   ▓ ▓▓ ▓▓▓  ▓▓ ▓   ▓▓ ▓▓   ▓ │  192
+   4.0│     ▓▓ ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓ ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓ ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓ ▓▓▓▓▓▓▓▓▓▓ │  165
+   2.7│     ▓▓ ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓ │  110
+   2.0│     ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓ │   82
+   0.0│  ● ●▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓ │    0
+      └────────────────────────────────────────────────────────────────────────┘
+        22:44:55      22:46:06      22:47:01      22:47:52            22:48:47
 
   Legend: ▓ DL Mbps   ░ UL Mbps   ● RTT (ms)   ─ Egress Rate Limit
 
@@ -603,17 +601,22 @@ Time     │ DL Mbps UL Mbps │  RTT ms │ Eg mbit In mbit │ Dir
   Egress (E) and Ingress (I) rate limits over time.
   Range: 0-25 mbit   Direction: ▲=increase ▼=decrease .=stable
 
-   25 │ IIIIIIIIIIIIIIIIII            IIIIIIIIIIIII
-   20 │                   III     IIII
-   15 │                      IIIII
-   10 │ EEEEEEEEEEEEEEEEEEE         EEEEEEEEEEEEEEE
-    7 │                    EEE   EEEE
-    5 │                       EEE
-    0 │
-      └──────────────────────────────────────────────
-       ..........▼▼▼▼▼▼....▲▲▲▲▲▲▲......▼▼▼.▲▲...  ← Direction
+   25 │ IIIIII
+   22 │       I
+   20 │        I
+   18 │         I
+   15 │          III
+   13 │             II
+   11 │               II
+    9 │ EEEEEE          II
+    6 │       EEE         III
+    4 │          EE          IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII
+    2 │            EE
+    0 │              EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+      └───────────────────────────────────────────────────────────────────────
+        ......▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▲▼▲▼▲▼▲▼▲▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼  ← Direction (▲ up ▼ down . stable)
 
-  Legend: E=Egress rate  I=Ingress rate  ▲▼.=Direction
+  Legend: E=Egress rate  I=Ingress rate  X=Overlap  ▲▼.=Direction
 ```
 
 ### Usage
@@ -701,12 +704,12 @@ BloatBuster's per-hop analysis shows **incremental delay per link segment**:
 ```
 Hop  Segment                     Link Base    Link P95     Bloat
 --------------------------------------------------------------------
-2    (source) -> 10.1.2.1        17.30        491.37       474.07  ← YOUR UPLINK BUFFER
-3    10.1.2.1 -> 10.1.3.1         0.88         23.51        22.63  ← ISP backhaul
-4    10.1.3.1 -> 10.1.2.1         0.79         21.38        20.59  ← Core network
+2    (source) -> 10.0.1.1        17.08        513.28       496.20  ← YOUR UPLINK BUFFER
+3    10.0.1.1 -> 10.0.2.1         0.64         13.75        13.11  ← ISP backhaul
+4    10.0.2.1 -> 10.1.2.1         0.55         11.52        10.98  ← Core network
 ```
 
-- **Hop 2 has 474ms of bloat** → the modem/router uplink FIFO is the problem
+- **Hop 2 has 496ms of bloat** → the modem/router uplink FIFO is the problem
 - **Hops 3-4 have minimal bloat** → ISP core is fine
 - Other tools only show end-to-end latency and can't distinguish where the queue is
 
