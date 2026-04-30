@@ -105,11 +105,17 @@ To use a different config file: `CONFIG_FILE=/path/to/config.json ./bufferManage
 | `test.logging.main_log` | CSV output filename | `"bloat_results.log"` |
 | `test.logging.stress_type` | `"tcp"` or `"udp"` | `"tcp"` |
 | `test.iperf_common.enable_stress` | Run iperf3 or monitor-only | `true` |
+| `test.iperf_common.enable_dl` | Run downlink iperf3 | `true` |
+| `test.iperf_common.enable_ul` | Run uplink iperf3 | `true` |
+| `test.iperf_common.connect_timeout` | Seconds to wait before declaring a port failed | `5` |
+| `test.iperf_common.port_retries` | Times to cycle through the full port list before giving up | `2` |
 | `test.iperf_common.report_interval` | iperf3 -i value | `1` |
 | `test.iperf_common.show_diagram` | Show ASCII diagram | `true` |
-| `test.udp.port_dl` / `port_ul` | UDP server ports | `5991` / `5992` |
+| `test.udp.port_dl` | UDP DL port(s) — single value or array | `[5991, 5993]` |
+| `test.udp.port_ul` | UDP UL port(s) — single value or array | `[5992, 5994]` |
 | `test.udp.parallel` | UDP parallel streams | `1` |
-| `test.tcp.port_dl` / `port_ul` | TCP server ports | `5991` / `5992` |
+| `test.tcp.port_dl` | TCP DL port(s) — single value or array | `[5991, 5993]` |
+| `test.tcp.port_ul` | TCP UL port(s) — single value or array | `[5992, 5994]` |
 | `test.tcp.parallel` | TCP parallel streams | `4` |
 
 ### Shared: scenario (bufferScenarioTest.sh)
@@ -359,7 +365,13 @@ Run `./bufferTest.sh -h` for a full list of config keys.
 
 ### Prerequisites
 
-- **iperf3 server** running on the target host (`iperf3 -s -p 5991` and `iperf3 -s -p 5992`)
+- **iperf3 server** running on the target host on each configured port. Start one listener per port in the `port_dl`/`port_ul` arrays — iperf3 handles one client connection per instance:
+  ```bash
+  iperf3 -s -p 5991 &   # DL primary
+  iperf3 -s -p 5993 &   # DL fallback
+  iperf3 -s -p 5992 &   # UL primary
+  iperf3 -s -p 5994 &   # UL fallback
+  ```
 - `traceroute` installed
 - iperf3 3.9+ recommended (for `--timestamps`)
 
@@ -826,14 +838,16 @@ Check availability: `modinfo sch_cake` / `modinfo tcp_bbr`
 
 ### Remote iperf3 Server
 
-`bufferTest.sh` requires an **iperf3 server** listening on the target host. Run on the remote machine:
+`bufferTest.sh` requires an **iperf3 server** listening on the target host. Since iperf3 handles only one client connection per process, run one listener per port in your `port_dl`/`port_ul` arrays. With the default config:
 
 ```bash
-iperf3 -s -p 5991 &   # downlink port
-iperf3 -s -p 5992 &   # uplink port
+iperf3 -s -p 5991 &   # DL primary
+iperf3 -s -p 5993 &   # DL fallback
+iperf3 -s -p 5992 &   # UL primary
+iperf3 -s -p 5994 &   # UL fallback
 ```
 
-Ports are configurable via `test.tcp.port_dl` / `test.tcp.port_ul` (or UDP equivalents) in `config.json`.
+Configure ports via `test.tcp.port_dl` / `test.tcp.port_ul` (or UDP equivalents) in `config.json`. Both accept a single integer or an array of ports for automatic failover.
 
 ---
 

@@ -81,17 +81,21 @@
     },
     "iperf_common": {
       "enable_stress": true,
+      "enable_dl": true,
+      "enable_ul": true,
+      "connect_timeout": 5,
+      "port_retries": 2,
       "report_interval": 1,
       "show_diagram": true
     },
     "udp": {
-      "port_dl": 5991,
-      "port_ul": 5992,
+      "port_dl": [5991, 5993],
+      "port_ul": [5992, 5994],
       "parallel": 1
     },
     "tcp": {
-      "port_dl": 5991,
-      "port_ul": 5992,
+      "port_dl": [5991, 5993],
+      "port_ul": [5992, 5994],
       "parallel": 4
     }
   },

@@ -43,14 +43,25 @@ REPORT_INT=$(jq -r '.test.iperf_common.report_interval' "$CONFIG_FILE")
 SHOW_DIAGRAM=$(jq -r '.test.iperf_common.show_diagram' "$CONFIG_FILE")
 
 # --- UDP settings ---
-UDP_PORT_DL=$(jq -r '.test.udp.port_dl' "$CONFIG_FILE")
-UDP_PORT_UL=$(jq -r '.test.udp.port_ul' "$CONFIG_FILE")
 UDP_PARALLEL=$(jq -r '.test.udp.parallel' "$CONFIG_FILE")
 
 # --- TCP settings ---
-TCP_PORT_DL=$(jq -r '.test.tcp.port_dl' "$CONFIG_FILE")
-TCP_PORT_UL=$(jq -r '.test.tcp.port_ul' "$CONFIG_FILE")
 TCP_PARALLEL=$(jq -r '.test.tcp.parallel' "$CONFIG_FILE")
+
+# --- iperf direction and port settings ---
+ENABLE_DL=$(jq -r '.test.iperf_common.enable_dl // true' "$CONFIG_FILE")
+ENABLE_UL=$(jq -r '.test.iperf_common.enable_ul // true' "$CONFIG_FILE")
+CONNECT_TIMEOUT=$(jq -r '.test.iperf_common.connect_timeout // 5' "$CONFIG_FILE")
+PORT_RETRIES=$(jq -r '.test.iperf_common.port_retries // 2' "$CONFIG_FILE")
+
+# Port lists — accept array or single value in config
+if [[ "$STRESS_TYPE" == "udp" ]]; then
+    mapfile -t PORT_DL_LIST < <(jq -r '.test.udp.port_dl | if type == "array" then .[] else . end' "$CONFIG_FILE")
+    mapfile -t PORT_UL_LIST < <(jq -r '.test.udp.port_ul | if type == "array" then .[] else . end' "$CONFIG_FILE")
+else
+    mapfile -t PORT_DL_LIST < <(jq -r '.test.tcp.port_dl | if type == "array" then .[] else . end' "$CONFIG_FILE")
+    mapfile -t PORT_UL_LIST < <(jq -r '.test.tcp.port_ul | if type == "array" then .[] else . end' "$CONFIG_FILE")
+fi
 
 # ══════════════════════════════════════════════════════════════════════════════
 # USAGE / HELP
@@ -94,15 +105,24 @@ Configuration (config.json):
 
   test.iperf_common:
     enable_stress                 true = run iperf3, false = monitor-only
+    enable_dl                     true = run downlink iperf3 (default: true)
+    enable_ul                     true = run uplink iperf3 (default: true)
+    connect_timeout               Seconds to wait before declaring a port failed (default: 5)
+    port_retries                  Number of times to cycle through the port list before giving up (default: 2)
     report_interval               iperf3 -i interval (default: 1)
     show_diagram                  true = show ASCII network diagram
+    (When both enable_dl and enable_ul are true, both must connect or both are killed
+     and the next port pair is tried. When only one direction is enabled, ports are
+     retried independently. Stress timer starts only after successful connection.)
 
   test.udp:
-    port_dl / port_ul             Server ports for UDP DL/UL
+    port_dl                       UDP DL port(s): single value or array e.g. [5991,5993]
+    port_ul                       UDP UL port(s): single value or array e.g. [5992,5994]
     parallel                      Parallel streams per UDP session
 
   test.tcp:
-    port_dl / port_ul             Server ports for TCP DL/UL
+    port_dl                       TCP DL port(s): single value or array e.g. [5991,5993]
+    port_ul                       TCP UL port(s): single value or array e.g. [5992,5994]
     parallel                      Parallel streams per TCP session
 
 Current config (profile: $ACTIVE_PROFILE):
@@ -110,6 +130,8 @@ Current config (profile: $ACTIVE_PROFILE):
   STRESS_TYPE=$STRESS_TYPE  BASELINE=${BASELINE_SEC}s  STRESS=${STRESS_SEC}s
   UDP_BW_DL=$UDP_BW_DL  UDP_BW_UL=$UDP_BW_UL
   TCP_PARALLEL=$TCP_PARALLEL  UDP_PARALLEL=$UDP_PARALLEL
+  ENABLE_DL=$ENABLE_DL  ENABLE_UL=$ENABLE_UL  CONNECT_TIMEOUT=${CONNECT_TIMEOUT}s  PORT_RETRIES=$PORT_RETRIES
+  DL ports: ${PORT_DL_LIST[*]}  UL ports: ${PORT_UL_LIST[*]}
 
 Override config path:
   CONFIG_FILE=/path/to/config.json $0
@@ -174,45 +196,135 @@ probe_hop() {
     fi
 }
 
+# Launch a single iperf3 instance in the background; echoes its PID.
+# Args: logfile port direction(dl|ul)
+_start_iperf_instance() {
+    local logfile="$1" port="$2" direction="$3"
+    if [[ "$STRESS_TYPE" == "udp" ]]; then
+        if [[ "$direction" == "dl" ]]; then
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] iperf3 DL: -p $port -u -b $UDP_BW_DL -P $UDP_PARALLEL -R" >> "$logfile"
+            iperf3 -B "$BIND_IP" -c "$TARGET" -i "$REPORT_INT" -t "$STRESS_SEC" \
+                -p "$port" -u -b "$UDP_BW_DL" -P "$UDP_PARALLEL" -R --timestamps='[%H:%M:%S] ' >> "$logfile" 2>&1 &
+        else
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] iperf3 UL: -p $port -u -b $UDP_BW_UL -P $UDP_PARALLEL" >> "$logfile"
+            iperf3 -B "$BIND_IP" -c "$TARGET" -i "$REPORT_INT" -t "$STRESS_SEC" \
+                -p "$port" -u -b "$UDP_BW_UL" -P "$UDP_PARALLEL" --timestamps='[%H:%M:%S] ' >> "$logfile" 2>&1 &
+        fi
+    else
+        if [[ "$direction" == "dl" ]]; then
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] iperf3 DL: -p $port -P $TCP_PARALLEL -R" >> "$logfile"
+            iperf3 -B "$BIND_IP" -c "$TARGET" -i "$REPORT_INT" -t "$STRESS_SEC" \
+                -p "$port" -P "$TCP_PARALLEL" -R --timestamps='[%H:%M:%S] ' >> "$logfile" 2>&1 &
+        else
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] iperf3 UL: -p $port -P $TCP_PARALLEL" >> "$logfile"
+            iperf3 -B "$BIND_IP" -c "$TARGET" -i "$REPORT_INT" -t "$STRESS_SEC" \
+                -p "$port" -P "$TCP_PARALLEL" --timestamps='[%H:%M:%S] ' >> "$logfile" 2>&1 &
+        fi
+    fi
+    echo $!
+}
+
+# Launch iperf3 with port rotation and retry logic.
+# Paired mode (both DL+UL enabled): if either fails, kill both and try the next port pair.
+# Single mode (one direction only): retry that direction independently across its port list.
+# Stress timer must start AFTER this returns 0.
+# Returns 0 on success (PIDs appended to IPERF_PID_FILE), 1 if all ports exhausted.
+launch_iperf() {
+    if [[ "$ENABLE_DL" != true && "$ENABLE_UL" != true ]]; then
+        echo "WARNING: Both enable_dl and enable_ul are false — no iperf3 launched."
+        return 1
+    fi
+
+    local n_dl=${#PORT_DL_LIST[@]} n_ul=${#PORT_UL_LIST[@]}
+    local paired=false
+    [[ "$ENABLE_DL" == true && "$ENABLE_UL" == true ]] && paired=true
+
+    local n_ports_paired=$(( n_dl > n_ul ? n_dl : n_ul ))
+    local max_attempts
+    if $paired; then
+        max_attempts=$(( n_ports_paired * PORT_RETRIES ))
+    elif [[ "$ENABLE_DL" == true ]]; then
+        max_attempts=$(( n_dl * PORT_RETRIES ))
+    else
+        max_attempts=$(( n_ul * PORT_RETRIES ))
+    fi
+
+    local attempt dl_pid ul_pid dl_ok ul_ok reason cycle total_cycles=$PORT_RETRIES
+    for (( attempt=0; attempt<max_attempts; attempt++ )); do
+        local dl_port="${PORT_DL_LIST[$(( attempt % n_dl ))]}"
+        local ul_port="${PORT_UL_LIST[$(( attempt % n_ul ))]}"
+        # Which cycle are we on? (1-based, based on the relevant port list size)
+        if $paired; then
+            cycle=$(( attempt / n_ports_paired + 1 ))
+        elif [[ "$ENABLE_DL" == true ]]; then
+            cycle=$(( attempt / n_dl + 1 ))
+        else
+            cycle=$(( attempt / n_ul + 1 ))
+        fi
+        dl_pid=""; ul_pid=""
+
+        [[ "$ENABLE_DL" == true ]] && dl_pid=$(_start_iperf_instance "$IPERF_LOG_DL" "$dl_port" "dl")
+        [[ "$ENABLE_UL" == true ]] && ul_pid=$(_start_iperf_instance "$IPERF_LOG_UL" "$ul_port" "ul")
+
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Verifying iperf3 connection(s) (${CONNECT_TIMEOUT}s)..."
+        sleep "$CONNECT_TIMEOUT"
+
+        dl_ok=true; ul_ok=true
+        [[ "$ENABLE_DL" == true && -n "$dl_pid" ]] && ! kill -0 "$dl_pid" 2>/dev/null && dl_ok=false
+        [[ "$ENABLE_UL" == true && -n "$ul_pid" ]] && ! kill -0 "$ul_pid" 2>/dev/null && ul_ok=false
+
+        if $paired; then
+            if [[ "$dl_ok" == true && "$ul_ok" == true ]]; then
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] iperf3 DL verified (PID $dl_pid, port $dl_port)"
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] iperf3 UL verified (PID $ul_pid, port $ul_port)"
+                echo "$dl_pid" >> "$IPERF_PID_FILE"; echo "$ul_pid" >> "$IPERF_PID_FILE"
+                return 0
+            fi
+            # Kill both before trying next port pair
+            [[ -n "$dl_pid" ]] && kill "$dl_pid" 2>/dev/null
+            [[ -n "$ul_pid" ]] && kill "$ul_pid" 2>/dev/null
+            reason=""
+            [[ "$dl_ok" == false ]] && reason+=" DL(port $dl_port)"
+            [[ "$ul_ok" == false ]] && reason+=" UL(port $ul_port)"
+            echo "WARNING: iperf3$reason failed (attempt $((attempt+1))/${max_attempts}, cycle ${cycle}/${total_cycles}), trying next port pair..."
+        else
+            if [[ "$ENABLE_DL" == true ]]; then
+                if [[ "$dl_ok" == true ]]; then
+                    echo "[$(date '+%Y-%m-%d %H:%M:%S')] iperf3 DL verified (PID $dl_pid, port $dl_port)"
+                    echo "$dl_pid" >> "$IPERF_PID_FILE"
+                    return 0
+                fi
+                [[ -n "$dl_pid" ]] && kill "$dl_pid" 2>/dev/null
+                echo "WARNING: iperf3 DL failed (attempt $((attempt+1))/${max_attempts}, cycle ${cycle}/${total_cycles}, port $dl_port), trying next..."
+            else
+                if [[ "$ul_ok" == true ]]; then
+                    echo "[$(date '+%Y-%m-%d %H:%M:%S')] iperf3 UL verified (PID $ul_pid, port $ul_port)"
+                    echo "$ul_pid" >> "$IPERF_PID_FILE"
+                    return 0
+                fi
+                [[ -n "$ul_pid" ]] && kill "$ul_pid" 2>/dev/null
+                echo "WARNING: iperf3 UL failed (attempt $((attempt+1))/${max_attempts}, cycle ${cycle}/${total_cycles}, port $ul_port), trying next..."
+            fi
+        fi
+    done
+
+    echo "ERROR: iperf3 could not connect after $max_attempts attempt(s) ($total_cycles cycle(s) through port list)."
+    return 1
+}
+
 run_monitor() {
     local duration=$1 mode=$2
-    local start_time=$SECONDS
 
     if [[ "$mode" == "STRESS" && "$ENABLE_STRESS" == true ]]; then
         echo ">>> LAUNCHING IPERF3 AND TRACEROUTE SIMULTANEOUSLY <<<"
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting iperf3 ($STRESS_TYPE) to $TARGET for ${STRESS_SEC}s"
-
-        if [[ "$STRESS_TYPE" == "udp" ]]; then
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] iperf3 DL: -p $UDP_PORT_DL -u -b $UDP_BW_DL -P $UDP_PARALLEL -R" >> "$IPERF_LOG_DL"
-            iperf3 -B "$BIND_IP" -c "$TARGET" -i "$REPORT_INT" -t "$STRESS_SEC" \
-                -p "$UDP_PORT_DL" -u -b "$UDP_BW_DL" -P "$UDP_PARALLEL" -R --timestamps='[%H:%M:%S] ' >> "$IPERF_LOG_DL" 2>&1 &
-            DL_PID=$!; echo "$DL_PID" >> "$IPERF_PID_FILE"
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] iperf3 UL: -p $UDP_PORT_UL -u -b $UDP_BW_UL -P $UDP_PARALLEL" >> "$IPERF_LOG_UL"
-            iperf3 -B "$BIND_IP" -c "$TARGET" -i "$REPORT_INT" -t "$STRESS_SEC" \
-                -p "$UDP_PORT_UL" -u -b "$UDP_BW_UL" -P "$UDP_PARALLEL" --timestamps='[%H:%M:%S] ' >> "$IPERF_LOG_UL" 2>&1 &
-            UL_PID=$!; echo "$UL_PID" >> "$IPERF_PID_FILE"
-        else
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] iperf3 DL: -p $TCP_PORT_DL -P $TCP_PARALLEL -R" >> "$IPERF_LOG_DL"
-            iperf3 -B "$BIND_IP" -c "$TARGET" -i "$REPORT_INT" -t "$STRESS_SEC" \
-                -p "$TCP_PORT_DL" -P "$TCP_PARALLEL" -R --timestamps='[%H:%M:%S] ' >> "$IPERF_LOG_DL" 2>&1 &
-            DL_PID=$!; echo "$DL_PID" >> "$IPERF_PID_FILE"
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] iperf3 UL: -p $TCP_PORT_UL -P $TCP_PARALLEL" >> "$IPERF_LOG_UL"
-            iperf3 -B "$BIND_IP" -c "$TARGET" -i "$REPORT_INT" -t "$STRESS_SEC" \
-                -p "$TCP_PORT_UL" -P "$TCP_PARALLEL" --timestamps='[%H:%M:%S] ' >> "$IPERF_LOG_UL" 2>&1 &
-            UL_PID=$!; echo "$UL_PID" >> "$IPERF_PID_FILE"
+        if ! launch_iperf; then
+            echo "ERROR: Could not establish iperf3 on any configured port. Stress phase aborted."
+            return 1
         fi
-
-        # Verify iperf3 actually connected
-        sleep 3
-        for pid_label in "DL:$DL_PID" "UL:$UL_PID"; do
-            label="${pid_label%%:*}"; pid="${pid_label##*:}"
-            if kill -0 "$pid" 2>/dev/null; then
-                echo "[$(date '+%Y-%m-%d %H:%M:%S')] iperf3 $label verified running (PID $pid)"
-            else
-                echo "WARNING: iperf3 $label (PID $pid) failed to start — stress results may be invalid"
-            fi
-        done
     fi
+
+    local start_time=$SECONDS  # Start timing after successful iperf3 launch
 
     while [ $((SECONDS - start_time)) -lt "$duration" ]; do
         echo -ne "Phase: $mode | Time Left: $((duration - (SECONDS - start_time)))s   \r"
