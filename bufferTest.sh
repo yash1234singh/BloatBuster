@@ -51,7 +51,7 @@ TCP_PARALLEL=$(jq -r '.test.tcp.parallel' "$CONFIG_FILE")
 # --- iperf direction and port settings ---
 ENABLE_DL=$(jq -r '.test.iperf_common.enable_dl // true' "$CONFIG_FILE")
 ENABLE_UL=$(jq -r '.test.iperf_common.enable_ul // true' "$CONFIG_FILE")
-CONNECT_TIMEOUT=$(jq -r '.test.iperf_common.connect_timeout // 5' "$CONFIG_FILE")
+CONNECT_TIMEOUT=$(jq -r '.test.iperf_common.connect_timeout // 10' "$CONFIG_FILE")
 PORT_RETRIES=$(jq -r '.test.iperf_common.port_retries // 2' "$CONFIG_FILE")
 
 # Port lists — accept array or single value in config
@@ -107,7 +107,7 @@ Configuration (config.json):
     enable_stress                 true = run iperf3, false = monitor-only
     enable_dl                     true = run downlink iperf3 (default: true)
     enable_ul                     true = run uplink iperf3 (default: true)
-    connect_timeout               Seconds to wait before declaring a port failed (default: 5)
+    connect_timeout               Seconds to wait before declaring a port failed (default: 10)
     port_retries                  Number of times to cycle through the port list before giving up (default: 2)
     report_interval               iperf3 -i interval (default: 1)
     show_diagram                  true = show ASCII network diagram
@@ -162,7 +162,7 @@ for cmd in iperf3 traceroute; do
     command -v "$cmd" >/dev/null 2>&1 || { echo "ERROR: $cmd not found"; exit 1; }
 done
 if ! iperf3 --help 2>&1 | grep -q timestamps; then
-    echo "WARNING: iperf3 may not support --timestamps (need 3.9+), timestamps in logs may be missing"
+    echo "WARNING: iperf3 may not support --timestamps/--connect-timeout/--forceflush (need 3.7+), upgrade for full robustness"
 fi
 
 # Discovery traceroute — auto-detect hop count
@@ -200,28 +200,40 @@ probe_hop() {
 # Args: logfile port direction(dl|ul)
 _start_iperf_instance() {
     local logfile="$1" port="$2" direction="$3"
+    local ct_ms=$(( CONNECT_TIMEOUT * 1000 ))
     if [[ "$STRESS_TYPE" == "udp" ]]; then
         if [[ "$direction" == "dl" ]]; then
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] iperf3 DL: -p $port -u -b $UDP_BW_DL -P $UDP_PARALLEL -R" >> "$logfile"
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] iperf3 DL: -B $BIND_IP -c $TARGET -i $REPORT_INT -t $STRESS_SEC -p $port -u -b $UDP_BW_DL -P $UDP_PARALLEL -R --connect-timeout $ct_ms --forceflush" >> "$logfile"
             iperf3 -B "$BIND_IP" -c "$TARGET" -i "$REPORT_INT" -t "$STRESS_SEC" \
-                -p "$port" -u -b "$UDP_BW_DL" -P "$UDP_PARALLEL" -R --timestamps='[%H:%M:%S] ' >> "$logfile" 2>&1 &
+                -p "$port" -u -b "$UDP_BW_DL" -P "$UDP_PARALLEL" -R \
+                --connect-timeout "$ct_ms" --forceflush --timestamps='[%H:%M:%S] ' >> "$logfile" 2>&1 &
         else
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] iperf3 UL: -p $port -u -b $UDP_BW_UL -P $UDP_PARALLEL" >> "$logfile"
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] iperf3 UL: -B $BIND_IP -c $TARGET -i $REPORT_INT -t $STRESS_SEC -p $port -u -b $UDP_BW_UL -P $UDP_PARALLEL --connect-timeout $ct_ms --forceflush" >> "$logfile"
             iperf3 -B "$BIND_IP" -c "$TARGET" -i "$REPORT_INT" -t "$STRESS_SEC" \
-                -p "$port" -u -b "$UDP_BW_UL" -P "$UDP_PARALLEL" --timestamps='[%H:%M:%S] ' >> "$logfile" 2>&1 &
+                -p "$port" -u -b "$UDP_BW_UL" -P "$UDP_PARALLEL" \
+                --connect-timeout "$ct_ms" --forceflush --timestamps='[%H:%M:%S] ' >> "$logfile" 2>&1 &
         fi
     else
         if [[ "$direction" == "dl" ]]; then
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] iperf3 DL: -p $port -P $TCP_PARALLEL -R" >> "$logfile"
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] iperf3 DL: -B $BIND_IP -c $TARGET -i $REPORT_INT -t $STRESS_SEC -p $port -P $TCP_PARALLEL -R --connect-timeout $ct_ms --forceflush" >> "$logfile"
             iperf3 -B "$BIND_IP" -c "$TARGET" -i "$REPORT_INT" -t "$STRESS_SEC" \
-                -p "$port" -P "$TCP_PARALLEL" -R --timestamps='[%H:%M:%S] ' >> "$logfile" 2>&1 &
+                -p "$port" -P "$TCP_PARALLEL" -R \
+                --connect-timeout "$ct_ms" --forceflush --timestamps='[%H:%M:%S] ' >> "$logfile" 2>&1 &
         else
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] iperf3 UL: -p $port -P $TCP_PARALLEL" >> "$logfile"
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] iperf3 UL: -B $BIND_IP -c $TARGET -i $REPORT_INT -t $STRESS_SEC -p $port -P $TCP_PARALLEL --connect-timeout $ct_ms --forceflush" >> "$logfile"
             iperf3 -B "$BIND_IP" -c "$TARGET" -i "$REPORT_INT" -t "$STRESS_SEC" \
-                -p "$port" -P "$TCP_PARALLEL" --timestamps='[%H:%M:%S] ' >> "$logfile" 2>&1 &
+                -p "$port" -P "$TCP_PARALLEL" \
+                --connect-timeout "$ct_ms" --forceflush --timestamps='[%H:%M:%S] ' >> "$logfile" 2>&1 &
         fi
     fi
     echo $!
+}
+
+# Returns 0 if iperf3 PID is alive AND its log file contains at least one data interval.
+_iperf_ok() {
+    local pid="$1" logfile="$2"
+    kill -0 "$pid" 2>/dev/null || return 1       # process still alive
+    grep -q 'bits/sec' "$logfile" 2>/dev/null     # at least one reported interval
 }
 
 # Launch iperf3 with port rotation and retry logic.
@@ -263,15 +275,24 @@ launch_iperf() {
         fi
         dl_pid=""; ul_pid=""
 
-        [[ "$ENABLE_DL" == true ]] && dl_pid=$(_start_iperf_instance "$IPERF_LOG_DL" "$dl_port" "dl")
         [[ "$ENABLE_UL" == true ]] && ul_pid=$(_start_iperf_instance "$IPERF_LOG_UL" "$ul_port" "ul")
+        [[ "$ENABLE_DL" == true ]] && dl_pid=$(_start_iperf_instance "$IPERF_LOG_DL" "$dl_port" "dl")
 
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Verifying iperf3 connection(s) (${CONNECT_TIMEOUT}s)..."
+        # Phase 1 — connection check: wait for --connect-timeout to fire on failures
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Waiting for iperf3 connection(s) (${CONNECT_TIMEOUT}s)..."
         sleep "$CONNECT_TIMEOUT"
 
         dl_ok=true; ul_ok=true
         [[ "$ENABLE_DL" == true && -n "$dl_pid" ]] && ! kill -0 "$dl_pid" 2>/dev/null && dl_ok=false
         [[ "$ENABLE_UL" == true && -n "$ul_pid" ]] && ! kill -0 "$ul_pid" 2>/dev/null && ul_ok=false
+
+        # Phase 2 — data check: wait one report interval so the first data line is in the log
+        if [[ "$dl_ok" == true || "$ul_ok" == true ]]; then
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] Waiting for first data interval (${REPORT_INT}s)..."
+            sleep "$REPORT_INT"
+            [[ "$ENABLE_DL" == true && -n "$dl_pid" && "$dl_ok" == true ]] && ! _iperf_ok "$dl_pid" "$IPERF_LOG_DL" && dl_ok=false
+            [[ "$ENABLE_UL" == true && -n "$ul_pid" && "$ul_ok" == true ]] && ! _iperf_ok "$ul_pid" "$IPERF_LOG_UL" && ul_ok=false
+        fi
 
         if $paired; then
             if [[ "$dl_ok" == true && "$ul_ok" == true ]]; then

@@ -107,7 +107,7 @@ To use a different config file: `CONFIG_FILE=/path/to/config.json ./bufferManage
 | `test.iperf_common.enable_stress` | Run iperf3 or monitor-only | `true` |
 | `test.iperf_common.enable_dl` | Run downlink iperf3 | `true` |
 | `test.iperf_common.enable_ul` | Run uplink iperf3 | `true` |
-| `test.iperf_common.connect_timeout` | Seconds to wait before declaring a port failed | `5` |
+| `test.iperf_common.connect_timeout` | Seconds to wait before declaring a port failed | `10` |
 | `test.iperf_common.port_retries` | Times to cycle through the full port list before giving up | `2` |
 | `test.iperf_common.report_interval` | iperf3 -i value | `1` |
 | `test.iperf_common.show_diagram` | Show ASCII diagram | `true` |
@@ -373,7 +373,7 @@ Run `./bufferTest.sh -h` for a full list of config keys.
   iperf3 -s -p 5994 &   # UL fallback
   ```
 - `traceroute` installed
-- iperf3 3.9+ recommended (for `--timestamps`)
+- iperf3 3.7+ required (for `--connect-timeout`, `--forceflush`); 3.9+ recommended (adds `--timestamps`)
 
 ### Usage
 
@@ -810,7 +810,7 @@ Hop  Segment                     Link Base    Link P95     Bloat
 | `sysctl` | `procps` | `bufferManager.sh` | Apply TCP stack settings (BBR, ECN, buffer sizes) |
 | `modprobe` | `kmod` | `bufferManager.sh` | Load `ifb` kernel module for ingress shaping |
 | `ping` | `iputils-ping` | `bufferManager.sh` | RTT probes for autorate adaptation |
-| `iperf3` 3.9+ | `iperf3` | `bufferTest.sh` | Saturate the link (TCP/UDP stress test). Version 3.9+ needed for `--timestamps`. |
+| `iperf3` 3.7+ | `iperf3` | `bufferTest.sh` | Saturate the link (TCP/UDP stress test). 3.7+ needed for `--connect-timeout`/`--forceflush`; 3.9+ for `--timestamps`. |
 | `traceroute` | `traceroute` | `bufferTest.sh` | Per-hop ICMP latency measurement (needs `-I` flag support) |
 | `jq` | `jq` | all scripts | Parse and read `config.json` |
 | `awk` | `gawk` / `mawk` | `bufferTest.sh`, `bloatChart.sh` | Log parsing and ASCII chart rendering |
