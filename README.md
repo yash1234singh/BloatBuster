@@ -839,9 +839,65 @@ Check availability: `modinfo sch_cake` / `modinfo tcp_bbr`
 ### Remote iperf3 Server
 
 `bufferTest.sh` requires an **iperf3 server** listening on the target host. Since iperf3 handles only one client connection per process, run one listener per port in your `port_dl`/`port_ul` arrays. With the default config:
-
-```bash
-iperf3 -s -p 5991 &   # DL primary
+ 
+ ---
+ 
+ ## traffic-gen.py: User Browsing Traffic Simulator
+ 
+ `traffic-gen.py` is a standalone Python tool for simulating realistic web browsing and upload/download activity, independent of the main bufferbloat test scripts. It is designed to generate diverse, high-concurrency traffic patterns similar to real users, and is useful for stress-testing networks, routers, or shaping policies.
+ 
+ ### What It Does
+ 
+ - Launches multiple parallel download (DL) and upload (UL) clients as threads
+ - Simulates browsing to popular sites (Google, Facebook, Wikipedia, etc.) using HTTP/1.1, HTTPS, and HTTP/3/QUIC (if supported)
+ - Downloads large files from public test servers
+ - Uploads random-sized data blobs to public HTTP endpoints
+ - Randomizes timing, URLs, and request types to mimic real user behavior
+ - Tracks per-client statistics: success/fail counts, bytes transferred, socket events
+ - Runs for a configurable duration (default: very long, can be interrupted with Ctrl+C)
+ 
+ ### Usage
+ 
+ ```bash
+ python3 traffic-gen.py
+ ```
+ 
+ You can adjust the number of DL/UL clients and duration by editing the variables at the top of the script:
+ 
+ - `DL_CLIENTS` — number of parallel download threads (default: 30)
+ - `UL_CLIENTS` — number of parallel upload threads (default: 50)
+ - `DURATION_MINS` — total run time in minutes (default: 3000)
+ 
+ The script prints live activity and a summary report at the end. All data is discarded to `/dev/null` (no files are saved).
+ 
+ ### Example Output
+ 
+ ```
+ =====================================================
+   DUAL-ROLE TRAFFIC ENGINE: 30 DL | 50 UL
+   ALL DATA DISCARDED TO /dev/null
+ =====================================================
+ [12:34:56] [DL-Thread #1] -> STARTING [HTTPS] | https://www.wikipedia.org
+ [12:34:57] [UL-Thread #1] -> UPLOADING 23MB to https://httpbin.org/post
+ ... (live logs) ...
+ 
+ ==========================================================================
+               TRAFFIC SIMULATION REPORT
+ ==========================================================================
+ CLIENT   ROLE  SUCC  FAIL  OPEN  CLOS  RST   DATA_TRANSFERRED
+ 1        DL    5     0     5     5     0     12.34 MB
+ 1        UL    4     1     4     4     0     67.89 MB
+ ... (per-client stats) ...
+ TOTAL         150   10    150   150   2     DL: 123.45 MB / UL: 678.90 MB
+ ```
+ 
+ ### Requirements
+ 
+ - Python 3
+ - `curl` (with HTTP/3/QUIC support for QUIC tests, optional)
+ - `dd` (for upload data generation)
+ 
+ > **Note:** This tool is completely independent of the bufferbloat test/shape scripts. It does not require or use `config.json` and can be run on any Linux system with Python 3 and curl.
 iperf3 -s -p 5993 &   # DL fallback
 iperf3 -s -p 5992 &   # UL primary
 iperf3 -s -p 5994 &   # UL fallback

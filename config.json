@@ -86,6 +86,7 @@
       "connect_timeout": 10,
       "port_retries": 2,
       "report_interval": 1,
+      "kill_paired_on_failure": false,
       "show_diagram": true
     },
     "udp": {

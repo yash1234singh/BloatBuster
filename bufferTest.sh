@@ -53,6 +53,7 @@ ENABLE_DL=$(jq -r '.test.iperf_common.enable_dl // true' "$CONFIG_FILE")
 ENABLE_UL=$(jq -r '.test.iperf_common.enable_ul // true' "$CONFIG_FILE")
 CONNECT_TIMEOUT=$(jq -r '.test.iperf_common.connect_timeout // 10' "$CONFIG_FILE")
 PORT_RETRIES=$(jq -r '.test.iperf_common.port_retries // 2' "$CONFIG_FILE")
+KILL_PAIRED=$(jq -r '.test.iperf_common.kill_paired_on_failure // false' "$CONFIG_FILE")
 
 # Port lists — accept array or single value in config
 if [[ "$STRESS_TYPE" == "udp" ]]; then
@@ -110,10 +111,10 @@ Configuration (config.json):
     connect_timeout               Seconds to wait before declaring a port failed (default: 10)
     port_retries                  Number of times to cycle through the port list before giving up (default: 2)
     report_interval               iperf3 -i interval (default: 1)
+    kill_paired_on_failure        false = retry only the failed direction, leave the other running (default)
+                                  true  = kill both directions when either fails, retry as a pair
     show_diagram                  true = show ASCII network diagram
-    (When both enable_dl and enable_ul are true, both must connect or both are killed
-     and the next port pair is tried. When only one direction is enabled, ports are
-     retried independently. Stress timer starts only after successful connection.)
+    (Stress timer starts only after both directions are verified.)
 
   test.udp:
     port_dl                       UDP DL port(s): single value or array e.g. [5991,5993]
@@ -229,16 +230,25 @@ _start_iperf_instance() {
     echo $!
 }
 
-# Returns 0 if iperf3 PID is alive AND its log file contains at least one data interval.
+# Returns 0 if iperf3 PID is alive AND its log contains at least one data interval
+# from line $start onward (default: 1 = whole file).
 _iperf_ok() {
-    local pid="$1" logfile="$2"
-    kill -0 "$pid" 2>/dev/null || return 1       # process still alive
-    grep -q 'bits/sec' "$logfile" 2>/dev/null     # at least one reported interval
+    local pid="$1" logfile="$2" start="${3:-1}"
+    kill -0 "$pid" 2>/dev/null || return 1
+    tail -n +"$start" "$logfile" 2>/dev/null | grep -q 'bits/sec'
+}
+
+# Extract the last iperf3 error/interrupt line from a log (from line $start onward).
+_last_iperf_err() {
+    local logfile="$1" start="${2:-1}"
+    tail -n +"$start" "$logfile" 2>/dev/null | grep 'iperf3: error\|iperf3: interrupt' | tail -1 | sed 's/.*iperf3:/iperf3:/'
 }
 
 # Launch iperf3 with port rotation and retry logic.
-# Paired mode (both DL+UL enabled): if either fails, kill both and try the next port pair.
-# Single mode (one direction only): retry that direction independently across its port list.
+# kill_paired_on_failure=false (default): when one direction fails, only that direction is
+#   killed and retried; the other keeps running. Both must be verified before stress starts.
+# kill_paired_on_failure=true: if either direction fails, kill both and retry as a pair.
+# Single mode (one direction only): retries that direction independently.
 # Stress timer must start AFTER this returns 0.
 # Returns 0 on success (PIDs appended to IPERF_PID_FILE), 1 if all ports exhausted.
 launch_iperf() {
@@ -251,6 +261,115 @@ launch_iperf() {
     local paired=false
     [[ "$ENABLE_DL" == true && "$ENABLE_UL" == true ]] && paired=true
 
+    # ── Independent retry path (paired + kill_paired_on_failure=false) ────────
+    if $paired && [[ "$KILL_PAIRED" != true ]]; then
+        local max_dl=$(( n_dl * PORT_RETRIES ))
+        local max_ul=$(( n_ul * PORT_RETRIES ))
+        local max_iters=$(( max_dl + max_ul + 2 ))
+
+        local dl_pid="" ul_pid=""
+        local dl_attempt=0 ul_attempt=0
+        local dl_verified=false ul_verified=false
+        local dl_port="" ul_port=""
+        local dl_log_start=1 ul_log_start=1
+
+        for (( _i=0; _i<max_iters; _i++ )); do
+
+            # Start any direction that needs a new process
+            if [[ "$ul_verified" == false && -z "$ul_pid" ]]; then
+                if [[ $ul_attempt -ge $max_ul ]]; then
+                    echo "ERROR: iperf3 UL exhausted all $max_ul attempt(s)."
+                    [[ -n "$dl_pid" ]] && kill "$dl_pid" 2>/dev/null
+                    return 1
+                fi
+                ul_port="${PORT_UL_LIST[$(( ul_attempt % n_ul ))]}"
+                ul_log_start=$(( $(wc -l < "$IPERF_LOG_UL" 2>/dev/null || echo 0) + 1 ))
+                ul_pid=$(_start_iperf_instance "$IPERF_LOG_UL" "$ul_port" "ul")
+                (( ul_attempt++ ))
+            fi
+            if [[ "$dl_verified" == false && -z "$dl_pid" ]]; then
+                if [[ $dl_attempt -ge $max_dl ]]; then
+                    echo "ERROR: iperf3 DL exhausted all $max_dl attempt(s)."
+                    [[ -n "$ul_pid" ]] && kill "$ul_pid" 2>/dev/null
+                    return 1
+                fi
+                dl_port="${PORT_DL_LIST[$(( dl_attempt % n_dl ))]}"
+                dl_log_start=$(( $(wc -l < "$IPERF_LOG_DL" 2>/dev/null || echo 0) + 1 ))
+                dl_pid=$(_start_iperf_instance "$IPERF_LOG_DL" "$dl_port" "dl")
+                (( dl_attempt++ ))
+            fi
+
+            # Phase 1 — poll for connection (unverified directions only)
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] Waiting for iperf3 connection(s) (max ${CONNECT_TIMEOUT}s)..."
+            local dl_ok=true ul_ok=true
+            local watching_dl=false watching_ul=false
+            [[ "$dl_verified" == false && -n "$dl_pid" ]] && watching_dl=true
+            [[ "$ul_verified" == false && -n "$ul_pid" ]] && watching_ul=true
+            local p1_deadline=$(( SECONDS + CONNECT_TIMEOUT ))
+            while [[ $SECONDS -lt $p1_deadline ]]; do
+                sleep 0.5
+                $watching_dl && ! kill -0 "$dl_pid" 2>/dev/null && watching_dl=false && dl_ok=false
+                $watching_ul && ! kill -0 "$ul_pid" 2>/dev/null && watching_ul=false && ul_ok=false
+                $watching_dl && tail -n +"$dl_log_start" "$IPERF_LOG_DL" 2>/dev/null | grep -q 'connected to' && watching_dl=false
+                $watching_ul && tail -n +"$ul_log_start" "$IPERF_LOG_UL" 2>/dev/null | grep -q 'connected to' && watching_ul=false
+                ! $watching_dl && ! $watching_ul && break
+            done
+            [[ "$dl_verified" == false && "$dl_ok" == true && -n "$dl_pid" ]] && ! kill -0 "$dl_pid" 2>/dev/null && dl_ok=false
+            [[ "$ul_verified" == false && "$ul_ok" == true && -n "$ul_pid" ]] && ! kill -0 "$ul_pid" 2>/dev/null && ul_ok=false
+
+            # Phase 2 — poll for first data interval (unverified directions only)
+            if [[ "$dl_ok" == true || "$ul_ok" == true ]]; then
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] Waiting for first data interval (max ${CONNECT_TIMEOUT}s)..."
+                local p2_deadline=$(( SECONDS + CONNECT_TIMEOUT ))
+                local need_dl=false need_ul=false
+                [[ "$dl_verified" == false && -n "$dl_pid" && "$dl_ok" == true ]] && need_dl=true
+                [[ "$ul_verified" == false && -n "$ul_pid" && "$ul_ok" == true ]] && need_ul=true
+                while [[ $SECONDS -lt $p2_deadline ]]; do
+                    sleep 0.5
+                    $need_dl && tail -n +"$dl_log_start" "$IPERF_LOG_DL" 2>/dev/null | grep -q 'bits/sec' && need_dl=false
+                    $need_ul && tail -n +"$ul_log_start" "$IPERF_LOG_UL" 2>/dev/null | grep -q 'bits/sec' && need_ul=false
+                    $need_dl && ! kill -0 "$dl_pid" 2>/dev/null && need_dl=false && dl_ok=false
+                    $need_ul && ! kill -0 "$ul_pid" 2>/dev/null && need_ul=false && ul_ok=false
+                    ! $need_dl && ! $need_ul && break
+                done
+                [[ "$dl_verified" == false && "$dl_ok" == true && -n "$dl_pid" ]] && ! _iperf_ok "$dl_pid" "$IPERF_LOG_DL" "$dl_log_start" && dl_ok=false
+                [[ "$ul_verified" == false && "$ul_ok" == true && -n "$ul_pid" ]] && ! _iperf_ok "$ul_pid" "$IPERF_LOG_UL" "$ul_log_start" && ul_ok=false
+            fi
+
+            # Mark verified successes
+            if [[ "$dl_verified" == false && "$dl_ok" == true ]]; then
+                dl_verified=true
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] iperf3 DL verified (PID $dl_pid, port $dl_port)"
+                echo "$dl_pid" >> "$IPERF_PID_FILE"
+            fi
+            if [[ "$ul_verified" == false && "$ul_ok" == true ]]; then
+                ul_verified=true
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] iperf3 UL verified (PID $ul_pid, port $ul_port)"
+                echo "$ul_pid" >> "$IPERF_PID_FILE"
+            fi
+
+            $dl_verified && $ul_verified && return 0
+
+            # Kill only the failed direction(s); surviving verified direction keeps running
+            local reason="" err_detail=""
+            if [[ "$dl_verified" == false && "$dl_ok" == false ]]; then
+                reason+=" DL(port $dl_port, attempt ${dl_attempt}/${max_dl})"
+                local e; e=$(_last_iperf_err "$IPERF_LOG_DL" "$dl_log_start"); [[ -n "$e" ]] && err_detail+=" [DL: $e]"
+                [[ -n "$dl_pid" ]] && kill "$dl_pid" 2>/dev/null; dl_pid=""
+            fi
+            if [[ "$ul_verified" == false && "$ul_ok" == false ]]; then
+                reason+=" UL(port $ul_port, attempt ${ul_attempt}/${max_ul})"
+                local e; e=$(_last_iperf_err "$IPERF_LOG_UL" "$ul_log_start"); [[ -n "$e" ]] && err_detail+=" [UL: $e]"
+                [[ -n "$ul_pid" ]] && kill "$ul_pid" 2>/dev/null; ul_pid=""
+            fi
+            [[ -n "$reason" ]] && echo "WARNING: iperf3$reason failed${err_detail}, retrying failed direction(s)..."
+        done
+
+        echo "ERROR: iperf3 could not connect after all attempts."
+        return 1
+    fi
+
+    # ── Kill-both-on-failure path (kill_paired_on_failure=true) or single mode ─
     local n_ports_paired=$(( n_dl > n_ul ? n_dl : n_ul ))
     local max_attempts
     if $paired; then
@@ -261,11 +380,10 @@ launch_iperf() {
         max_attempts=$(( n_ul * PORT_RETRIES ))
     fi
 
-    local attempt dl_pid ul_pid dl_ok ul_ok reason cycle total_cycles=$PORT_RETRIES
+    local attempt dl_pid ul_pid dl_ok ul_ok cycle total_cycles=$PORT_RETRIES
     for (( attempt=0; attempt<max_attempts; attempt++ )); do
         local dl_port="${PORT_DL_LIST[$(( attempt % n_dl ))]}"
         local ul_port="${PORT_UL_LIST[$(( attempt % n_ul ))]}"
-        # Which cycle are we on? (1-based, based on the relevant port list size)
         if $paired; then
             cycle=$(( attempt / n_ports_paired + 1 ))
         elif [[ "$ENABLE_DL" == true ]]; then
@@ -278,20 +396,41 @@ launch_iperf() {
         [[ "$ENABLE_UL" == true ]] && ul_pid=$(_start_iperf_instance "$IPERF_LOG_UL" "$ul_port" "ul")
         [[ "$ENABLE_DL" == true ]] && dl_pid=$(_start_iperf_instance "$IPERF_LOG_DL" "$dl_port" "dl")
 
-        # Phase 1 — connection check: wait for --connect-timeout to fire on failures
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Waiting for iperf3 connection(s) (${CONNECT_TIMEOUT}s)..."
-        sleep "$CONNECT_TIMEOUT"
-
+        # Phase 1 — poll for connection or death
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Waiting for iperf3 connection(s) (max ${CONNECT_TIMEOUT}s)..."
         dl_ok=true; ul_ok=true
-        [[ "$ENABLE_DL" == true && -n "$dl_pid" ]] && ! kill -0 "$dl_pid" 2>/dev/null && dl_ok=false
-        [[ "$ENABLE_UL" == true && -n "$ul_pid" ]] && ! kill -0 "$ul_pid" 2>/dev/null && ul_ok=false
+        local p1_deadline=$(( SECONDS + CONNECT_TIMEOUT ))
+        local watching_dl=false watching_ul=false
+        [[ "$ENABLE_DL" == true && -n "$dl_pid" ]] && watching_dl=true
+        [[ "$ENABLE_UL" == true && -n "$ul_pid" ]] && watching_ul=true
+        while [[ $SECONDS -lt $p1_deadline ]]; do
+            sleep 0.5
+            $watching_dl && ! kill -0 "$dl_pid" 2>/dev/null && watching_dl=false && dl_ok=false
+            $watching_ul && ! kill -0 "$ul_pid" 2>/dev/null && watching_ul=false && ul_ok=false
+            $watching_dl && grep -q 'connected to' "$IPERF_LOG_DL" 2>/dev/null && watching_dl=false
+            $watching_ul && grep -q 'connected to' "$IPERF_LOG_UL" 2>/dev/null && watching_ul=false
+            ! $watching_dl && ! $watching_ul && break
+        done
+        [[ "$ENABLE_DL" == true && "$dl_ok" == true && -n "$dl_pid" ]] && ! kill -0 "$dl_pid" 2>/dev/null && dl_ok=false
+        [[ "$ENABLE_UL" == true && "$ul_ok" == true && -n "$ul_pid" ]] && ! kill -0 "$ul_pid" 2>/dev/null && ul_ok=false
 
-        # Phase 2 — data check: wait one report interval so the first data line is in the log
+        # Phase 2 — poll for first data interval
         if [[ "$dl_ok" == true || "$ul_ok" == true ]]; then
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] Waiting for first data interval (${REPORT_INT}s)..."
-            sleep "$REPORT_INT"
-            [[ "$ENABLE_DL" == true && -n "$dl_pid" && "$dl_ok" == true ]] && ! _iperf_ok "$dl_pid" "$IPERF_LOG_DL" && dl_ok=false
-            [[ "$ENABLE_UL" == true && -n "$ul_pid" && "$ul_ok" == true ]] && ! _iperf_ok "$ul_pid" "$IPERF_LOG_UL" && ul_ok=false
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] Waiting for first data interval (max ${CONNECT_TIMEOUT}s)..."
+            local deadline=$(( SECONDS + CONNECT_TIMEOUT ))
+            local need_dl=false need_ul=false
+            [[ "$ENABLE_DL" == true && -n "$dl_pid" && "$dl_ok" == true ]] && need_dl=true
+            [[ "$ENABLE_UL" == true && -n "$ul_pid" && "$ul_ok" == true ]] && need_ul=true
+            while [[ $SECONDS -lt $deadline ]]; do
+                sleep 0.5
+                $need_dl && grep -q 'bits/sec' "$IPERF_LOG_DL" 2>/dev/null && need_dl=false
+                $need_ul && grep -q 'bits/sec' "$IPERF_LOG_UL" 2>/dev/null && need_ul=false
+                $need_dl && ! kill -0 "$dl_pid" 2>/dev/null && need_dl=false && dl_ok=false
+                $need_ul && ! kill -0 "$ul_pid" 2>/dev/null && need_ul=false && ul_ok=false
+                ! $need_dl && ! $need_ul && break
+            done
+            [[ "$ENABLE_DL" == true && "$dl_ok" == true && -n "$dl_pid" ]] && ! _iperf_ok "$dl_pid" "$IPERF_LOG_DL" && dl_ok=false
+            [[ "$ENABLE_UL" == true && "$ul_ok" == true && -n "$ul_pid" ]] && ! _iperf_ok "$ul_pid" "$IPERF_LOG_UL" && ul_ok=false
         fi
 
         if $paired; then
@@ -301,13 +440,18 @@ launch_iperf() {
                 echo "$dl_pid" >> "$IPERF_PID_FILE"; echo "$ul_pid" >> "$IPERF_PID_FILE"
                 return 0
             fi
-            # Kill both before trying next port pair
             [[ -n "$dl_pid" ]] && kill "$dl_pid" 2>/dev/null
             [[ -n "$ul_pid" ]] && kill "$ul_pid" 2>/dev/null
-            reason=""
-            [[ "$dl_ok" == false ]] && reason+=" DL(port $dl_port)"
-            [[ "$ul_ok" == false ]] && reason+=" UL(port $ul_port)"
-            echo "WARNING: iperf3$reason failed (attempt $((attempt+1))/${max_attempts}, cycle ${cycle}/${total_cycles}), trying next port pair..."
+            local reason="" err_detail=""
+            if [[ "$dl_ok" == false ]]; then
+                reason+=" DL(port $dl_port)"
+                local e; e=$(_last_iperf_err "$IPERF_LOG_DL"); [[ -n "$e" ]] && err_detail+=" [DL: $e]"
+            fi
+            if [[ "$ul_ok" == false ]]; then
+                reason+=" UL(port $ul_port)"
+                local e; e=$(_last_iperf_err "$IPERF_LOG_UL"); [[ -n "$e" ]] && err_detail+=" [UL: $e]"
+            fi
+            echo "WARNING: iperf3$reason failed (attempt $((attempt+1))/${max_attempts}, cycle ${cycle}/${total_cycles})${err_detail}, trying next port pair..."
         else
             if [[ "$ENABLE_DL" == true ]]; then
                 if [[ "$dl_ok" == true ]]; then
@@ -316,7 +460,8 @@ launch_iperf() {
                     return 0
                 fi
                 [[ -n "$dl_pid" ]] && kill "$dl_pid" 2>/dev/null
-                echo "WARNING: iperf3 DL failed (attempt $((attempt+1))/${max_attempts}, cycle ${cycle}/${total_cycles}, port $dl_port), trying next..."
+                local e; e=$(_last_iperf_err "$IPERF_LOG_DL")
+                echo "WARNING: iperf3 DL failed (attempt $((attempt+1))/${max_attempts}, cycle ${cycle}/${total_cycles}, port $dl_port)${e:+ [$e]}, trying next..."
             else
                 if [[ "$ul_ok" == true ]]; then
                     echo "[$(date '+%Y-%m-%d %H:%M:%S')] iperf3 UL verified (PID $ul_pid, port $ul_port)"
@@ -324,7 +469,8 @@ launch_iperf() {
                     return 0
                 fi
                 [[ -n "$ul_pid" ]] && kill "$ul_pid" 2>/dev/null
-                echo "WARNING: iperf3 UL failed (attempt $((attempt+1))/${max_attempts}, cycle ${cycle}/${total_cycles}, port $ul_port), trying next..."
+                local e; e=$(_last_iperf_err "$IPERF_LOG_UL")
+                echo "WARNING: iperf3 UL failed (attempt $((attempt+1))/${max_attempts}, cycle ${cycle}/${total_cycles}, port $ul_port)${e:+ [$e]}, trying next..."
             fi
         fi
     done
