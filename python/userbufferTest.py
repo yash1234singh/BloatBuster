@@ -42,7 +42,22 @@ DEFAULT_DL_CLIENTS    = 30
 DEFAULT_UL_CLIENTS    = 50
 DEFAULT_CHART_WIDTH   = 80
 DEFAULT_CHART_HEIGHT  = 20
-DEFAULT_RATE_METHOD   = 'auto'   # 'auto', 'procnetdev', or 'statsfile'
+# Rate measurement method — three options:
+#   'statsfile'  — reads traffic-gen.py's own byte counters (app-level).
+#                  Only counts curl bytes, unaffected by other LAN traffic.
+#                  Rate = (cumulative_bytes_now - cumulative_bytes_prev) * 8
+#                         / elapsed_seconds_between_stats_file_writes / 1_000_000
+#                  Units: Mbps.  Can appear bursty as curl threads finish in bursts.
+#   'procnetdev' — reads /proc/net/dev RX/TX counters for the WAN interface
+#                  (interface auto-detected via 'ip route get <target>').
+#                  Rate = (NIC_counter_now - NIC_counter_prev) * 8
+#                         / wall_clock_dt / 1_000_000
+#                  Units: Mbps.  Wire-level, smooth, but counts ALL traffic on
+#                  that interface (not just the test), so may be inflated on a
+#                  router or shared LAN machine.
+#   'auto'       — selects 'statsfile' unconditionally (safe default); use
+#                  '-m procnetdev -I <iface>' explicitly for wire-level readings.
+DEFAULT_RATE_METHOD   = 'auto'
 
 
 # ---------------------------------------------------------------------------
@@ -82,7 +97,7 @@ def run_traceroute(target, timeout=2):
 def read_throughput_snapshot(stats_file):
     """Read the current cumulative byte counters from traffic-gen's stats file.
 
-    Returns (dl_bytes, ul_bytes) or None if not available.
+    Returns (elapsed_sec, dl_bytes, ul_bytes) or None if not available.
     """
     if not stats_file or not os.path.exists(stats_file):
         return None
@@ -93,7 +108,7 @@ def read_throughput_snapshot(stats_file):
             return None
         parts = line.split()
         if len(parts) >= 4:
-            return int(parts[2]), int(parts[3])
+            return float(parts[1]), int(parts[2]), int(parts[3])
     except (OSError, ValueError):
         pass
     return None
@@ -136,6 +151,27 @@ def detect_default_interface():
     return None
 
 
+def detect_interface_for_target(target):
+    """Return the outgoing network interface used to reach *target*.
+
+    Uses ``ip route get <target>`` which correctly resolves policy routing
+    and returns the WAN/cellular interface rather than always returning the
+    default-route interface.  Falls back to detect_default_interface() if
+    the command is unavailable.
+    """
+    try:
+        res = subprocess.run(
+            ['ip', 'route', 'get', target],
+            capture_output=True, text=True, check=False, timeout=3
+        )
+        m = re.search(r'\bdev\s+(\S+)', res.stdout)
+        if m:
+            return m.group(1)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return detect_default_interface()
+
+
 def collect_latency_samples(target, duration_sec, interval_sec, timeout,
                             phase_name="PHASE", stats_file=None,
                             rate_method='statsfile', interface=None):
@@ -161,7 +197,9 @@ def collect_latency_samples(target, duration_sec, interval_sec, timeout,
     end_time = start_time + duration_sec
     sample_count = 0
     prev_dl = prev_ul = 0
+    start_dl = start_ul = 0
     prev_time = start_time
+    prev_sample_elapsed = None
     use_procnetdev = (rate_method == 'procnetdev' and interface)
 
     # Take initial /proc/net/dev snapshot for delta calculation
@@ -169,6 +207,12 @@ def collect_latency_samples(target, duration_sec, interval_sec, timeout,
         snap0 = read_procnetdev(interface)
         if snap0:
             prev_dl, prev_ul = snap0  # rx_bytes = DL, tx_bytes = UL
+            start_dl, start_ul = snap0
+    elif stats_file:
+        snap0 = read_throughput_snapshot(stats_file)
+        if snap0:
+            prev_sample_elapsed, prev_dl, prev_ul = snap0
+            start_dl, start_ul = prev_dl, prev_ul
 
     print(f"\n{'='*72}")
     method_label = f"/proc/net/dev ({interface})" if use_procnetdev else "stats-file"
@@ -205,23 +249,38 @@ def collect_latency_samples(target, duration_sec, interval_sec, timeout,
         if use_procnetdev:
             snap = read_procnetdev(interface)
             if snap:
-                dl_bytes, ul_bytes = snap  # rx = DL, tx = UL
+                raw_dl_bytes, raw_ul_bytes = snap  # rx = DL, tx = UL
                 dt = time.time() - prev_time
                 if dt > 0.1:
-                    dl_rate = (dl_bytes - prev_dl) * 8 / dt / 1_000_000
-                    ul_rate = (ul_bytes - prev_ul) * 8 / dt / 1_000_000
-                    prev_dl, prev_ul = dl_bytes, ul_bytes
+                    dl_rate = (raw_dl_bytes - prev_dl) * 8 / dt / 1_000_000
+                    ul_rate = (raw_ul_bytes - prev_ul) * 8 / dt / 1_000_000
+                    prev_dl, prev_ul = raw_dl_bytes, raw_ul_bytes
                     prev_time = time.time()
+                dl_bytes = max(0, raw_dl_bytes - start_dl)
+                ul_bytes = max(0, raw_ul_bytes - start_ul)
         elif stats_file:
             snap = read_throughput_snapshot(stats_file)
             if snap:
-                dl_bytes, ul_bytes = snap
-                dt = time.time() - prev_time
-                if dt > 0.1:
-                    dl_rate = (dl_bytes - prev_dl) * 8 / dt / 1_000_000
-                    ul_rate = (ul_bytes - prev_ul) * 8 / dt / 1_000_000
-                    prev_dl, prev_ul = dl_bytes, ul_bytes
-                    prev_time = time.time()
+                sample_elapsed, raw_dl_bytes, raw_ul_bytes = snap
+                if prev_sample_elapsed is None:
+                    prev_sample_elapsed = sample_elapsed
+                    prev_dl, prev_ul = raw_dl_bytes, raw_ul_bytes
+                    start_dl, start_ul = raw_dl_bytes, raw_ul_bytes
+                dt = sample_elapsed - prev_sample_elapsed
+                if dt >= 0.5:
+                    # Simple per-interval delta rate.  traffic-gen.py now
+                    # reports bytes progressively (counted as they flow
+                    # through the pipe), so the counter increments smoothly
+                    # every second instead of jumping on curl completion.
+                    dl_rate = (raw_dl_bytes - prev_dl) * 8 / dt / 1_000_000
+                    ul_rate = (raw_ul_bytes - prev_ul) * 8 / dt / 1_000_000
+                    prev_dl, prev_ul = raw_dl_bytes, raw_ul_bytes
+                    prev_sample_elapsed = sample_elapsed
+                else:
+                    # Stale snapshot — file hasn't been updated yet
+                    snap = None
+                dl_bytes = max(0, raw_dl_bytes - start_dl)
+                ul_bytes = max(0, raw_ul_bytes - start_ul)
 
         elapsed = time.time() - start_time
         time_series.append({
@@ -309,49 +368,92 @@ def compute_hop_stats(hop_data):
 # ---------------------------------------------------------------------------
 
 def print_segment_bloat_table(baseline_stats, stress_stats):
-    """Per-segment incremental delay analysis."""
+    """Per-segment incremental delay analysis.
+
+    Each row shows the latency added by that single link segment (incremental),
+    not the cumulative RTT to that hop.  Segment bloat values sum to the
+    end-to-end bloat; no intermediate hop can exceed the final hop.
+
+    A hop that responded in baseline but not during stress is ICMP-silent:
+    core/MPLS routers commonly deprioritise or drop ICMP TTL-exceeded
+    messages under load.  These hops are shown with 'N/A' bloat so they
+    do not produce spurious negative values; their bloat is already
+    captured by the first hop that DID respond under stress.
+    """
     print(f"\n{'='*72}")
     print(f"{'PER-SEGMENT BLOAT ANALYSIS (Incremental Delay)':^72}")
     print(f"{'='*72}")
-    print(f"{'Hop':<5}{'Segment':<35}{'Link Base':<12}{'Link P95':<12}{'Bloat':<10}")
-    print("-" * 72)
+    print(f"{'Hop':<5}{'Segment':<38}{'Link Base':<12}{'Link P95':<12}{'Bloat':<10}")
+    print("-" * 77)
 
     all_hops = sorted(set(baseline_stats.keys()) | set(stress_stats.keys()))
     segments = []
 
     prev_ip = "(source)"
+    prev_base_cum   = 0.0
+    prev_stress_cum = 0.0
+
     for hop in all_hops:
         b = baseline_stats.get(hop, {})
         s = stress_stats.get(hop, {})
         curr_ip = s.get('ip', b.get('ip', '*'))
 
-        base_avg = b.get('avg', 0)
-        stress_p95 = s.get('p95', 0)
-        bloat = stress_p95 - base_avg
+        cum_base       = b.get('avg', 0.0)
+        cum_stress_p95 = s.get('p95', 0.0)
 
-        segment_label = f"{prev_ip} -> {curr_ip}"
-        marker = "  <<<" if bloat > 50 else ""
+        # Skip hops where BOTH phases have no data (pure wildcard hops)
+        if curr_ip == '*' and cum_base == 0.0 and cum_stress_p95 == 0.0:
+            continue
 
-        print(f"{hop:<5}{segment_label:<35}{base_avg:<12.2f}{stress_p95:<12.2f}"
-              f"{bloat:<10.2f}{marker}")
-        segments.append((hop, curr_ip, base_avg, stress_p95, bloat))
+        # Hop has a real IP in baseline but no/few RTTs during stress
+        # → ICMP TTL-exceeded dropped under load; bloat is N/A for this segment.
+        # Also treat hops with very few stress RTTs (<3) as unreliable.
+        stress_rtts = s.get('rtts', [])
+        is_icmp_silent = (curr_ip != '*') and (len(stress_rtts) < 3)
+
+        # Detect same-IP consecutive hops (MPLS / non-decrementing TTL)
+        same_ip = (curr_ip == prev_ip and prev_ip != '(source)')
+        label_suffix = " [MPLS]" if same_ip else ""
+        segment_label = f"{prev_ip} -> {curr_ip}{label_suffix}"
+
+        link_base = max(0.0, cum_base - prev_base_cum)
+
+        if is_icmp_silent:
+            print(f"{hop:<5}{segment_label:<38}{link_base:<12.2f}{'N/A':<12}"
+                  f"N/A  (ICMP silent under load)")
+            segments.append((hop, curr_ip, link_base, None, None, True))
+        else:
+            link_stress_p95 = max(0.0, cum_stress_p95 - prev_stress_cum)
+            segment_bloat   = max(0.0, link_stress_p95 - link_base)
+            marker = "  <<<" if segment_bloat > 50 else ""
+            print(f"{hop:<5}{segment_label:<38}{link_base:<12.2f}"
+                  f"{link_stress_p95:<12.2f}{segment_bloat:<10.2f}{marker}")
+            segments.append((hop, curr_ip, link_base, link_stress_p95, segment_bloat, False))
+            if cum_stress_p95 > 0.0:
+                prev_stress_cum = cum_stress_p95
+
+        if cum_base > 0.0:
+            prev_base_cum = cum_base
         prev_ip = curr_ip
 
     return segments
 
 
 def print_ranked_bloat(segments):
-    """Ranked bloat summary — worst links first."""
+    """Ranked bloat summary — worst links first (ICMP-silent hops excluded)."""
     print(f"\n{'='*72}")
     print(f"{'LINK SEGMENTS RANKED BY BLOAT (Worst First)':^72}")
     print(f"{'='*72}")
     print(f"{'IP Address':<20}{'Bloat (ms)':<15}")
     print("-" * 72)
 
-    ranked = sorted(segments, key=lambda x: x[4], reverse=True)
-    for _, ip, _, _, bloat in ranked:
-        if bloat > 0:
-            print(f"{ip:<20}{bloat:<15.2f}ms")
+    # Only include hops with a real, positive bloat value
+    ranked = sorted(
+        [seg for seg in segments if not seg[5] and seg[4] is not None and seg[4] > 0],
+        key=lambda x: x[4], reverse=True,
+    )
+    for _, ip, _, _, bloat, _ in ranked:
+        print(f"{ip:<20}{bloat:<15.2f}ms")
 
 
 def print_network_diagram(segments):
@@ -364,21 +466,31 @@ def print_network_diagram(segments):
     print(f"|  {'(source)':<12}|")
     print(f"+{'─'*15}+")
 
-    for _, ip, base_avg, stress_p95, bloat in segments:
-        marker = "  <<<" if bloat > 50 else ""
+    for _, ip, base_avg, stress_p95, bloat, is_silent in segments:
         print(f"    |  Base:  {base_avg:.2f} ms")
-        print(f"    |  P95:  {stress_p95:.2f} ms")
-        print(f"    |  Bloat: {bloat:.2f} ms{marker}")
+        if is_silent:
+            print("    |  P95:  N/A (ICMP silent under load)")
+            print("    |  Bloat: N/A")
+        else:
+            marker = "  <<<" if bloat > 50 else ""
+            print(f"    |  P95:  {stress_p95:.2f} ms")
+            print(f"    |  Bloat: {bloat:.2f} ms{marker}")
         print("    v")
         print(f"+{'─'*15}+")
         print(f"| {ip:<14}|")
         print(f"+{'─'*15}+")
 
 
-def print_overall_summary(baseline_stats, stress_stats,
+def print_overall_summary(baseline_ts, stress_ts,
                           baseline_probes, baseline_lost,
                           stress_probes, stress_lost):
-    """End-to-end latency summary."""
+    """End-to-end latency summary.
+
+    RTT values are taken from the time-series e2e_rtt field (the RTT to the
+    last responding hop in each traceroute probe) rather than from hop_data,
+    which can have very few entries for the last-numbered hop under stress
+    because high-numbered hops are often ICMP-silent.
+    """
     print(f"\n{'='*72}")
     print(f"{'OVERALL LATENCY SUMMARY (End-to-End)':^72}")
     print(f"{'='*72}")
@@ -386,17 +498,11 @@ def print_overall_summary(baseline_stats, stress_stats,
           f"{'P95 (ms)':<11}{'Max (ms)':<11}")
     print("-" * 72)
 
-    def get_e2e(stats):
-        if not stats:
-            return []
-        last_hop = max(stats.keys())
-        return stats[last_hop].get('rtts', [])
+    base_rtts   = [e['e2e_rtt'] for e in baseline_ts if e['e2e_rtt'] is not None]
+    stress_rtts = [e['e2e_rtt'] for e in stress_ts   if e['e2e_rtt'] is not None]
 
-    base_rtts = get_e2e(baseline_stats)
-    stress_rtts = get_e2e(stress_stats)
-
-    base_loss_pct = (baseline_lost / baseline_probes * 100) if baseline_probes else 0
-    stress_loss_pct = (stress_lost / stress_probes * 100) if stress_probes else 0
+    base_loss_pct   = (baseline_lost / baseline_probes * 100) if baseline_probes else 0
+    stress_loss_pct = (stress_lost   / stress_probes   * 100) if stress_probes   else 0
 
     if base_rtts:
         print(f"{'BASELINE':<12}{len(base_rtts):<9}{base_loss_pct:<9.1f}"
@@ -418,27 +524,51 @@ def print_overall_summary(baseline_stats, stress_stats,
 # ---------------------------------------------------------------------------
 
 def print_time_series_table(baseline_ts, stress_ts):
-    """Print a time-aligned table of RTT and throughput for both phases."""
-    print(f"\n{'='*80}")
-    print(f"{'TIME-SERIES DATA (1-second intervals)':^80}")
-    print(f"{'='*80}")
-    print(f"{'Time':<10}│{'Phase':<10}│{'RTT ms':>8} │{'DL Mbps':>9} {'UL Mbps':>9} │"
+    """Print a time-aligned table of RTT and throughput for both phases.
+
+    Columns:
+      DL Δ(MB) / UL Δ(MB) — bytes transferred in this 1-second interval
+                             (delta of cumulative counters).  This is the
+                             raw source used to derive the Mbps rate.
+      DL Total / UL Total  — cumulative bytes since stress phase started.
+    """
+    W = 96
+    print(f"\n{'='*W}")
+    print(f"{'TIME-SERIES DATA (1-second intervals)':^{W}}")
+    print(f"{'='*W}")
+    print(f"{'Time':<10}│{'Phase':<10}│{'RTT ms':>8} │"
+          f"{'DL Mbps':>9} {'UL Mbps':>9} │"
+          f"{'DL Δ(MB)':>9} {'UL Δ(MB)':>9} │"
           f"{'DL Total':>10} {'UL Total':>10}")
-    print(f"{'─'*10}┼{'─'*10}┼{'─'*9}┼{'─'*20}┼{'─'*21}")
+    sep = f"{'─'*10}┼{'─'*10}┼{'─'*9}┼{'─'*20}┼{'─'*20}┼{'─'*21}"
+    print(sep)
 
     for entry in baseline_ts:
         rtt_s = f"{entry['e2e_rtt']:.1f}" if entry['e2e_rtt'] else "-"
         print(f"{entry['ts']:<10}│{'BASE':<10}│{rtt_s:>8} │"
-              f"{'':>9} {'':>9} │{'':>10} {'':>10}")
+              f"{'':>9} {'':>9} │{'':>9} {'':>9} │{'':>10} {'':>10}")
 
+    prev_dl = prev_ul = 0
     for entry in stress_ts:
         rtt_s = f"{entry['e2e_rtt']:.1f}" if entry['e2e_rtt'] else "-"
-        dl_r = f"{entry['dl_rate_mbps']:.1f}" if entry['dl_rate_mbps'] > 0 else "-"
-        ul_r = f"{entry['ul_rate_mbps']:.1f}" if entry['ul_rate_mbps'] > 0 else "-"
-        dl_mb = f"{entry['dl_bytes']/1048576:.1f}MB" if entry['dl_bytes'] > 0 else "-"
-        ul_mb = f"{entry['ul_bytes']/1048576:.1f}MB" if entry['ul_bytes'] > 0 else "-"
+        dl_r  = f"{entry['dl_rate_mbps']:.1f}" if entry['dl_rate_mbps'] > 0 else "0.0"
+        ul_r  = f"{entry['ul_rate_mbps']:.1f}" if entry['ul_rate_mbps'] > 0 else "0.0"
+
+        # Per-interval deltas (bytes → MB)
+        dl_delta = (entry['dl_bytes'] - prev_dl) / 1048576
+        ul_delta = (entry['ul_bytes'] - prev_ul) / 1048576
+        dl_d_s = f"{dl_delta:.2f}" if dl_delta > 0 else "0.00"
+        ul_d_s = f"{ul_delta:.2f}" if ul_delta > 0 else "0.00"
+
+        dl_tot = f"{entry['dl_bytes']/1048576:.1f}MB" if entry['dl_bytes'] > 0 else "-"
+        ul_tot = f"{entry['ul_bytes']/1048576:.1f}MB" if entry['ul_bytes'] > 0 else "-"
+
         print(f"{entry['ts']:<10}│{'STRESS':<10}│{rtt_s:>8} │"
-              f"{dl_r:>9} {ul_r:>9} │{dl_mb:>10} {ul_mb:>10}")
+              f"{dl_r:>9} {ul_r:>9} │"
+              f"{dl_d_s:>9} {ul_d_s:>9} │"
+              f"{dl_tot:>10} {ul_tot:>10}")
+        prev_dl = entry['dl_bytes']
+        prev_ul = entry['ul_bytes']
 
 
 def print_ascii_chart(baseline_ts, stress_ts, width=80, height=20):
@@ -628,7 +758,7 @@ def save_results_csv(output_file, baseline_stats, stress_stats, segments,
             writer.writerow(['# PER-HOP BLOAT'])
             writer.writerow(['hop', 'ip', 'baseline_avg_ms', 'baseline_p95_ms',
                              'stress_avg_ms', 'stress_p95_ms', 'bloat_ms'])
-            for hop_num, ip, base_avg, stress_p95, bloat in segments:
+            for hop_num, ip, base_avg, stress_p95, bloat, is_silent in segments:
                 b = baseline_stats.get(hop_num, {})
                 s = stress_stats.get(hop_num, {})
                 writer.writerow([
@@ -636,8 +766,8 @@ def save_results_csv(output_file, baseline_stats, stress_stats, segments,
                     f"{base_avg:.2f}",
                     f"{b.get('p95', 0):.2f}",
                     f"{s.get('avg', 0):.2f}",
-                    f"{stress_p95:.2f}",
-                    f"{bloat:.2f}",
+                    f"{stress_p95:.2f}" if not is_silent else "N/A",
+                    f"{bloat:.2f}"     if not is_silent else "N/A",
                 ])
 
             # Section 2: Time-series
@@ -688,6 +818,7 @@ def start_traffic_gen(dl_clients, ul_clients, duration_secs, log_file, stats_fil
         '-t', str(duration_mins),
         '-p', '0',
         '-S', stats_file,
+        '--stats-interval', '1',
     ]
     if log_file:
         cmd.extend(['-l', log_file])
@@ -749,9 +880,11 @@ def parse_args():
     p.add_argument('-m', '--rate-method', type=str, default=DEFAULT_RATE_METHOD,
                    choices=['auto', 'procnetdev', 'statsfile'],
                    help="Throughput measurement method: "
-                        "'procnetdev' reads /proc/net/dev (wire-level, smooth — Linux only), "
-                        "'statsfile' reads traffic-gen.py's stats file (app-level, bursty), "
-                        "'auto' uses procnetdev on Linux, statsfile otherwise")
+                        "'procnetdev' reads /proc/net/dev on the WAN interface (wire-level, "
+                        "auto-detected via 'ip route get <target>'), "
+                        "'statsfile' reads traffic-gen.py's app-level byte counters (may "
+                        "exceed WAN capacity when the test machine has fast local internet), "
+                        "'auto' uses procnetdev on Linux, statsfile otherwise (default)")
     p.add_argument('-I', '--interface', type=str, default=None,
                    help="Network interface for /proc/net/dev measurement "
                         "(auto-detected from default route if omitted)")
@@ -778,10 +911,11 @@ def main():
     rate_method = args.rate_method
     interface = args.interface
     if rate_method == 'auto':
-        if os.path.exists('/proc/net/dev'):
-            rate_method = 'procnetdev'
-        else:
-            rate_method = 'statsfile'
+        # Default to statsfile: counts only traffic-gen.py's own curl bytes,
+        # so it is unaffected by other hosts on the LAN or router forwarding
+        # traffic on the outgoing interface.  Use '-m procnetdev -I <iface>'
+        # explicitly if you want raw NIC counters on a known WAN interface.
+        rate_method = 'statsfile'
 
     if rate_method == 'procnetdev':
         if not os.path.exists('/proc/net/dev'):
@@ -789,11 +923,59 @@ def main():
                   file=sys.stderr)
             rate_method = 'statsfile'
         elif not interface:
-            interface = detect_default_interface()
+            # Use the interface that actually routes packets to the test target
+            # (e.g. the cellular/WAN port), not necessarily the default-route iface.
+            interface = detect_interface_for_target(args.target)
             if not interface:
-                print("[WARN] Could not detect default interface, falling back to statsfile.",
+                print("[WARN] Could not detect outgoing interface, falling back to statsfile.",
                       file=sys.stderr)
                 rate_method = 'statsfile'
+
+    # --- procnetdev pre-test sanity check ---
+    # Measure a 2-second idle rate on the detected interface BEFORE any traffic
+    # starts.  This lets the user verify they are reading the right interface
+    # and catches the common misconfiguration where a LAN/bridge interface is
+    # auto-detected instead of the WAN port.
+    if rate_method == 'procnetdev' and interface:
+        print(f"\n[INFO] procnetdev: checking interface '{interface}' ...")
+        try:
+            res = subprocess.run(['ip', 'route', 'get', args.target],
+                                 capture_output=True, text=True, check=False, timeout=3)
+            print(f"[INFO] ip route get {args.target}  →  {res.stdout.strip()}")
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        snap_a = read_procnetdev(interface)
+        time.sleep(2)
+        snap_b = read_procnetdev(interface)
+        if snap_a and snap_b:
+            idle_dl = (snap_b[0] - snap_a[0]) * 8 / 2 / 1_000_000
+            idle_ul = (snap_b[1] - snap_a[1]) * 8 / 2 / 1_000_000
+            print(f"[INFO] '{interface}' idle rate (2s sample): "
+                  f"DL {idle_dl:.1f} Mbps  UL {idle_ul:.1f} Mbps")
+            if idle_dl > 20 or idle_ul > 20:
+                print(f"[WARN] *** Idle rate is unexpectedly high for a 10 Mbps WAN! ***",
+                      file=sys.stderr)
+                print(f"[WARN] '{interface}' is likely a LAN/bridge interface that sees all",
+                      file=sys.stderr)
+                print(f"[WARN] forwarded traffic — reported rates will be inflated.",
+                      file=sys.stderr)
+                print(f"[WARN] Recommendation: use '-m statsfile' (measures only test traffic),",
+                      file=sys.stderr)
+                print(f"[WARN] or specify your actual WAN interface with '-I <iface>'.",
+                      file=sys.stderr)
+                # List available interfaces to help the user pick the right one
+                print(f"[WARN] Available interfaces in /proc/net/dev:", file=sys.stderr)
+                try:
+                    with open('/proc/net/dev', 'r', encoding='utf-8') as _f:
+                        for _line in _f:
+                            if ':' in _line:
+                                _iface = _line.split(':')[0].strip()
+                                if _iface and _iface != 'lo':
+                                    _snap = read_procnetdev(_iface)
+                                    _rx = f"{_snap[0]/1073741824:.2f} GB RX" if _snap else ""
+                                    print(f"[WARN]   {_iface:15s} {_rx}", file=sys.stderr)
+                except OSError:
+                    pass
 
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     traffic_log = f"traffic_gen_{timestamp}.csv"
@@ -858,7 +1040,7 @@ def main():
     segments = print_segment_bloat_table(baseline_stats, stress_stats)
     print_ranked_bloat(segments)
     print_network_diagram(segments)
-    print_overall_summary(baseline_stats, stress_stats,
+    print_overall_summary(baseline_ts, stress_ts,
                           baseline_probes, baseline_lost,
                           stress_probes, stress_lost)
     print_throughput_summary(stress_ts)

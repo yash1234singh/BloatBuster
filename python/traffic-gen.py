@@ -35,6 +35,7 @@ DURATION_MINS = 3000
 PROGRESS_SECS = 60
 LOG_FILE      = None
 STATS_FILE    = None   # real-time byte-counter file (used by userbufferTest.py)
+STATS_INTERVAL = 1     # how often (seconds) to write stats file; keep ≤1 for accurate rates
 
 # --- URL GROUPS ---
 G1_QUIC = [
@@ -156,30 +157,51 @@ def run_downloader(worker_id, curl_h3_enabled):
         url = random.choice(url_list)
         print(f"[{_now()}] [DL-Thread #{worker_id:>3}] -> STARTING [{req_type}] | {url}")
 
+        # Body flows through stdout for progressive byte counting;
+        # -w output goes to stderr via %{stderr} so it doesn't mix with body.
         cmd = [
             'curl', '-L', '-s', '-v',
             '--limit-rate', '5M', '--max-time', '300',
             '--user-agent', 'Mozilla/5.0',
-            '-o', '/dev/null',
-            '-w', '%{size_download} %{size_upload} %{http_code}',
+            '-w', '%{stderr}CURL_STATS %{size_download} %{size_upload} %{http_code}',
             url,
         ]
         if req_type == "QUIC " and curl_h3_enabled:
             cmd.insert(1, '--http3')
 
-        dl_bytes = ul_bytes = success = sock_opened = sock_closed = sock_reset = 0
+        success = sock_opened = sock_closed = sock_reset = 0
         returncode = -1
+        key = f"{worker_id}_DL"
         try:
-            res = subprocess.run(cmd, capture_output=True, text=True, check=False)
-            returncode = res.returncode
-            dl_bytes, ul_bytes, http_code = _parse_curl_output(res.stdout)
+            p = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE)
+            # Read body in chunks, counting bytes progressively
+            while True:
+                chunk = p.stdout.read(65536)
+                if not chunk:
+                    break
+                with stats_lock:
+                    stats[key]['dl_bytes'] += len(chunk)
+            stderr_raw = p.stderr.read().decode('utf-8', errors='replace')
+            p.wait()
+            returncode = p.returncode
+            # Parse socket events from verbose output
+            sock_opened, sock_closed, sock_reset = _parse_socket_events(stderr_raw)
+            # Parse CURL_STATS line from stderr (written by -w %{stderr}...)
+            http_code = 0
+            for line in stderr_raw.splitlines():
+                if line.startswith('CURL_STATS '):
+                    parts = line.split()
+                    if len(parts) >= 4:
+                        http_code = int(parts[3])
+                    break
             success = 1 if 200 <= http_code < 400 and returncode == 0 else 0
-            sock_opened, sock_closed, sock_reset = _parse_socket_events(res.stderr)
         except Exception as exc:
             print(f"[{_now()}] [DL-Thread #{worker_id:>3}] ERROR: {exc}")
 
         if running:
-            _record_stats(f"{worker_id}_DL", success, dl_bytes, ul_bytes,
+            # dl_bytes already counted progressively above; pass 0 to avoid double-count
+            _record_stats(key, success, 0, 0,
                           sock_opened, sock_closed, sock_reset, returncode)
         print(f"[{_now()}] [DL-Thread #{worker_id:>3}] <- FINISHED")
 
@@ -201,28 +223,48 @@ def run_uploader(worker_id):
             'curl', '-s', '-v', '-X', 'POST', '--data-binary', '@-',
             '--limit-rate', '3M', '--max-time', '300',
             '-o', '/dev/null',
-            '-w', '%{size_download} %{size_upload} %{http_code}',
+            '-w', '%{stderr}CURL_STATS %{size_download} %{size_upload} %{http_code}',
             url,
         ]
 
-        dl_bytes = ul_bytes = success = sock_opened = sock_closed = sock_reset = 0
+        success = sock_opened = sock_closed = sock_reset = 0
         returncode = -1
+        key = f"{worker_id}_UL"
         try:
             p1 = subprocess.Popen(dd_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-            p2 = subprocess.Popen(curl_cmd, stdin=p1.stdout,
-                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            if p1.stdout:
-                p1.stdout.close()
-            out, err = p2.communicate()
+            p2 = subprocess.Popen(curl_cmd, stdin=subprocess.PIPE,
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            # Shuttle data from dd to curl, counting upload bytes progressively
+            while True:
+                chunk = p1.stdout.read(65536)
+                if not chunk:
+                    break
+                try:
+                    p2.stdin.write(chunk)
+                    with stats_lock:
+                        stats[key]['ul_bytes'] += len(chunk)
+                except (BrokenPipeError, OSError):
+                    break
+            p2.stdin.close()
+            p1.wait()
+            stderr_raw = p2.stderr.read().decode('utf-8', errors='replace')
+            p2.wait()
             returncode = p2.returncode
-            dl_bytes, ul_bytes, http_code = _parse_curl_output(out)
+            sock_opened, sock_closed, sock_reset = _parse_socket_events(stderr_raw)
+            http_code = 0
+            for line in stderr_raw.splitlines():
+                if line.startswith('CURL_STATS '):
+                    parts = line.split()
+                    if len(parts) >= 4:
+                        http_code = int(parts[3])
+                    break
             success = 1 if 200 <= http_code < 400 and returncode == 0 else 0
-            sock_opened, sock_closed, sock_reset = _parse_socket_events(err)
         except Exception as exc:
             print(f"[{_now()}] [UL-Thread #{worker_id:>3}] ERROR: {exc}")
 
         if running:
-            _record_stats(f"{worker_id}_UL", success, dl_bytes, ul_bytes,
+            # ul_bytes already counted progressively above; pass 0 to avoid double-count
+            _record_stats(key, success, 0, 0,
                           sock_opened, sock_closed, sock_reset, returncode)
         print(f"[{_now()}] [UL-Thread #{worker_id:>3}] <- FINISHED UPLOAD")
 
@@ -256,13 +298,16 @@ def periodic_summary(interval_secs, run_start_time):
         print(f"    Data     : DL {tot_dl:.1f} MB  |  UL {tot_ul:.1f} MB\n")
 
 
-def stats_writer(stats_file_path, run_start_time):
-    """Write cumulative byte counters to a file every second.
+def stats_writer(stats_file_path, run_start_time, interval=1.0):
+    """Write cumulative byte counters to a file at a fixed interval.
 
     Format per line: <timestamp> <elapsed_sec> <dl_bytes> <ul_bytes>
-    The file is atomically overwritten each second so the reader always
+    The file is atomically overwritten each interval so the reader always
     gets a consistent snapshot.  A growing append log (.log suffix) is
     also maintained for post-hoc analysis.
+
+    Uses time.monotonic() to schedule writes at exact multiples of
+    *interval* seconds, avoiding drift from lock contention or I/O delays.
     """
     log_path = stats_file_path + ".log"
     try:
@@ -271,10 +316,24 @@ def stats_writer(stats_file_path, run_start_time):
     except OSError:
         pass
 
+    next_write = time.monotonic() + interval
     while running:
-        time.sleep(1)
+        # Sleep until the next scheduled write, waking early to check 'running'
+        now_mono = time.monotonic()
+        sleep_dur = next_write - now_mono
+        if sleep_dur > 0:
+            time.sleep(min(sleep_dur, 0.25))
+            continue  # re-check running flag and timing
+
         if not running:
             return
+
+        # Schedule the next write immediately to minimise drift
+        next_write += interval
+        # If we somehow fell behind, skip ahead to avoid a burst of writes
+        if next_write < time.monotonic():
+            next_write = time.monotonic() + interval
+
         elapsed = time.time() - run_start_time
         with stats_lock:
             tot_dl = sum(v['dl_bytes'] for v in stats.values())
@@ -348,7 +407,7 @@ def generate_report(log_file=None):
                 writer.writerows(rows)
                 writer.writerow(['TOTAL', '',
                                  tot_succ, tot_fail, tot_open, tot_clos, tot_rst,
-                                 f"DL:{tot_dl / 1048576:.2f} UL:{tot_ul / 1048576:.2f}"])
+                                 f"DL:{tot_dl / 1048576:.2f} MB UL:{tot_ul / 1048576:.2f} MB"])
             print(f"\nReport saved to: {log_file}")
         except OSError as exc:
             print(f"[WARN] Could not write log file: {exc}", file=sys.stderr)
@@ -374,7 +433,9 @@ def parse_args():
     p.add_argument('-p', '--progress',   type=int,   default=PROGRESS_SECS,
                    help="Periodic progress summary interval in seconds (0 = off)")
     p.add_argument('-S', '--stats-file',  type=str,   default=STATS_FILE,
-                   help="Write cumulative byte counters to this file every second (for external readers)")
+                   help="Write cumulative byte counters to this file (for external readers)")
+    p.add_argument('--stats-interval', type=float, default=STATS_INTERVAL,
+                   help="Interval in seconds between stats-file writes (default: 1)")
     return p.parse_args()
 
 
@@ -426,7 +487,7 @@ if __name__ == "__main__":
         if args.progress > 0:
             executor.submit(periodic_summary, args.progress, start_time)  # start_time defined above
         if args.stats_file:
-            executor.submit(stats_writer, args.stats_file, start_time)
+            executor.submit(stats_writer, args.stats_file, start_time, args.stats_interval)
 
         try:
             while running:
