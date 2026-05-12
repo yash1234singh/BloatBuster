@@ -9,7 +9,7 @@ set -u
 # LOAD CONFIG FROM config.json (requires jq)
 # ══════════════════════════════════════════════════════════════════════════════
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-CONFIG_FILE="${CONFIG_FILE:-$SCRIPT_DIR/config.json}"
+CONFIG_FILE="${CONFIG_FILE:-$SCRIPT_DIR/../config.json}"
 BM="$SCRIPT_DIR/bufferManager.sh"
 BT="$SCRIPT_DIR/bufferTest.sh"
 

@@ -1,37 +1,228 @@
 # Bufferbloat Testing Toolkit
 
-Three scripts for detecting, mitigating, and benchmarking bufferbloat on Linux network links — particularly useful for LTE/5G, satellite, and other variable-bandwidth WANs.
+Two approaches for detecting, mitigating, and benchmarking bufferbloat on Linux network links — particularly useful for LTE/5G, satellite, and other variable-bandwidth WANs.
 
 ## Overview
 
+### Two Testing Approaches
+
+| Approach | Scripts | Requires | Best For |
+|----------|---------|----------|----------|
+| **Python (no server)** | `python/userbufferTest.py` + `python/traffic-gen.py` | Python 3, `curl`, `traceroute` | Quick tests without iperf3 server setup |
+| **Bash (iperf3 server)** | `bash/bufferTest.sh` + `bash/bufferManager.sh` + `bash/bufferScenarioTest.sh` + `bash/bloatChart.sh` | `iperf3`, `traceroute`, `jq`, `tc`, root | Production shaping, A/B benchmarking |
+
+### Directory Structure
+
+```
+BloatBuster/
+├── README.md
+├── LICENSE
+├── config.json   # Bash tool configs
+│
+├── python/                         # Python-based (no server needed)
+│   ├── userbufferTest.py           #   Bufferbloat measurement
+│   └── traffic-gen.py              #   Browsing traffic generator
+│
+├── bash/                           # Bash-based (requires iperf3 server)
+│   ├── bufferManager.sh            #   Traffic shaping (CAKE/HTB/fq_codel)
+│   ├── bufferTest.sh               #   Bufferbloat measurement
+│   ├── bufferScenarioTest.sh       #   A/B scenario comparison
+│   └── bloatChart.sh               #   ASCII time-series charts
+```
+
+### Tool Summary
+
 | Script | Purpose | Requires |
 |--------|---------|----------|
-| **bufferManager.sh** | Apply/remove traffic shaping strategies (CAKE, HTB, fq_codel) and TCP tuning (BBR, ECN) | `tc`, `ip`, `sysctl`, `jq`, root |
-| **bufferTest.sh** | Measure bufferbloat via per-hop traceroute + iperf3 stress testing | `iperf3`, `traceroute`, `jq`, iperf3 server |
-| **bufferScenarioTest.sh** | Orchestrate A/B comparisons: apply strategy → run test → record results → compare | Both scripts above, `jq`, `bc` |
-| **bloatChart.sh** | ASCII time-series chart: overlay throughput, RTT, and autorate limits | `jq`, `awk` (runs automatically or standalone) |
+| **python/userbufferTest.py** | Measure bufferbloat via per-hop traceroute + real browsing traffic stress | Python 3, `curl`, `traceroute` |
+| **python/traffic-gen.py** | Standalone browsing traffic simulator (HTTP/HTTPS/QUIC) | Python 3, `curl`, `dd` |
+| **bash/bufferManager.sh** | Apply/remove traffic shaping strategies (CAKE, HTB, fq_codel) and TCP tuning (BBR, ECN) | `tc`, `ip`, `sysctl`, `jq`, root |
+| **bash/bufferTest.sh** | Measure bufferbloat via per-hop traceroute + iperf3 stress testing | `iperf3`, `traceroute`, `jq`, iperf3 server |
+| **bash/bufferScenarioTest.sh** | Orchestrate A/B comparisons: apply strategy → run test → compare results | Both bash scripts above, `jq`, `bc` |
+| **bash/bloatChart.sh** | ASCII time-series chart: overlay throughput, RTT, and autorate limits | `jq`, `awk` |
 
-All scripts read their configuration from a single **`config.json`** file (requires `jq`).
+Bash scripts read configuration from a single **`config.json`** file (requires `jq`).
 
 ```
-bufferScenarioTest.sh
-  │
-  ├─ bufferManager.sh remove/tune/cake-bidir/autorate  (apply strategy)
-  ├─ bufferManager.sh clear                             (zero counters)
-  ├─ bufferTest.sh                                      (run bloat test)
-  ├─ bufferManager.sh counters                          (read counters)
-  └─ Compare all scenarios in a table
+python/userbufferTest.py                    bash/bufferScenarioTest.sh
+  │                                           │
+  └─ python/traffic-gen.py (stress load)      ├─ bash/bufferManager.sh (apply strategy)
+                                              ├─ bash/bufferTest.sh    (run bloat test)
+                                              └─ Compare all scenarios
 ```
+
+---
+
+## Python Tools (No Server Required)
+
+### userbufferTest.py
+
+Two-phase bufferbloat measurement using real browsing traffic as stress. Same per-hop methodology as `bufferTest.sh` but uses `traffic-gen.py` instead of iperf3 — **no remote server setup needed**.
+
+#### How It Works
+
+```
+Phase 1: BASELINE (30s)
+  └─ Traceroute every 1s to all hops → record per-hop latency (no load)
+
+Phase 2: STRESS (120s)
+  ├─ Launch traffic-gen.py (30 DL + 50 UL threads browsing real websites)
+  └─ Traceroute every 1s to all hops → record per-hop latency (under load)
+```
+
+#### Throughput Measurement Methods
+
+| Method | Flag | How | Accuracy | Platform |
+|--------|------|-----|----------|----------|
+| **procnetdev** (default on Linux) | `-m procnetdev` | Reads `/proc/net/dev` RX/TX byte counters | Wire-level, smooth 1s samples | Linux only |
+| **statsfile** | `-m statsfile` | Reads traffic-gen.py's cumulative byte counter file | App-level, bursty (reports only when curl requests complete) | Any OS |
+| **auto** (default) | `-m auto` | Uses `procnetdev` on Linux, `statsfile` elsewhere | Best available | Any OS |
+
+The `procnetdev` method reads the kernel's interface counters directly, giving accurate per-second throughput regardless of when individual HTTP requests complete. The `statsfile` method relies on curl reporting bytes only when each request finishes, causing spiky throughput readings.
+
+#### Usage
+
+```bash
+# Basic test (auto-detects interface and measurement method)
+python3 python/userbufferTest.py -T 8.8.8.8
+
+# Specify interface and method explicitly
+python3 python/userbufferTest.py -T 8.8.8.8 -m procnetdev -I eth0
+
+# Custom clients and duration
+python3 python/userbufferTest.py -T 10.1.2.1 -b 20 -s 60 -d 15 -u 25
+
+# Save results to CSV
+python3 python/userbufferTest.py -T 1.1.1.1 -o results.csv
+
+# Use statsfile method (curl-based, works on non-Linux)
+python3 python/userbufferTest.py -T 8.8.8.8 -m statsfile
+```
+
+#### CLI Options
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `-T, --target` | Traceroute target host/IP (required) | — |
+| `-b, --baseline` | Baseline phase duration (seconds) | `30` |
+| `-s, --stress` | Stress phase duration (seconds) | `120` |
+| `-i, --interval` | Traceroute poll interval (seconds) | `1` |
+| `-w, --timeout` | Traceroute wait timeout (seconds) | `2` |
+| `-d, --dl-clients` | Download threads for traffic-gen.py | `30` |
+| `-u, --ul-clients` | Upload threads for traffic-gen.py | `50` |
+| `-m, --rate-method` | Throughput method: `auto`, `procnetdev`, `statsfile` | `auto` |
+| `-I, --interface` | Network interface for procnetdev (auto-detected if omitted) | auto |
+| `-o, --output` | Save results to CSV file | — |
+| `-W, --chart-width` | ASCII chart width in columns | `80` |
+| `-H, --chart-height` | ASCII chart height in rows | `20` |
+
+#### Analysis Output
+
+1. **Per-Segment Bloat Table** — incremental delay between each hop pair
+2. **Ranked Bloat Summary** — worst bloating links sorted by severity
+3. **ASCII Network Diagram** — visual path with per-link baseline/stress/bloat
+4. **Overall Latency Summary** — end-to-end avg, P95, max, loss %
+5. **Throughput Summary** — DL/UL mean, max, median, P10, P90 Mbps
+6. **Time-Series Table** — 1-second RTT + throughput data
+7. **ASCII Chart** — dual-axis: throughput (▓ DL, ░ UL) + RTT (● stress, ○ baseline)
+8. **Traffic Summary** — per-client success/fail/socket stats from traffic-gen.py
+
+#### Sample Output
+
+```
+========================================================================
+             PER-SEGMENT BLOAT ANALYSIS (Incremental Delay)
+========================================================================
+Hop  Segment                            Link Base   Link P95    Bloat
+------------------------------------------------------------------------
+1    (source) -> 172.20.10.1            0.42        0.64        0.22
+4    192.168.5.2 -> 10.222.70.81        59.32       1001.65     942.33      <<<
+
+========================================================================
+                  OVERALL LATENCY SUMMARY (End-to-End)
+========================================================================
+Phase       Samples  Loss %   Avg (ms)   P95 (ms)   Max (ms)
+------------------------------------------------------------------------
+BASELINE    1        0.0      61.50      61.50      61.50
+STRESS      120      0.0      547.46     1001.42    1326.19
+
+========================================================================
+                 THROUGHPUT SUMMARY (Browsing Traffic)
+========================================================================
+Direction    Mean Mbps     Max  Median     P10     P90 Samples
+------------------------------------------------------------------------
+download        394.94 2468.53    3.27    0.01 1692.65      49
+upload          187.52  463.39  139.85   13.61  391.88      20
+```
+
+#### Requirements
+
+- Python 3.8+
+- `curl` (with HTTP/3/QUIC support optional)
+- `dd` (for upload data generation)
+- `traceroute` (`apt install traceroute`)
+
+---
+
+### traffic-gen.py
+
+Standalone browsing traffic simulator. Spawns concurrent download and upload threads that fetch random URLs via curl, generating realistic HTTP/HTTPS/QUIC traffic patterns.
+
+#### What It Does
+
+- Launches parallel DL and UL worker threads via `ThreadPoolExecutor`
+- Downloads from popular sites (Google, Facebook, Wikipedia, etc.) and large test files
+- Uploads random-sized data blobs (10–49 MB) to httpbin.org
+- Supports HTTP/3 (QUIC) when curl has `--http3` support
+- Tracks per-client stats: success/fail, bytes transferred, socket events
+- Writes real-time byte counters to a stats file (for use by `userbufferTest.py`)
+
+#### Usage
+
+```bash
+# Default: 30 DL + 50 UL threads, runs for 3000 minutes
+python3 python/traffic-gen.py
+
+# Custom settings
+python3 python/traffic-gen.py -d 15 -u 25 -t 10
+
+# With CSV report and stats file
+python3 python/traffic-gen.py -d 20 -u 30 -t 5 -l report.csv -S stats.dat
+
+# No periodic progress (quiet mode)
+python3 python/traffic-gen.py -p 0
+```
+
+#### CLI Options
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `-d, --dl-clients` | Parallel download threads | `30` |
+| `-u, --ul-clients` | Parallel upload threads | `50` |
+| `-t, --duration` | Run duration in minutes (0 = unlimited) | `3000` |
+| `-l, --log` | Save final report to CSV file | — |
+| `-p, --progress` | Periodic summary interval in seconds (0 = off) | `60` |
+| `-S, --stats-file` | Write cumulative byte counters to this file every second | — |
+
+#### URL Groups
+
+| Group | Protocol | Sites |
+|-------|----------|-------|
+| G1_QUIC | HTTP/3 | google.com, facebook.com, chatgpt.com, tiktok.com |
+| G2_HTTPS | HTTPS | wikipedia.org, reddit.com, amazon.com, github.com, ... |
+| G3_HTTP | HTTP | msn.com, yahoo.com, cnn.com, bing.com, bbc.com |
+| G4_FILES | HTTP/S | 100MB/512MB test files from thinkbroadband, hetzner, leaseweb |
+| G5_UPLOADS | HTTP/S | httpbin.org/post |
 
 ---
 
 ## Configuration (config.json)
 
-All settings are centralized in `config.json`. Each script reads the keys it needs at startup.
+All settings are centralized in `config.json`. Each bash script reads the keys it needs at startup.
 
 To switch profiles, change `"active_profile"` — no need to edit any script.
 
-To use a different config file: `CONFIG_FILE=/path/to/config.json ./bufferManager.sh <cmd>`
+To use a different config file: `CONFIG_FILE=/path/to/config.json bash/bufferManager.sh <cmd>`
 
 ### Structure
 
@@ -136,11 +327,13 @@ When you saturate a network link, excess packets queue in buffers — often larg
 
 ---
 
-## bufferManager.sh
+## Bash Tools (iperf3 Server Required)
+
+### bufferManager.sh
 
 Traffic shaping and TCP stack tuning. Supports multiple qdisc strategies with static or adaptive (RTT-based) rate control.
 
-### Architecture
+#### Architecture
 
 ```
 EGRESS (upload):
@@ -150,7 +343,7 @@ INGRESS (download, cake-bidir only):
   wire → NIC → [ingress qdisc] → redirect → [IFB0: CAKE @ shaped rate] → App
 ```
 
-### Strategies
+#### Strategies
 
 | Command | Qdisc | Shaping | Best For |
 |---------|-------|---------|----------|
@@ -160,7 +353,7 @@ INGRESS (download, cake-bidir only):
 | `fq_codel` | fq_codel only | None | When bottleneck is at the NIC itself |
 | `aggressive` | fq_codel (tight limits) | None | Last resort, aggressive AQM |
 
-### Adaptive Mode (autorate)
+#### Adaptive Mode (autorate)
 
 Instead of fixed rates, `autorate` continuously probes RTT and adjusts CAKE bandwidth:
 
@@ -174,7 +367,7 @@ Every 5s:
   4. tc qdisc change (live, no traffic disruption)
 ```
 
-### TCP Tuning
+#### TCP Tuning
 
 `tune` applies complementary TCP stack optimizations:
 - **BBR** congestion control (model-based, doesn't fill buffers)
@@ -182,7 +375,7 @@ Every 5s:
 - **Reduced rmem/wmem** (limits TCP receive window → server sends slower)
 - **Timestamps on**, slow_start_after_idle off
 
-### Config Profiles
+#### Config Profiles
 
 Edit `config.json` to define link-specific profiles:
 
@@ -211,22 +404,22 @@ Switch profiles by changing `"active_profile"` — no script edits needed.
 
 ```bash
 # Static shaping
-./bufferManager.sh tune && ./bufferManager.sh cake-bidir
+bash/bufferManager.sh tune && bash/bufferManager.sh cake-bidir
 
 # Adaptive shaping
-./bufferManager.sh tune && ./bufferManager.sh cake-bidir && ./bufferManager.sh autorate
+bash/bufferManager.sh tune && bash/bufferManager.sh cake-bidir && bash/bufferManager.sh autorate
 
 # Check what's active
-./bufferManager.sh diagnose
+bash/bufferManager.sh diagnose
 
 # View counters
-./bufferManager.sh counters
+bash/bufferManager.sh counters
 
 # Remove everything
-./bufferManager.sh remove && ./bufferManager.sh untune
+bash/bufferManager.sh remove && bash/bufferManager.sh untune
 ```
 
-### All Commands
+#### All Commands
 
 ```
 Strategies:    cake-bidir | cake | htb | fq_codel | aggressive
@@ -237,7 +430,7 @@ Management:    status | counters | clear | diagnose | remove
 
 ---
 
-## bufferTest.sh
+### bufferTest.sh
 
 Two-phase bufferbloat measurement using per-hop traceroute latency under idle and load conditions.
 
@@ -252,7 +445,7 @@ Phase 2: STRESS (200s)
   └─ Traceroute every 1s to all hops → record per-hop latency (under load)
 ```
 
-### Analysis Output
+#### Analysis Output
 
 1. **Per-Segment Bloat Table** — incremental delay between each hop pair, baseline avg vs stress P95
 2. **Ranked Bloat Summary** — worst bloating links sorted by severity
@@ -260,7 +453,7 @@ Phase 2: STRESS (200s)
 4. **Overall Latency Summary** — end-to-end avg, P95, max, loss % per phase
 5. **iperf3 Throughput Table** — DL/UL mean, max, median, P10, P90 Mbps
 
-### Sample Output
+#### Sample Output
 
 ```
 ========================================================================
@@ -335,7 +528,7 @@ uplink     TCP         65.2       8.10    19.90     7.34     4.19    12.60      
 - **Throughput**: 4.82 Mbps downlink, 8.10 Mbps uplink (LTE link, uplink bursting without shaping)
 - **RTT probe loss**: only 38/204 traceroute probes got through — ICMP packets dropped by congested buffers (this itself confirms bloat)
 
-### Config
+#### Config
 
 All settings are read from `config.json`. Key parameters for this script:
 
@@ -361,9 +554,9 @@ All settings are read from `config.json`. Key parameters for this script:
 }
 ```
 
-Run `./bufferTest.sh -h` for a full list of config keys.
+Run `bash/bufferTest.sh -h` for a full list of config keys.
 
-### Prerequisites
+#### Prerequisites
 
 - **iperf3 server** running on the target host on each configured port. Start one listener per port in the `port_dl`/`port_ul` arrays — iperf3 handles one client connection per instance:
   ```bash
@@ -375,21 +568,21 @@ Run `./bufferTest.sh -h` for a full list of config keys.
 - `traceroute` installed
 - iperf3 3.7+ required (for `--connect-timeout`, `--forceflush`); 3.9+ recommended (adds `--timestamps`)
 
-### Usage
+#### Usage
 
 ```bash
-./bufferTest.sh
+bash/bufferTest.sh
 ```
 
 Output files: `bloat_results.log` (CSV), `iperf_tcp_downlink.log`, `iperf_tcp_uplink.log`
 
 ---
 
-## bufferScenarioTest.sh
+### bufferScenarioTest.sh
 
 Automated A/B testing wrapper. Runs multiple shaping strategies back-to-back, captures qdisc counters and iperf/latency metrics, and displays a color-coded comparison table.
 
-### What It Does Per Scenario
+#### What It Does Per Scenario
 
 ```
 1. Clean slate     → bufferManager.sh remove + untune
@@ -404,7 +597,7 @@ Automated A/B testing wrapper. Runs multiple shaping strategies back-to-back, ca
 
 ### Sample Result (5 runs, base vs shaped+autorate)
 
-Command: `./bufferScenarioTest.sh -r 5 -s "base:remove;shaped+autorate:tune,cake-bidir,autorate"`
+Command: `bash/bufferScenarioTest.sh -r 5 -s "base:remove;shaped+autorate:tune,cake-bidir,autorate"`
 
 ```
 ════════════════════════════════════════════════════════════════
@@ -474,23 +667,23 @@ Results saved to:
 - **Egress Drops** (avg 21.8/run) confirms CAKE is managing the queue at your device rather than the upstream FIFO
 - **Per-run consistency**: shaped+autorate shows tight clustering (335–367ms stress avg vs 442–454ms for base)
 
-### Usage
+#### Usage
 
 ```bash
 # Baseline vs CAKE with autorate
-./bufferScenarioTest.sh -s "base:remove;shaped+autorate:tune,cake-bidir,autorate"
+bash/bufferScenarioTest.sh -s "base:remove;shaped+autorate:tune,cake-bidir,autorate"
 
 # Full 3-way comparison, 3 runs each
-./bufferScenarioTest.sh -r 3 -s "base:remove;shaped:tune,cake-bidir;shaped+autorate:tune,cake-bidir,autorate"
+bash/bufferScenarioTest.sh -r 3 -s "base:remove;shaped:tune,cake-bidir;shaped+autorate:tune,cake-bidir,autorate"
 
 # All built-in scenarios
-./bufferScenarioTest.sh
+bash/bufferScenarioTest.sh
 
 # List built-in scenarios
-./bufferScenarioTest.sh -l
+bash/bufferScenarioTest.sh -l
 ```
 
-### Options
+#### Options
 
 | Flag | Description | Default |
 |------|-------------|---------|
@@ -500,7 +693,7 @@ Results saved to:
 | `-l` | List built-in scenarios | — |
 | `-h` | Help | — |
 
-### Built-in Scenarios
+#### Built-in Scenarios
 
 | Label | Commands | Tests |
 |-------|----------|-------|
@@ -511,7 +704,7 @@ Results saved to:
 | htb+tune | `tune,htb` | HTB + fq_codel fallback |
 | aggressive | `tune,aggressive` | Tight fq_codel limits |
 
-### Output Files
+#### Output Files
 
 ```
 scenario_logs/
@@ -548,11 +741,11 @@ scenario_logs/
 
 ---
 
-## bloatChart.sh
+### bloatChart.sh
 
 ASCII time-series overlay chart showing iperf throughput, RTT, and autorate adjustments on a unified timeline. Runs automatically at the end of `bufferTest.sh` or standalone.
 
-### What It Shows
+#### What It Shows
 
 Three data series aligned by time (1-second intervals):
 1. **iperf3 throughput** — DL (▓) and UL (░) in Mbps
@@ -631,22 +824,22 @@ Time     │ DL Mbps UL Mbps │  RTT ms │ Eg mbit In mbit │ Dir
   Legend: E=Egress rate  I=Ingress rate  X=Overlap  ▲▼.=Direction
 ```
 
-### Usage
+#### Usage
 
 ```bash
 # Runs automatically at the end of bufferTest.sh
 
 # Or run standalone after a test
-./bloatChart.sh
+bash/bloatChart.sh
 
 # Custom files and dimensions
-./bloatChart.sh -r my_results.log -a autorate.log -w 120 -H 25
+bash/bloatChart.sh -r my_results.log -a autorate.log -w 120 -H 25
 
 # Without autorate (just throughput + RTT)
-./bloatChart.sh -r bloat_results.log -d iperf_tcp_downlink.log -u iperf_tcp_uplink.log
+bash/bloatChart.sh -r bloat_results.log -d iperf_tcp_downlink.log -u iperf_tcp_uplink.log
 ```
 
-### Options
+#### Options
 
 | Flag | Description | Default |
 |------|-------------|---------|
@@ -658,7 +851,7 @@ Time     │ DL Mbps UL Mbps │  RTT ms │ Eg mbit In mbit │ Dir
 | `-H HEIGHT` | Chart height in rows | `20` |
 | `-h` | Help | — |
 
-### How It Helps
+#### How It Helps
 
 - **Correlate RTT spikes with throughput drops** — see exactly when bloat causes performance degradation
 - **Verify autorate is responding** — watch rate limits decrease as RTT rises, and recover when RTT drops
@@ -674,7 +867,7 @@ Low, variable bandwidth. High baseline latency. CAKE + autorate handles fluctuat
 
 ```bash
 # Config: MAX_EGRESS=10mbit, MAX_INGRESS=25mbit, BASELINE_RTT=60ms
-./bufferManager.sh tune && ./bufferManager.sh cake-bidir && ./bufferManager.sh autorate
+bash/bufferManager.sh tune && bash/bufferManager.sh cake-bidir && bash/bufferManager.sh autorate
 ```
 
 ### 5G / Fixed Wireless
@@ -682,7 +875,7 @@ Higher bandwidth but still variable. Larger rate ranges, same adaptive approach.
 
 ```bash
 # Config: MAX_EGRESS=15mbit, MAX_INGRESS=65mbit
-./bufferScenarioTest.sh -r 3 -s "base:remove;cake:tune,cake-bidir;adaptive:tune,cake-bidir,autorate"
+bash/bufferScenarioTest.sh -r 3 -s "base:remove;cake:tune,cake-bidir;adaptive:tune,cake-bidir,autorate"
 ```
 
 ### VPN / Tunnel Endpoints
@@ -696,7 +889,7 @@ Use `bufferScenarioTest.sh` to quantify the impact of different strategies on yo
 
 ```bash
 # "Is CAKE actually helping on my link?"
-./bufferScenarioTest.sh -r 5 -s "baseline:remove;cake:tune,cake-bidir"
+bash/bufferScenarioTest.sh -r 5 -s "baseline:remove;cake:tune,cake-bidir"
 ```
 
 ---
@@ -707,7 +900,7 @@ Use `bufferScenarioTest.sh` to quantify the impact of different strategies on yo
 
 Most existing bufferbloat tools (Flent, netperfrunner, web tests) tell you **"you have bloat"** but don't tell you **where in the network path** the bloat occurs. BloatBuster's per-hop traceroute under load pinpoints the exact link (hop) that's buffering — so you know whether the problem is your router, your ISP's DSLAM, or a backhaul node.
 
-Additionally, Flent and netperf-based tools require **both a client and a dedicated server** (netperf/iperf running on both ends). BloatBuster only needs a standard iperf3 server on the remote end — no custom daemon, no Flent installation on the server, no coordination. You can point it at any existing iperf3 endpoint.
+Additionally, Flent and netperf-based tools require **both a client and a dedicated server** (netperf/iperf running on both ends). BloatBuster's bash tools only need a standard iperf3 server on the remote end — no custom daemon, no Flent installation on the server, no coordination. The Python tools (`userbufferTest.py`) go further: they need **no server at all** — they use real HTTP/HTTPS/QUIC traffic to public websites for stress, so you can run a bufferbloat test from any Linux machine with internet access.
 
 ### Where in the Network You See Bloat
 
@@ -727,41 +920,36 @@ Hop  Segment                     Link Base    Link P95     Bloat
 
 ### Detailed Comparison Table
 
-| Feature | BloatBuster | Flent (RRUL) | betterspeedtest.sh | Web Tests (Waveform/Cloudflare) |
-|---------|-------------|--------------|--------------------|---------------------------------|
-| **Measures bloat location (per-hop)** | Yes — traceroute under load | No — end-to-end only | No — end-to-end only | No — end-to-end only |
-| **Server requirement** | iperf3 server only | netperf server + Flent install | netperf server | None (uses CDN) |
-| **Client-only operation** | Yes (just needs iperf3 server) | No (Flent needed on both ends) | Yes (needs netperf server) | Yes |
-| **Identifies bloating hop** | Yes — ranked by severity | No | No | No |
-| **Simultaneous DL + UL stress** | Yes (TCP/UDP, configurable streams) | Yes (RRUL: 4 up + 4 down) | Yes (sequential, not simultaneous) | Varies by test |
-| **Latency measurement method** | ICMP traceroute per-hop | ICMP/UDP ping (end-to-end) | ICMP ping (end-to-end) | Proprietary |
-| **Built-in traffic shaping** | Yes — CAKE/HTB/fq_codel + autorate | No (measurement only) | No (measurement only) | No |
-| **Adaptive rate control** | Yes — RTT-based live CAKE adjustment | No | No | No |
-| **A/B scenario comparison** | Yes — automated multi-strategy benchmark | Manual (re-run + compare plots) | No | No |
-| **Graphical output** | ASCII diagrams + tables | Yes — matplotlib plots | Text summary | Web UI |
-| **Repeatability / scripted runs** | Yes — automated N-run averaging | Yes — repeatable via CLI | Partially | No |
-| **Protocol support** | TCP + UDP (configurable) | TCP (netperf) | TCP (netperf) | HTTP/HTTPS |
-| **High bandwidth (>1Gbps)** | Depends on iperf3 | Yes (tested to 40GigE) | Limited | No |
-| **Dependencies** | iperf3, traceroute, jq, tc | Flent, netperf, matplotlib, Python | netperf | Browser |
-| **Works on embedded/router** | Yes (bash + basic tools) | No (Python + heavy deps) | Yes | No |
-| **Centralized config** | Yes — config.json for all scripts | No (CLI flags per run) | No (hardcoded) | N/A |
-| **ECN / qdisc counter tracking** | Yes — per-test delta analysis | No | No | No |
+| Feature | BloatBuster (Bash) | BloatBuster (Python) | Flent (RRUL) | betterspeedtest.sh | Web Tests (Waveform/Cloudflare) |
+|---------|-------------------|---------------------|--------------|--------------------|---------------------------------|
+| **Measures bloat location (per-hop)** | Yes | Yes | No | No | No |
+| **Server requirement** | iperf3 server | **None** | netperf server + Flent | netperf server | None (CDN) |
+| **Client-only operation** | Yes (needs iperf3 server) | **Yes (fully standalone)** | No | Yes | Yes |
+| **Identifies bloating hop** | Yes | Yes | No | No | No |
+| **Throughput measurement** | iperf3 (reliable) | /proc/net/dev or curl stats | netperf | netperf | Proprietary |
+| **Built-in traffic shaping** | Yes (CAKE/HTB/fq_codel + autorate) | No | No | No | No |
+| **A/B scenario comparison** | Yes — automated | No | Manual | No | No |
+| **Graphical output** | ASCII diagrams + tables | ASCII chart + time-series | matplotlib plots | Text | Web UI |
+| **Dependencies** | iperf3, traceroute, jq, tc | Python 3, curl, traceroute | Flent, netperf, matplotlib | netperf | Browser |
+| **Works on embedded/router** | Yes (bash + basic tools) | Needs Python 3 | No | Yes | No |
 
 ### BloatBuster Advantages
 
 1. **Per-hop bloat localization** — The key differentiator. Traceroute under load reveals which specific link in the path is bloated. Other tools only give you a single end-to-end latency number.
 
-2. **Client-side only** — No Flent/netperf installation on the server. Any iperf3 endpoint works (even public ones).
+2. **Zero-server option (Python tools)** — `userbufferTest.py` needs no iperf3 server, no netperf, no custom daemon. It uses real browsing traffic to stress the link. Just point it at any IP and go.
 
-3. **Integrated shaping + measurement** — Test, shape, re-test in one workflow. Flent measures but doesn't fix; you need separate SQM/CAKE setup.
+3. **Client-side only** — Even the bash tools only need a standard iperf3 server on the remote end. No Flent/netperf installation on the server.
 
-4. **Adaptive rate control (autorate)** — Continuous RTT-based bandwidth adjustment for variable links (LTE/5G). Similar to [cake-autorate](https://github.com/lynxthecat/cake-autorate) but integrated into the test/shape workflow.
+4. **Integrated shaping + measurement** — Test, shape, re-test in one workflow. Flent measures but doesn't fix; you need separate SQM/CAKE setup.
 
-5. **Automated A/B benchmarking** — `bufferScenarioTest.sh` runs N strategies × M repetitions and produces a comparison table. Flent requires manual re-runs and eyeballing plots.
+5. **Adaptive rate control (autorate)** — Continuous RTT-based bandwidth adjustment for variable links (LTE/5G).
 
-6. **Lightweight / embeddable** — Pure bash + standard Linux tools. Runs on routers, embedded devices, containers. Flent needs Python 3, matplotlib, and netperf compiled on both ends.
+6. **Automated A/B benchmarking** — `bufferScenarioTest.sh` runs N strategies × M repetitions and produces a comparison table.
 
-7. **Qdisc counter analysis** — Tracks dropped/overlimit/ECN-marked packets per test run to understand AQM behavior, not just throughput/latency.
+7. **Wire-level throughput via /proc/net/dev** — `userbufferTest.py` reads kernel interface counters for smooth, accurate throughput data instead of relying on application-level byte counting.
+
+8. **Lightweight / embeddable** — Bash tools are pure bash + standard Linux tools. Python tools need only Python 3 + curl.
 
 ### What Flent Does Better (gaps to consider)
 
@@ -778,13 +966,14 @@ Hop  Segment                     Link Base    Link P95     Bloat
 
 | Scenario | Recommended Tool |
 |----------|-----------------|
-| "Where in my network is the bloat?" | **BloatBuster** |
+| "Where in my network is the bloat?" | **BloatBuster** (either approach) |
+| Quick test, no server available | **userbufferTest.py** (Python) |
+| Apply + test shaping in one workflow | **bufferTest.sh** + **bufferManager.sh** (Bash) |
+| A/B comparison of shaping strategies | **bufferScenarioTest.sh** (Bash) |
+| Router/embedded device (no Python) | **Bash tools** |
+| LTE/5G with variable bandwidth | **Bash** (autorate) or **Python** (measurement only) |
 | Quick letter-grade check | Web test (Waveform) |
 | Academic/publishable benchmark | Flent (RRUL) |
-| Apply + test shaping in one workflow | **BloatBuster** |
-| Router/embedded device (no Python) | **BloatBuster** |
-| 10-40GigE data center testing | Flent |
-| LTE/5G with variable bandwidth | **BloatBuster** (autorate) |
 | Pretty graphs for a presentation | Flent |
 
 ---
@@ -795,12 +984,23 @@ Hop  Segment                     Link Base    Link P95     Bloat
 
 | Requirement | Notes |
 |-------------|-------|
-| Linux kernel 4.9+ | BBR congestion control (`tcp_bbr` module) |
-| Linux kernel 4.19+ | CAKE qdisc (`sch_cake` module) |
-| Root / sudo | Required by `tc`, `ip link`, `sysctl`, `modprobe` |
-| Writable log directory | Scripts write CSV logs, iperf output, and scenario results to the working directory (or `scenario.log_dir`). The path must be writable by the running user. |
+| Linux | Required for both approaches. Bash tools need kernel 4.19+ for CAKE. |
+| Root / sudo | Required by bash tools (`tc`, `ip link`, `sysctl`). Python tools run as regular user. |
 
-### Required Tools
+### Python Tools Requirements
+
+| Tool | Package | Purpose |
+|------|---------|---------|
+| Python 3.8+ | `python3` | Script interpreter |
+| `curl` | `curl` | HTTP/HTTPS/QUIC traffic generation |
+| `dd` | `coreutils` | Upload data generation |
+| `traceroute` | `traceroute` | Per-hop ICMP latency measurement |
+
+```bash
+apt install python3 curl traceroute
+```
+
+### Bash Tools Requirements
 
 | Tool | Package (Debian/Ubuntu) | Used By | Purpose |
 |------|------------------------|---------|---------|
@@ -810,13 +1010,11 @@ Hop  Segment                     Link Base    Link P95     Bloat
 | `sysctl` | `procps` | `bufferManager.sh` | Apply TCP stack settings (BBR, ECN, buffer sizes) |
 | `modprobe` | `kmod` | `bufferManager.sh` | Load `ifb` kernel module for ingress shaping |
 | `ping` | `iputils-ping` | `bufferManager.sh` | RTT probes for autorate adaptation |
-| `iperf3` 3.7+ | `iperf3` | `bufferTest.sh` | Saturate the link (TCP/UDP stress test). 3.7+ needed for `--connect-timeout`/`--forceflush`; 3.9+ for `--timestamps`. |
-| `traceroute` | `traceroute` | `bufferTest.sh` | Per-hop ICMP latency measurement (needs `-I` flag support) |
-| `jq` | `jq` | all scripts | Parse and read `config.json` |
+| `iperf3` 3.7+ | `iperf3` | `bufferTest.sh` | Saturate the link (TCP/UDP stress test) |
+| `traceroute` | `traceroute` | `bufferTest.sh` | Per-hop ICMP latency measurement |
+| `jq` | `jq` | all bash scripts | Parse and read `config.json` |
 | `awk` | `gawk` / `mawk` | `bufferTest.sh`, `bloatChart.sh` | Log parsing and ASCII chart rendering |
-| `bc` | `bc` | `bufferScenarioTest.sh` | Floating-point arithmetic in scenario comparisons |
-
-Install everything at once on Debian/Ubuntu:
+| `bc` | `bc` | `bufferScenarioTest.sh` | Floating-point arithmetic |
 
 ```bash
 apt install iproute2 procps kmod iputils-ping iperf3 traceroute jq gawk bc
@@ -838,66 +1036,10 @@ Check availability: `modinfo sch_cake` / `modinfo tcp_bbr`
 
 ### Remote iperf3 Server
 
-`bufferTest.sh` requires an **iperf3 server** listening on the target host. Since iperf3 handles only one client connection per process, run one listener per port in your `port_dl`/`port_ul` arrays. With the default config:
- 
- ---
- 
- ## traffic-gen.py: User Browsing Traffic Simulator
- 
- `traffic-gen.py` is a standalone Python tool for simulating realistic web browsing and upload/download activity, independent of the main bufferbloat test scripts. It is designed to generate diverse, high-concurrency traffic patterns similar to real users, and is useful for stress-testing networks, routers, or shaping policies.
- 
- ### What It Does
- 
- - Launches multiple parallel download (DL) and upload (UL) clients as threads
- - Simulates browsing to popular sites (Google, Facebook, Wikipedia, etc.) using HTTP/1.1, HTTPS, and HTTP/3/QUIC (if supported)
- - Downloads large files from public test servers
- - Uploads random-sized data blobs to public HTTP endpoints
- - Randomizes timing, URLs, and request types to mimic real user behavior
- - Tracks per-client statistics: success/fail counts, bytes transferred, socket events
- - Runs for a configurable duration (default: very long, can be interrupted with Ctrl+C)
- 
- ### Usage
- 
- ```bash
- python3 traffic-gen.py
- ```
- 
- You can adjust the number of DL/UL clients and duration by editing the variables at the top of the script:
- 
- - `DL_CLIENTS` — number of parallel download threads (default: 30)
- - `UL_CLIENTS` — number of parallel upload threads (default: 50)
- - `DURATION_MINS` — total run time in minutes (default: 3000)
- 
- The script prints live activity and a summary report at the end. All data is discarded to `/dev/null` (no files are saved).
- 
- ### Example Output
- 
- ```
- =====================================================
-   DUAL-ROLE TRAFFIC ENGINE: 30 DL | 50 UL
-   ALL DATA DISCARDED TO /dev/null
- =====================================================
- [12:34:56] [DL-Thread #1] -> STARTING [HTTPS] | https://www.wikipedia.org
- [12:34:57] [UL-Thread #1] -> UPLOADING 23MB to https://httpbin.org/post
- ... (live logs) ...
- 
- ==========================================================================
-               TRAFFIC SIMULATION REPORT
- ==========================================================================
- CLIENT   ROLE  SUCC  FAIL  OPEN  CLOS  RST   DATA_TRANSFERRED
- 1        DL    5     0     5     5     0     12.34 MB
- 1        UL    4     1     4     4     0     67.89 MB
- ... (per-client stats) ...
- TOTAL         150   10    150   150   2     DL: 123.45 MB / UL: 678.90 MB
- ```
- 
- ### Requirements
- 
- - Python 3
- - `curl` (with HTTP/3/QUIC support for QUIC tests, optional)
- - `dd` (for upload data generation)
- 
- > **Note:** This tool is completely independent of the bufferbloat test/shape scripts. It does not require or use `config.json` and can be run on any Linux system with Python 3 and curl.
+`bufferTest.sh` requires an **iperf3 server** listening on the target host. Since iperf3 handles only one client connection per process, run one listener per port in your `port_dl`/`port_ul` arrays:
+
+```bash
+iperf3 -s -p 5991 &   # DL primary
 iperf3 -s -p 5993 &   # DL fallback
 iperf3 -s -p 5992 &   # UL primary
 iperf3 -s -p 5994 &   # UL fallback
@@ -910,32 +1052,45 @@ Configure ports via `test.tcp.port_dl` / `test.tcp.port_ul` (or UDP equivalents)
 ## Quick Reference
 
 ```bash
+# ─── Python approach (no server needed) ───
+
+# Quick bufferbloat test
+python3 python/userbufferTest.py -T 8.8.8.8
+
+# With custom interface and method
+python3 python/userbufferTest.py -T 8.8.8.8 -m procnetdev -I wlan0
+
+# Just generate traffic (standalone)
+python3 python/traffic-gen.py -d 20 -u 30 -t 5
+
+# ─── Bash approach (needs iperf3 server) ───
+
 # 1. Edit config.json: set active_profile, interface, target, rates
 #    (no script edits needed)
 
 # 2. Verify connectivity
-./bufferManager.sh probe
+bash/bufferManager.sh probe
 
 # 3. Run bufferTest.sh independently (measures bloat without shaping)
-./bufferTest.sh
+bash/bufferTest.sh
 
 # 4. Run bufferManager.sh independently (apply shaping)
-./bufferManager.sh tune && ./bufferManager.sh cake-bidir
+bash/bufferManager.sh tune && bash/bufferManager.sh cake-bidir
 
 # 5. Run a quick before/after comparison
-./bufferScenarioTest.sh -s "before:remove;after:tune,cake-bidir,autorate"
+bash/bufferScenarioTest.sh -s "before:remove;after:tune,cake-bidir,autorate"
 
 # 6. Run a thorough benchmark (3 repetitions)
-./bufferScenarioTest.sh -r 3
+bash/bufferScenarioTest.sh -r 3
 
 # 7. Check results
 cat scenario_logs/summary_*.txt
 
 # Show help for each script
-./bufferManager.sh          # (no args shows help)
-./bufferTest.sh -h
-./bufferScenarioTest.sh -h
+bash/bufferManager.sh          # (no args shows help)
+bash/bufferTest.sh -h
+bash/bufferScenarioTest.sh -h
 
 # Override config file path
-CONFIG_FILE=/etc/bloatbuster/config.json ./bufferManager.sh cake-bidir
+CONFIG_FILE=/etc/bloatbuster/config.json bash/bufferManager.sh cake-bidir
 ```
