@@ -55,8 +55,13 @@ DEFAULT_CHART_HEIGHT  = 20
 #                  Units: Mbps.  Wire-level, smooth, but counts ALL traffic on
 #                  that interface (not just the test), so may be inflated on a
 #                  router or shared LAN machine.
+#   'ss'         — hybrid: DL from NIC RX (/proc/net/dev, monotonic — avoids the
+#                  non-monotonic ss bytes_received problem when DL connections close),
+#                  UL from ss bytes_acked (excludes retransmissions).  Requires an
+#                  interface to be detected for accurate DL; falls back to bytes_received
+#                  otherwise.  Still affected by TCP slow-start on hotspot topologies.
 #   'auto'       — selects 'statsfile' unconditionally (safe default); use
-#                  '-m procnetdev -I <iface>' explicitly for wire-level readings.
+#                  '-m procnetdev -I <iface>' or '-m ss' explicitly for wire-level readings.
 DEFAULT_RATE_METHOD   = 'auto'
 
 
@@ -110,6 +115,69 @@ def read_throughput_snapshot(stats_file):
         if len(parts) >= 4:
             return float(parts[1]), int(parts[2]), int(parts[3])
     except (OSError, ValueError):
+        pass
+    return None
+
+
+def read_ss_bytes():
+    """Sum bytes_received (DL) and bytes_acked (UL) across all TCP connections via ss -i.
+
+    Returns (rx_bytes, tx_bytes) or None if ss is unavailable.
+    bytes_received = payload bytes received by local TCP stack (DL proxy, no header overhead)
+    bytes_acked    = payload bytes sent and ACKed by peer (UL proxy, excludes retransmits)
+    """
+    try:
+        result = subprocess.run(
+            ['ss', '-i', '-t', '-n'],
+            capture_output=True, text=True, timeout=2
+        )
+        rx_total = tx_total = 0
+        for line in result.stdout.splitlines():
+            m = re.search(r'bytes_received:(\d+)', line)
+            if m:
+                rx_total += int(m.group(1))
+            m = re.search(r'bytes_acked:(\d+)', line)
+            if m:
+                tx_total += int(m.group(1))
+        if rx_total > 0 or tx_total > 0:
+            return rx_total, tx_total
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return None
+
+
+def read_ss_hybrid(interface):
+    """DL from NIC RX (monotonic, accurate), UL from ss bytes_acked (no retransmit overhead).
+
+    ss bytes_received is non-monotonic — it drops when DL connections close, causing
+    the cumulative sum to decrease between samples (DL shows 0 Mbps).  Using NIC RX
+    from /proc/net/dev instead gives a strictly monotonic DL counter.
+
+    Falls back to ss bytes_received for DL only if interface is unavailable.
+    Returns (rx_bytes, tx_bytes) or None.
+    """
+    try:
+        result = subprocess.run(
+            ['ss', '-i', '-t', '-n'],
+            capture_output=True, text=True, timeout=2
+        )
+        rx_ss = tx_total = 0
+        for line in result.stdout.splitlines():
+            m = re.search(r'bytes_received:(\d+)', line)
+            if m:
+                rx_ss += int(m.group(1))
+            m = re.search(r'bytes_acked:(\d+)', line)
+            if m:
+                tx_total += int(m.group(1))
+        # Prefer NIC RX (strictly monotonic) for DL; fall back to ss bytes_received
+        if interface:
+            nd = read_procnetdev(interface)
+            rx_bytes = nd[0] if nd else rx_ss
+        else:
+            rx_bytes = rx_ss
+        if rx_bytes > 0 or tx_total > 0:
+            return rx_bytes, tx_total
+    except (OSError, subprocess.TimeoutExpired):
         pass
     return None
 
@@ -200,13 +268,18 @@ def collect_latency_samples(target, duration_sec, interval_sec, timeout,
     start_dl = start_ul = 0
     prev_time = start_time
     prev_sample_elapsed = None
-    use_procnetdev = (rate_method == 'procnetdev' and interface)
+    rate_mode = rate_method if rate_method != 'auto' else 'statsfile'
 
-    # Take initial /proc/net/dev snapshot for delta calculation
-    if use_procnetdev:
+    # Take initial snapshot for delta calculation
+    if rate_mode == 'procnetdev' and interface:
         snap0 = read_procnetdev(interface)
         if snap0:
             prev_dl, prev_ul = snap0  # rx_bytes = DL, tx_bytes = UL
+            start_dl, start_ul = snap0
+    elif rate_mode == 'ss':
+        snap0 = read_ss_hybrid(interface)
+        if snap0:
+            prev_dl, prev_ul = snap0
             start_dl, start_ul = snap0
     elif stats_file:
         snap0 = read_throughput_snapshot(stats_file)
@@ -215,7 +288,12 @@ def collect_latency_samples(target, duration_sec, interval_sec, timeout,
             start_dl, start_ul = prev_dl, prev_ul
 
     print(f"\n{'='*72}")
-    method_label = f"/proc/net/dev ({interface})" if use_procnetdev else "stats-file"
+    if rate_mode == 'procnetdev' and interface:
+        method_label = f"/proc/net/dev ({interface})"
+    elif rate_mode == 'ss':
+        method_label = f"ss-hybrid (NIC-RX/{interface or 'fallback'} + bytes-acked)"
+    else:
+        method_label = "stats-file"
     print(f"  {phase_name}: Collecting traceroute samples for {duration_sec}s "
           f"(interval={interval_sec}s, rate={method_label})")
     print(f"{'='*72}")
@@ -246,16 +324,30 @@ def collect_latency_samples(target, duration_sec, interval_sec, timeout,
         dl_rate = ul_rate = 0.0
         snap = None
 
-        if use_procnetdev:
+        if rate_mode == 'procnetdev' and interface:
             snap = read_procnetdev(interface)
             if snap:
+                t_snap = time.time()
                 raw_dl_bytes, raw_ul_bytes = snap  # rx = DL, tx = UL
-                dt = time.time() - prev_time
+                dt = t_snap - prev_time
                 if dt > 0.1:
                     dl_rate = (raw_dl_bytes - prev_dl) * 8 / dt / 1_000_000
                     ul_rate = (raw_ul_bytes - prev_ul) * 8 / dt / 1_000_000
                     prev_dl, prev_ul = raw_dl_bytes, raw_ul_bytes
-                    prev_time = time.time()
+                    prev_time = t_snap
+                dl_bytes = max(0, raw_dl_bytes - start_dl)
+                ul_bytes = max(0, raw_ul_bytes - start_ul)
+        elif rate_mode == 'ss':
+            snap = read_ss_hybrid(interface)
+            if snap:
+                t_snap = time.time()
+                raw_dl_bytes, raw_ul_bytes = snap
+                dt = t_snap - prev_time
+                if dt > 0.1:
+                    dl_rate = (raw_dl_bytes - prev_dl) * 8 / dt / 1_000_000
+                    ul_rate = (raw_ul_bytes - prev_ul) * 8 / dt / 1_000_000
+                    prev_dl, prev_ul = raw_dl_bytes, raw_ul_bytes
+                    prev_time = t_snap
                 dl_bytes = max(0, raw_dl_bytes - start_dl)
                 ul_bytes = max(0, raw_ul_bytes - start_ul)
         elif stats_file:
@@ -878,13 +970,14 @@ def parse_args():
     p.add_argument('-H', '--chart-height', type=int, default=DEFAULT_CHART_HEIGHT,
                    help="ASCII chart height in rows")
     p.add_argument('-m', '--rate-method', type=str, default=DEFAULT_RATE_METHOD,
-                   choices=['auto', 'procnetdev', 'statsfile'],
+                   choices=['auto', 'procnetdev', 'statsfile', 'ss'],
                    help="Throughput measurement method: "
                         "'procnetdev' reads /proc/net/dev on the WAN interface (wire-level, "
                         "auto-detected via 'ip route get <target>'), "
-                        "'statsfile' reads traffic-gen.py's app-level byte counters (may "
-                        "exceed WAN capacity when the test machine has fast local internet), "
-                        "'auto' uses procnetdev on Linux, statsfile otherwise (default)")
+                        "'ss' runs 'ss -i -t -n' and sums bytes_acked (UL) and "
+                        "bytes_received (DL) across all TCP sockets (no interface needed), "
+                        "'statsfile' reads traffic-gen.py's app-level byte counters, "
+                        "'auto' defaults to statsfile (default)")
     p.add_argument('-I', '--interface', type=str, default=None,
                    help="Network interface for /proc/net/dev measurement "
                         "(auto-detected from default route if omitted)")

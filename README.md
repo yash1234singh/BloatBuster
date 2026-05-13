@@ -72,13 +72,79 @@ Phase 2: STRESS (120s)
 
 #### Throughput Measurement Methods
 
-| Method | Flag | How | Accuracy | Platform |
-|--------|------|-----|----------|----------|
-| **procnetdev** (default on Linux) | `-m procnetdev` | Reads `/proc/net/dev` RX/TX byte counters | Wire-level, smooth 1s samples | Linux only |
-| **statsfile** | `-m statsfile` | Reads traffic-gen.py's cumulative byte counter file | App-level, bursty (reports only when curl requests complete) | Any OS |
-| **auto** (default) | `-m auto` | Uses `procnetdev` on Linux, `statsfile` elsewhere | Best available | Any OS |
+| Method | Flag | DL source | UL source | Platform |
+|--------|------|-----------|-----------|----------|
+| **statsfile** (default) | `-m statsfile` | Progressive curl stdout reads | NIC TX bytes (`/proc/net/dev`) | Linux |
+| **procnetdev** | `-m procnetdev -I eth0` | NIC RX bytes (`/proc/net/dev`) | NIC TX bytes (`/proc/net/dev`) | Linux |
+| **ss** | `-m ss` | NIC RX bytes (`/proc/net/dev`) | `ss -i` `bytes_acked` sum | Linux |
+| **auto** | `-m auto` | Same as `statsfile` | Same as `statsfile` | Any |
 
-The `procnetdev` method reads the kernel's interface counters directly, giving accurate per-second throughput regardless of when individual HTTP requests complete. The `statsfile` method relies on curl reporting bytes only when each request finishes, causing spiky throughput readings.
+#### Measurement Accuracy & Known Limitations
+
+All methods report approximate throughput. Each has specific failure modes — understanding them helps interpret spiky or zero readings correctly.
+
+---
+
+##### `statsfile` method (default)
+
+**DL — accurate.**
+`traffic-gen.py` reads curl's stdout chunk-by-chunk (`p.stdout.read(65536)`). This call blocks until data arrives from the network, so every byte counted has already crossed the wire. The counter is strictly monotonically increasing and reflects true download rate.
+
+> DL may show **0.0 Mbps** for 1–4 seconds when all 30 download workers happen to be in their inter-request sleep gap simultaneously. This is a real measurement gap, not a bug.
+
+**UL — approximate, inflated during TCP slow start.**
+`traffic-gen.py` writes `/proc/net/dev` TX bytes (NIC-level) to the stats file. This is the most accurate UL measurement available from the test machine side, but has one known failure mode:
+
+> **TCP slow-start burst on mobile hotspot topology.**
+> Setup: test machine (eth0) → iPhone hotspot → cellular WAN.
+> When 50 upload workers all start simultaneously, each TCP connection's CWND grows from ~14 KB toward the LAN capacity (100 Mbps) before the cellular WAN bottleneck (2–9 Mbps) provides congestion feedback. During this ~10–20 second slow-start phase, the iPhone's TCP receive buffer absorbs data at LAN speed. NIC TX (eth0) measures LAN bytes sent to the phone, not WAN bytes actually transmitted over cellular.
+>
+> **Observed effect:** UL spikes of 100–600 Mbps for the first ~17 seconds, then settles to the true WAN rate (~2–9 Mbps) once congestion is established. Periodic smaller spikes (~25–93 Mbps) occur each time a worker completes one upload and opens a new TCP connection.
+>
+> **On a direct WAN connection** (test machine → cable/DSL modem, no buffering router between them), NIC TX equals WAN TX and the measurement is accurate.
+>
+> **Mitigation:** Set `UL_RATE_LIMIT` in `traffic-gen.py` to `'100K'`–`'200K'` per worker. 50 × 200 KB/s = 10 MB/s max burst (vs 150 MB/s at `3M`). NIC TX then settles to WAN rate immediately. The link is still saturated (10 MB/s >> 9 Mbps WAN). Default stays `'3M'` to test at full rate.
+
+---
+
+##### `procnetdev` method
+
+**DL — accurate.**
+Reads `/proc/net/dev` RX bytes for the WAN interface. Kernel counters are monotonically increasing and wire-level. Includes all incoming traffic (ICMP traceroute replies, ARP, etc.) which adds ~1–3% overhead, acceptable for a stress test.
+
+**UL — same slow-start limitation as `statsfile`.**
+Reads `/proc/net/dev` TX bytes. On a direct WAN connection this is accurate. On a mobile hotspot, shows the same TCP slow-start burst pattern described above — the measurement point (eth0 TX) is on the LAN side of the phone's buffer.
+
+> The interface is auto-detected via `ip route get <target>`. Specify `-I eth0` explicitly if auto-detection picks the wrong interface.
+
+---
+
+##### `ss` method (hybrid: NIC RX + `bytes_acked`)
+
+**DL — accurate (uses NIC RX, not `bytes_received`).**
+Earlier versions summed `bytes_received` across all open TCP connections, which is non-monotonic: when a DL connection closes, its counter disappears from `ss -i`, causing the cumulative sum to drop and DL to read 0 Mbps even during active downloads.
+
+The current implementation uses `/proc/net/dev` RX bytes (same monotonic NIC counter as `procnetdev`) for DL. This fixes the 0-Mbps issue entirely. Falls back to `ss bytes_received` only if no interface can be detected.
+
+**UL — marginally better than `procnetdev`, same slow-start limitation.**
+Sums `bytes_acked` across all TCP connections. `bytes_acked` excludes retransmitted bytes (procnetdev TX counts retransmissions), giving ~2–5% lower counts. Because upload connections are large (10–49 MB) and typically don't close during the 120 s test, the sum is approximately monotonic for UL. Still subject to the TCP slow-start burst on mobile hotspot topology.
+
+> **When to use `ss`:** When you want to exclude TCP retransmission overhead from UL counts. DL accuracy is now equivalent to `procnetdev`.
+
+---
+
+##### UL measurement — fundamental topology constraint
+
+There is **no measurement point on the test machine** that gives perfectly accurate UL rates when a buffering router sits between the machine and the WAN:
+
+| What we measure | What it reflects |
+|---|---|
+| NIC TX (eth0) | Bytes sent to router's LAN receive buffer |
+| `ss bytes_acked` | Bytes the router's TCP stack acknowledged (same rate — router ACKs at LAN speed) |
+| `curl %{size_upload}` | Bytes sent when curl finishes (burst spike at completion, zero otherwise) |
+| Router WAN TX | **Actual WAN bytes** — not accessible from test machine |
+
+The accurate solution requires either (a) setting `UL_RATE_LIMIT` low enough to prevent buffer flooding, or (b) measuring at the router/WAN side.
 
 #### Usage
 
@@ -110,7 +176,7 @@ python3 python/userbufferTest.py -T 8.8.8.8 -m statsfile
 | `-w, --timeout` | Traceroute wait timeout (seconds) | `2` |
 | `-d, --dl-clients` | Download threads for traffic-gen.py | `30` |
 | `-u, --ul-clients` | Upload threads for traffic-gen.py | `50` |
-| `-m, --rate-method` | Throughput method: `auto`, `procnetdev`, `statsfile` | `auto` |
+| `-m, --rate-method` | Throughput method: `auto`, `procnetdev`, `statsfile`, `ss` | `auto` |
 | `-I, --interface` | Network interface for procnetdev (auto-detected if omitted) | auto |
 | `-o, --output` | Save results to CSV file | — |
 | `-W, --chart-width` | ASCII chart width in columns | `80` |

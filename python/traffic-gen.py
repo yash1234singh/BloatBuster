@@ -36,6 +36,11 @@ PROGRESS_SECS = 60
 LOG_FILE      = None
 STATS_FILE    = None   # real-time byte-counter file (used by userbufferTest.py)
 STATS_INTERVAL = 1     # how often (seconds) to write stats file; keep ≤1 for accurate rates
+UL_RATE_LIMIT  = '3M'  # per-worker curl --limit-rate for uploads.
+                        # Lower values (e.g. '100K') prevent TCP slow-start flooding
+                        # the gateway buffer, giving accurate NIC TX UL rates.
+                        # Default '3M' saturates the link but UL rates may spike on
+                        # mobile hotspot topology (LAN != WAN bottleneck).
 
 # --- URL GROUPS ---
 G1_QUIC = [
@@ -221,7 +226,7 @@ def run_uploader(worker_id):
         dd_cmd   = ['dd', 'if=/dev/zero', 'bs=1M', f'count={size_mb}']
         curl_cmd = [
             'curl', '-s', '-v', '-X', 'POST', '--data-binary', '@-',
-            '--limit-rate', '3M', '--max-time', '300',
+            '--limit-rate', UL_RATE_LIMIT, '--max-time', '300',
             '-o', '/dev/null',
             '-w', '%{stderr}CURL_STATS %{size_download} %{size_upload} %{http_code}',
             url,
@@ -234,15 +239,15 @@ def run_uploader(worker_id):
             p1 = subprocess.Popen(dd_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
             p2 = subprocess.Popen(curl_cmd, stdin=subprocess.PIPE,
                                   stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-            # Shuttle data from dd to curl, counting upload bytes progressively
+            # Shuttle data from dd to curl.
+            # Do NOT count bytes here — pipe writes complete at memory speed, not network speed.
+            # Actual transmitted bytes come from curl's %{size_upload} stat below.
             while True:
                 chunk = p1.stdout.read(65536)
                 if not chunk:
                     break
                 try:
                     p2.stdin.write(chunk)
-                    with stats_lock:
-                        stats[key]['ul_bytes'] += len(chunk)
                 except (BrokenPipeError, OSError):
                     break
             p2.stdin.close()
@@ -252,9 +257,15 @@ def run_uploader(worker_id):
             returncode = p2.returncode
             sock_opened, sock_closed, sock_reset = _parse_socket_events(stderr_raw)
             http_code = 0
+            ul_bytes = 0
             for line in stderr_raw.splitlines():
                 if line.startswith('CURL_STATS '):
                     parts = line.split()
+                    if len(parts) >= 3:
+                        try:
+                            ul_bytes = int(parts[2])  # %{size_upload}: actual bytes sent
+                        except ValueError:
+                            pass
                     if len(parts) >= 4:
                         http_code = int(parts[3])
                     break
@@ -263,8 +274,7 @@ def run_uploader(worker_id):
             print(f"[{_now()}] [UL-Thread #{worker_id:>3}] ERROR: {exc}")
 
         if running:
-            # ul_bytes already counted progressively above; pass 0 to avoid double-count
-            _record_stats(key, success, 0, 0,
+            _record_stats(key, success, 0, ul_bytes,
                           sock_opened, sock_closed, sock_reset, returncode)
         print(f"[{_now()}] [UL-Thread #{worker_id:>3}] <- FINISHED UPLOAD")
 
@@ -298,10 +308,40 @@ def periodic_summary(interval_secs, run_start_time):
         print(f"    Data     : DL {tot_dl:.1f} MB  |  UL {tot_ul:.1f} MB\n")
 
 
+def _detect_wan_interface():
+    """Detect the WAN interface via 'ip route get 8.8.8.8'. Returns iface name or None."""
+    try:
+        r = subprocess.run(['ip', 'route', 'get', '8.8.8.8'],
+                           capture_output=True, text=True, timeout=2)
+        parts = r.stdout.split()
+        if 'dev' in parts:
+            return parts[parts.index('dev') + 1]
+    except Exception:
+        pass
+    return None
+
+
+def _read_nic_tx_bytes(interface):
+    """Read cumulative TX bytes for interface from /proc/net/dev. Returns int or None."""
+    try:
+        with open('/proc/net/dev', 'r') as f:
+            for line in f:
+                if line.strip().startswith(interface + ':'):
+                    return int(line.split()[9])  # TX bytes field (col 9 of split)
+    except Exception:
+        pass
+    return None
+
+
 def stats_writer(stats_file_path, run_start_time, interval=1.0):
     """Write cumulative byte counters to a file at a fixed interval.
 
     Format per line: <timestamp> <elapsed_sec> <dl_bytes> <ul_bytes>
+    ul_bytes is NIC TX bytes (from /proc/net/dev) when the WAN interface can be
+    detected — this gives accurate UL rates because app-level counting via the
+    dd→curl stdin pipe runs at memory speed, not network speed.  Falls back to
+    app-level ul_bytes if /proc/net/dev is unavailable.
+
     The file is atomically overwritten each interval so the reader always
     gets a consistent snapshot.  A growing append log (.log suffix) is
     also maintained for post-hoc analysis.
@@ -309,6 +349,9 @@ def stats_writer(stats_file_path, run_start_time, interval=1.0):
     Uses time.monotonic() to schedule writes at exact multiples of
     *interval* seconds, avoiding drift from lock contention or I/O delays.
     """
+    wan_iface   = _detect_wan_interface()
+    tx_baseline = _read_nic_tx_bytes(wan_iface) if wan_iface else None
+
     log_path = stats_file_path + ".log"
     try:
         with open(log_path, 'w', encoding='utf-8') as lf:
@@ -338,8 +381,17 @@ def stats_writer(stats_file_path, run_start_time, interval=1.0):
         with stats_lock:
             tot_dl = sum(v['dl_bytes'] for v in stats.values())
             tot_ul = sum(v['ul_bytes'] for v in stats.values())
+
+        # Use NIC TX bytes for UL — measures actual wire-level upload rate.
+        # App-level counting (dd→curl stdin) runs at buffer speed, not network speed.
+        if wan_iface and tx_baseline is not None:
+            tx_now = _read_nic_tx_bytes(wan_iface)
+            ul_for_file = (tx_now - tx_baseline) if tx_now is not None else tot_ul
+        else:
+            ul_for_file = tot_ul  # fallback: bursty but better than nothing
+
         ts = _now()
-        line = f"{ts} {elapsed:.1f} {tot_dl} {tot_ul}\n"
+        line = f"{ts} {elapsed:.1f} {tot_dl} {ul_for_file}\n"
         # Atomic-ish overwrite of snapshot file
         try:
             tmp = stats_file_path + ".tmp"
