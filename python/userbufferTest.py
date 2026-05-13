@@ -242,7 +242,8 @@ def detect_interface_for_target(target):
 
 def collect_latency_samples(target, duration_sec, interval_sec, timeout,
                             phase_name="PHASE", stats_file=None,
-                            rate_method='statsfile', interface=None):
+                            rate_method='statsfile', interface=None,
+                            min_probe_depth=0):
     """Collect traceroute samples for the given duration.
 
     Args:
@@ -311,11 +312,20 @@ def collect_latency_samples(target, duration_sec, interval_sec, timeout,
             rtt_str = "TIMEOUT"
         else:
             # Find last responding hop for end-to-end RTT
-            for _, _, h_rtt in reversed(hops):
+            last_hop_num = 0
+            for hop_num, _, h_rtt in reversed(hops):
                 if h_rtt is not None:
-                    e2e_rtt = h_rtt
-                    break
-            rtt_str = f"{e2e_rtt:.1f}ms" if e2e_rtt else "*"
+                    if e2e_rtt is None:
+                        e2e_rtt = h_rtt
+                        last_hop_num = hop_num
+            # Shallow probe: probe didn't reach expected network depth under congestion
+            # (e.g. only hop 1 at 0.1ms responded — not a valid e2e measurement)
+            if min_probe_depth > 0 and last_hop_num < min_probe_depth:
+                e2e_rtt = None
+                lost_probes += 1
+                rtt_str = f"SHALLOW ({last_hop_num}/{min_probe_depth} hops)"
+            else:
+                rtt_str = f"{e2e_rtt:.1f}ms" if e2e_rtt else "*"
             for hop_num, ip, rtt in hops:
                 hop_data[hop_num].append((ip, rtt))
 
@@ -503,10 +513,12 @@ def print_segment_bloat_table(baseline_stats, stress_stats):
         stress_rtts = s.get('rtts', [])
         is_icmp_silent = (curr_ip != '*') and (len(stress_rtts) < 3)
 
-        # Detect same-IP consecutive hops (MPLS / non-decrementing TTL)
-        same_ip = (curr_ip == prev_ip and prev_ip != '(source)')
-        label_suffix = " [MPLS]" if same_ip else ""
-        segment_label = f"{prev_ip} -> {curr_ip}{label_suffix}"
+        # Skip same-IP consecutive hops (MPLS / non-decrementing TTL)
+        # These always have 0ms segment delay and duplicate nodes in the diagram.
+        if curr_ip == prev_ip and prev_ip != '(source)':
+            continue
+
+        segment_label = f"{prev_ip} -> {curr_ip}"
 
         link_base = max(0.0, cum_base - prev_base_cum)
 
@@ -539,9 +551,9 @@ def print_ranked_bloat(segments):
     print(f"{'IP Address':<20}{'Bloat (ms)':<15}")
     print("-" * 72)
 
-    # Only include hops with a real, positive bloat value
+    # Only include hops with at least 1ms of bloat (sub-ms values are floating-point noise)
     ranked = sorted(
-        [seg for seg in segments if not seg[5] and seg[4] is not None and seg[4] > 0],
+        [seg for seg in segments if not seg[5] and seg[4] is not None and seg[4] >= 1.0],
         key=lambda x: x[4], reverse=True,
     )
     for _, ip, _, _, bloat, _ in ranked:
@@ -1098,6 +1110,14 @@ def main():
             phase_name="PHASE 1: BASELINE (no load)",
         )
 
+    # Compute deepest hop that responded during baseline — used to filter shallow stress probes
+    baseline_max_hop = 0
+    for hop_num, meas_list in baseline_data.items():
+        if any(r is not None for _, r in meas_list):
+            baseline_max_hop = max(baseline_max_hop, hop_num)
+    min_probe_depth = max(3, baseline_max_hop - 5)
+    print(f"  Baseline max hop: {baseline_max_hop} → min_probe_depth for stress: {min_probe_depth}")
+
     # --- Phase 2: Stress ---
     traffic_proc = start_traffic_gen(
         dl_clients=args.dl_clients,
@@ -1122,6 +1142,7 @@ def main():
                 stats_file=stats_file,
                 rate_method=rate_method,
                 interface=interface,
+                min_probe_depth=min_probe_depth,
             )
     finally:
         stop_traffic_gen(traffic_proc)

@@ -29,18 +29,29 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 # --- CONFIGURATION DEFAULTS (edit here, or override with CLI flags) ---
-DL_CLIENTS    = 30
-UL_CLIENTS    = 50
+DL_CLIENTS    = 50
+UL_CLIENTS    = 30
 DURATION_MINS = 3000
 PROGRESS_SECS = 60
 LOG_FILE      = None
 STATS_FILE    = None   # real-time byte-counter file (used by userbufferTest.py)
 STATS_INTERVAL = 1     # how often (seconds) to write stats file; keep ≤1 for accurate rates
-UL_RATE_LIMIT  = '3M'  # per-worker curl --limit-rate for uploads.
-                        # Lower values (e.g. '100K') prevent TCP slow-start flooding
-                        # the gateway buffer, giving accurate NIC TX UL rates.
-                        # Default '3M' saturates the link but UL rates may spike on
-                        # mobile hotspot topology (LAN != WAN bottleneck).
+# --- Rate limiting -------------------------------------------------------
+# Two modes — MAX_*_MBPS takes priority over static *_RATE_LIMIT when set.
+#
+# MODE A — static per-worker (curl rate string, e.g. '3M', '200K', or None):
+UL_RATE_LIMIT  = '3M'   # per-worker UL limit; None = unlimited (or derive below)
+DL_RATE_LIMIT  = '5M'   # per-worker DL limit; None = unlimited (or derive below)
+#
+# MODE B — derived from total WAN speed (float Mbps, e.g. 9.0):
+#   per-worker = MAX_*_MBPS × 1,000,000 / 8 / n_clients  (bytes/sec)
+#   Prevents TCP slow-start from flooding the gateway buffer on hotspot topologies,
+#   so NIC TX rates reflect actual WAN throughput instead of LAN burst speed.
+MAX_UL_MBPS    = None   # e.g. 9.0 for a 9 Mbps WAN; None = use UL_RATE_LIMIT
+MAX_DL_MBPS    = None   # e.g. 50.0 for a 50 Mbps WAN; None = use DL_RATE_LIMIT
+
+#MAX_UL_MBPS    = 15.0
+#MAX_DL_MBPS    = 70.0
 
 # --- URL GROUPS ---
 G1_QUIC = [
@@ -72,6 +83,26 @@ _GROUP_MAP = {
     3: ("HTTP ", G3_HTTP),
     4: ("FILE ", G4_FILES),
 }
+
+def _compute_rate_limit(static_val, max_mbps, n_clients):
+    """Return a curl --limit-rate string, or None if no limiting is wanted.
+
+    If max_mbps is set, derives per-worker bytes/sec = max_mbps*1e6/8/n_clients
+    and formats it as a curl rate string (e.g. '22K', '1.50M').
+    Otherwise returns static_val unchanged (may be None → no --limit-rate arg).
+    """
+    if max_mbps is not None and n_clients > 0:
+        bps = max_mbps * 1_000_000 / 8 / n_clients
+        if bps >= 1_000_000:
+            return f"{bps / 1_000_000:.2f}M"
+        elif bps >= 1_000:
+            return f"{int(bps / 1_000)}K"
+        return str(int(bps))
+    return static_val
+
+
+_DL_RATE = None   # effective per-worker DL limit; set in __main__ before threads start
+_UL_RATE = None   # effective per-worker UL limit; set in __main__ before threads start
 
 stats      = defaultdict(lambda: {
     'success': 0, 'fail': 0,
@@ -158,7 +189,7 @@ def _now():
 def run_downloader(worker_id, curl_h3_enabled):
     """Download worker: repeatedly fetches random URLs while running is True."""
     while running:
-        req_type, url_list = _GROUP_MAP[random.randint(1, 4)]
+        req_type, url_list = _GROUP_MAP[random.choices([1, 2, 3, 4], weights=[1, 1, 1, 3], k=1)[0]]
         url = random.choice(url_list)
         print(f"[{_now()}] [DL-Thread #{worker_id:>3}] -> STARTING [{req_type}] | {url}")
 
@@ -166,11 +197,13 @@ def run_downloader(worker_id, curl_h3_enabled):
         # -w output goes to stderr via %{stderr} so it doesn't mix with body.
         cmd = [
             'curl', '-L', '-s', '-v',
-            '--limit-rate', '5M', '--max-time', '300',
+            '--max-time', '300',
             '--user-agent', 'Mozilla/5.0',
             '-w', '%{stderr}CURL_STATS %{size_download} %{size_upload} %{http_code}',
             url,
         ]
+        if _DL_RATE:
+            cmd[1:1] = ['--limit-rate', _DL_RATE]
         if req_type == "QUIC " and curl_h3_enabled:
             cmd.insert(1, '--http3')
 
@@ -226,11 +259,13 @@ def run_uploader(worker_id):
         dd_cmd   = ['dd', 'if=/dev/zero', 'bs=1M', f'count={size_mb}']
         curl_cmd = [
             'curl', '-s', '-v', '-X', 'POST', '--data-binary', '@-',
-            '--limit-rate', UL_RATE_LIMIT, '--max-time', '300',
+            '--max-time', '300',
             '-o', '/dev/null',
             '-w', '%{stderr}CURL_STATS %{size_download} %{size_upload} %{http_code}',
             url,
         ]
+        if _UL_RATE:
+            curl_cmd[1:1] = ['--limit-rate', _UL_RATE]
 
         success = sock_opened = sock_closed = sock_reset = 0
         returncode = -1
@@ -488,6 +523,18 @@ def parse_args():
                    help="Write cumulative byte counters to this file (for external readers)")
     p.add_argument('--stats-interval', type=float, default=STATS_INTERVAL,
                    help="Interval in seconds between stats-file writes (default: 1)")
+    p.add_argument('--ul-rate',     type=str,   default=None,
+                   help="Per-worker UL rate limit (curl format: '200K', '3M'). "
+                        "Overrides UL_RATE_LIMIT constant. Ignored if --max-ul-mbps is set.")
+    p.add_argument('--dl-rate',     type=str,   default=None,
+                   help="Per-worker DL rate limit (curl format: '500K', '5M'). "
+                        "Overrides DL_RATE_LIMIT constant. Ignored if --max-dl-mbps is set.")
+    p.add_argument('--max-ul-mbps', type=float, default=None,
+                   help="Total WAN UL speed in Mbps. Derives per-worker limit automatically "
+                        "(= max_mbps/8/ul_clients bytes/sec). Takes priority over --ul-rate.")
+    p.add_argument('--max-dl-mbps', type=float, default=None,
+                   help="Total WAN DL speed in Mbps. Derives per-worker limit automatically "
+                        "(= max_mbps/8/dl_clients bytes/sec). Takes priority over --dl-rate.")
     return p.parse_args()
 
 
@@ -505,6 +552,15 @@ if __name__ == "__main__":
     args = parse_args()
     _report_log_file = args.log
 
+    # Compute effective per-worker rate limits (MAX_*_MBPS takes priority)
+    _ul_static = args.ul_rate     if args.ul_rate     is not None else UL_RATE_LIMIT
+    _dl_static = args.dl_rate     if args.dl_rate     is not None else DL_RATE_LIMIT
+    _max_ul    = args.max_ul_mbps if args.max_ul_mbps is not None else MAX_UL_MBPS
+    _max_dl    = args.max_dl_mbps if args.max_dl_mbps is not None else MAX_DL_MBPS
+
+    _UL_RATE = _compute_rate_limit(_ul_static, _max_ul, args.ul_clients)
+    _DL_RATE = _compute_rate_limit(_dl_static, _max_dl, args.dl_clients)
+
     signal.signal(signal.SIGINT,  signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
@@ -519,10 +575,20 @@ if __name__ == "__main__":
 
     h3_available = check_h3_support()
 
+    def _rate_label(rate, max_mbps, n):
+        if max_mbps is not None:
+            return (f"{rate} per worker  "
+                    f"[Mode B — derived: {max_mbps} Mbps ÷ {n} workers]")
+        if rate:
+            return f"{rate} per worker  [Mode A — static]"
+        return "unlimited  [no rate limiting]"
+
     print("=====================================================")
     print(f"   DUAL-ROLE TRAFFIC ENGINE: {args.dl_clients} DL | {args.ul_clients} UL")
     print(f"   Duration : {'unlimited' if args.duration == 0 else f'{args.duration:.0f} min'}")
-    print(f"   HTTP/3   : {'available' if h3_available else 'not available (falling back to HTTPS)'}") 
+    print(f"   HTTP/3   : {'available' if h3_available else 'not available (falling back to HTTPS)'}")
+    print(f"   DL rate  : {_rate_label(_DL_RATE, _max_dl, args.dl_clients)}")
+    print(f"   UL rate  : {_rate_label(_UL_RATE, _max_ul, args.ul_clients)}")
     print("   ALL DATA DISCARDED TO /dev/null")
     print("=====================================================")
 

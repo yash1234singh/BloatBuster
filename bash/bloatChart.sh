@@ -7,7 +7,7 @@
 # LOAD CONFIG FROM config.json (requires jq)
 # ══════════════════════════════════════════════════════════════════════════════
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-CONFIG_FILE="${CONFIG_FILE:-$SCRIPT_DIR/../config.json}"
+CONFIG_FILE="${CONFIG_FILE:-$SCRIPT_DIR/config.json}"
 
 if [ ! -f "$CONFIG_FILE" ]; then
     echo "ERROR: config.json not found at $CONFIG_FILE" >&2
@@ -68,7 +68,8 @@ AR_LOG="autorate.log"
 CHART_WIDTH=80
 CHART_HEIGHT=20
 
-while getopts "r:d:u:a:w:H:h" opt; do
+MAX_HOP_ARG=0
+while getopts "r:d:u:a:w:H:m:h" opt; do
     case $opt in
         r) RTT_LOG="$OPTARG" ;;
         d) DL_LOG="$OPTARG" ;;
@@ -76,6 +77,7 @@ while getopts "r:d:u:a:w:H:h" opt; do
         a) AR_LOG="$OPTARG" ;;
         w) CHART_WIDTH="$OPTARG" ;;
         H) CHART_HEIGHT="$OPTARG" ;;
+        m) MAX_HOP_ARG="$OPTARG" ;;
         h) usage ;;
         *) usage ;;
     esac
@@ -87,13 +89,15 @@ done
 WORK_DIR=$(mktemp -d "/tmp/bloatChart_XXXXXX")
 trap 'rm -rf "$WORK_DIR"' EXIT
 
-# Extract per-second RTT to target (last hop, highest latency per timestamp).
-# If all hops at a timestamp timed out (no valid response), report timeout_ms
-# so the chart shows worst-case latency instead of a missing ("-") entry.
+# Extract per-second RTT to target hop only (prevents shallow-probe 0.1ms leaking in).
+# When maxhop > 0, only rows from the target hop (hop == maxhop) are considered.
+# If that hop timed out, report timeout_ms so the chart shows a gap/worst-case.
+# If maxhop is not supplied (0), all hops are included (legacy behaviour).
 CHART_TIMEOUT_MS=$(( $(jq -r '.test.general.timeout' "$CONFIG_FILE") * 1000 ))
 if [ -f "$RTT_LOG" ]; then
-    awk -F, -v tms="$CHART_TIMEOUT_MS" 'NR>1 {
-        ts = $1
+    awk -F, -v tms="$CHART_TIMEOUT_MS" -v maxhop="$MAX_HOP_ARG" 'NR>1 {
+        ts = $1; hop = $2 + 0
+        if (maxhop > 0 && hop != maxhop) next
         if ($3 != "No-Response" && $3 != "Timeout" && $4+0 > 0) {
             lat = $4 + 0
             if (lat > max[ts]) max[ts] = lat

@@ -4,7 +4,7 @@
 # LOAD CONFIG FROM config.json (requires jq)
 # ══════════════════════════════════════════════════════════════════════════════
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-CONFIG_FILE="${CONFIG_FILE:-$SCRIPT_DIR/../config.json}"
+CONFIG_FILE="${CONFIG_FILE:-$SCRIPT_DIR/config.json}"
 
 if [ ! -f "$CONFIG_FILE" ]; then
     echo "ERROR: config.json not found at $CONFIG_FILE" >&2
@@ -641,7 +641,10 @@ END {
         bloat = s_p95 - base
         if (bloat < 0) bloat = 0
 
-        printf "%d|%s|%s|%.2f|%.2f|%.2f\n", h, from_ip, to_ip, base, s_p95, bloat > segfile
+        # Only emit segments seen in baseline — stress-only pairs are congestion artifacts
+        # (e.g. hop N skipped under load, creating a novel prev→target pairing)
+        if (bl_n[seg] > 0)
+            printf "%d|%s|%s|%.2f|%.2f|%.2f\n", h, from_ip, to_ip, base, s_p95, bloat > segfile
     }
 }' "$MAIN_LOG"
 
@@ -669,7 +672,7 @@ echo -e "=======================================================================
 printf "%-18s %-12s\n" "IP Address" "Bloat (ms)"
 echo "------------------------------------------------------------------------"
 if [ -f "$RANK_FILE" ]; then
-    sort -t, -k2,2rn "$RANK_FILE" | awk -F, '{printf "%-18s %-12.2f ms\n", $1, $2}'
+    sort -t, -k2,2rn "$RANK_FILE" | awk -F, '!seen[$1]++ {printf "%-18s %-12.2f ms\n", $1, $2}'
 else
     echo "No significant per-link bloat detected."
 fi
@@ -839,13 +842,15 @@ parse_iperf_log() {
         # Summary lines: pick the non-zero total (sender for UL, receiver for DL with -R)
         if (/sender/)        { s_xfer = xfer }
         else if (/receiver/) { r_xfer = xfer }
-        else if (bps > 0)    { n++; v[n] = bps }
+        else                 { n++; v[n] = bps; xfer_sum += xfer }
     }
     END {
         if (n == 0) exit 1
 
         # Total data = whichever summary line is non-zero (covers -R flag reversal)
         total_mb = (s_xfer > r_xfer) ? s_xfer : r_xfer
+        # Fallback: iperf3 crashed before writing sender/receiver summary — sum interval transfers
+        if (total_mb == 0 && xfer_sum > 0) total_mb = xfer_sum
 
         # Insertion sort
         for (j = 2; j <= n; j++) {
@@ -902,11 +907,13 @@ if [ -x "$CHART_SCRIPT" ]; then
     "$CHART_SCRIPT" -r "$MAIN_LOG" \
         -d "iperf_${STRESS_TYPE}_downlink.log" \
         -u "iperf_${STRESS_TYPE}_uplink.log" \
-        -a "${AUTORATE_LOG:-autorate.log}"
+        -a "${AUTORATE_LOG:-autorate.log}" \
+        -m "$MAX_HOP"
 elif [ -f "$CHART_SCRIPT" ]; then
     echo ""
     bash "$CHART_SCRIPT" -r "$MAIN_LOG" \
         -d "iperf_${STRESS_TYPE}_downlink.log" \
         -u "iperf_${STRESS_TYPE}_uplink.log" \
-        -a "${AUTORATE_LOG:-autorate.log}"
+        -a "${AUTORATE_LOG:-autorate.log}" \
+        -m "$MAX_HOP"
 fi

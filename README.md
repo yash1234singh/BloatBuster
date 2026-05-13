@@ -103,7 +103,7 @@ All methods report approximate throughput. Each has specific failure modes — u
 >
 > **On a direct WAN connection** (test machine → cable/DSL modem, no buffering router between them), NIC TX equals WAN TX and the measurement is accurate.
 >
-> **Mitigation:** Set `UL_RATE_LIMIT` in `traffic-gen.py` to `'100K'`–`'200K'` per worker. 50 × 200 KB/s = 10 MB/s max burst (vs 150 MB/s at `3M`). NIC TX then settles to WAN rate immediately. The link is still saturated (10 MB/s >> 9 Mbps WAN). Default stays `'3M'` to test at full rate.
+> **Mitigation:** Use the derived-rate mode in `traffic-gen.py` — set `MAX_UL_MBPS` to your WAN speed (e.g. `9.0`). Per-worker limit = 9 Mbps / 8 / 50 workers ≈ 22 KB/s. NIC TX then paces to WAN speed rather than flooding the gateway buffer. The link is still fully saturated. See [Rate Limiting Modes](#rate-limiting-modes) below. Default stays static `'3M'` to test without an artificial ceiling.
 
 ---
 
@@ -144,7 +144,81 @@ There is **no measurement point on the test machine** that gives perfectly accur
 | `curl %{size_upload}` | Bytes sent when curl finishes (burst spike at completion, zero otherwise) |
 | Router WAN TX | **Actual WAN bytes** — not accessible from test machine |
 
-The accurate solution requires either (a) setting `UL_RATE_LIMIT` low enough to prevent buffer flooding, or (b) measuring at the router/WAN side.
+The accurate solution requires either (a) using the derived-rate mode (`MAX_UL_MBPS`) to cap per-worker throughput below the WAN bottleneck (see [Rate Limiting Modes](#rate-limiting-modes) below), or (b) measuring at the router/WAN side.
+
+#### Rate Limiting Modes
+
+`traffic-gen.py` supports two modes for controlling per-worker curl `--limit-rate`. The active mode is determined by whether `MAX_UL_MBPS` / `MAX_DL_MBPS` are set (not `None`).
+
+##### Mode A — Static per-worker (default)
+
+Edit the constants at the top of `traffic-gen.py`:
+
+```python
+UL_RATE_LIMIT = '3M'   # per curl worker; None = unlimited
+DL_RATE_LIMIT = '5M'   # per curl worker; None = unlimited
+```
+
+Each worker gets exactly this rate regardless of thread count. At `'3M'` with 50 UL workers, the theoretical burst is 150 MB/s — far above any WAN link — but this is expected, since the real bottleneck is TCP congestion control at the gateway, not curl's rate limiter. This mode maximises stress with no artificial ceiling.
+
+**When to use:** Direct WAN connections (modem/cable gateway, no large intermediate buffer), or any topology where NIC TX equals WAN TX.
+
+##### Mode B — Derived from total WAN speed
+
+Edit the constants at the top of `traffic-gen.py`:
+
+```python
+MAX_UL_MBPS = 9.0    # your WAN UL speed in Mbps
+MAX_DL_MBPS = 50.0   # your WAN DL speed in Mbps
+```
+
+Per-worker limit = `MAX_*_MBPS × 1,000,000 / 8 / n_workers` bytes/sec, formatted as a curl rate string. With 50 UL workers and 9 Mbps WAN: `9 × 1e6 / 8 / 50 = 22,500 B/s → "22K"`. NIC TX then paces data at WAN speed rather than flooding the gateway buffer, so rate readings reflect actual WAN throughput. The link is still fully saturated.
+
+**When to use:** Mobile hotspot topology (test machine → phone → cellular WAN) or any setup where a router with a large receive buffer sits between the test machine and the WAN bottleneck.
+
+##### Selection priority
+
+| What is set | Mode used |
+|---|---|
+| `MAX_UL_MBPS` is not `None` | **Derived** — `UL_RATE_LIMIT` is ignored |
+| `MAX_UL_MBPS = None` | **Static** — uses `UL_RATE_LIMIT` |
+| Both `None` | **Unlimited** — no `--limit-rate` arg passed to curl |
+
+Same logic applies symmetrically for DL. CLI flags override the constants at runtime:
+
+| Flag | Effect |
+|---|---|
+| `--max-ul-mbps 9.0` | Derived UL mode (overrides `MAX_UL_MBPS` constant) |
+| `--max-dl-mbps 50.0` | Derived DL mode (overrides `MAX_DL_MBPS` constant) |
+| `--ul-rate 200K` | Static UL override (ignored if `--max-ul-mbps` is also set) |
+| `--dl-rate 1M` | Static DL override (ignored if `--max-dl-mbps` is also set) |
+
+```bash
+# Derived mode — accurate readings on a 9/50 Mbps hotspot connection
+python3 python/traffic-gen.py --max-ul-mbps 9 --max-dl-mbps 50 -u 50 -d 30
+# Banner shows:  DL rate : 1666K (derived: 50.0 Mbps / 30 workers)
+#                UL rate : 22K (derived: 9.0 Mbps / 50 workers)
+
+# Static mode (default) — maximum stress, no per-worker cap
+python3 python/traffic-gen.py
+# Banner shows:  DL rate : 5M
+#                UL rate : 3M
+```
+
+#### traffic-gen.py CLI Options
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `-d, --dl-clients` | Parallel download threads | `30` |
+| `-u, --ul-clients` | Parallel upload threads | `50` |
+| `-t, --duration` | Run time in minutes (`0` = unlimited) | `3000` |
+| `-l, --log` | Save final report to CSV | — |
+| `-p, --progress` | Progress summary interval in seconds (`0` = off) | `60` |
+| `-S, --stats-file` | Write byte counters to file (for `userbufferTest.py`) | — |
+| `--ul-rate` | Static per-worker UL rate (e.g. `'200K'`, `'3M'`) | `3M` |
+| `--dl-rate` | Static per-worker DL rate (e.g. `'500K'`, `'5M'`) | `5M` |
+| `--max-ul-mbps` | Total WAN UL Mbps — derives per-worker limit automatically | — |
+| `--max-dl-mbps` | Total WAN DL Mbps — derives per-worker limit automatically | — |
 
 #### Usage
 
