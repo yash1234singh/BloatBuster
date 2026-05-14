@@ -30,6 +30,7 @@ BASELINE_SEC=$(jq -r '.test.general.baseline_sec' "$CONFIG_FILE")
 STRESS_SEC=$(jq -r '.test.general.stress_sec' "$CONFIG_FILE")
 POLL_INTERVAL=$(jq -r '.test.general.poll_interval' "$CONFIG_FILE")
 TIMEOUT=$(jq -r '.test.general.timeout' "$CONFIG_FILE")
+MAX_RTT_SEC=$(jq -r '.test.general.max_rtt_sec // 5' "$CONFIG_FILE")
 
 # --- Logging configuration ---
 MAIN_LOG=$(jq -r '.test.logging.main_log' "$CONFIG_FILE")
@@ -128,7 +129,7 @@ Configuration (config.json):
 
 Current config (profile: $ACTIVE_PROFILE):
   TARGET=$TARGET  BIND_IP=$BIND_IP
-  STRESS_TYPE=$STRESS_TYPE  BASELINE=${BASELINE_SEC}s  STRESS=${STRESS_SEC}s
+  STRESS_TYPE=$STRESS_TYPE  BASELINE=${BASELINE_SEC}s  STRESS=${STRESS_SEC}s  TIMEOUT=${TIMEOUT}s  MAX_RTT_SEC=${MAX_RTT_SEC}s
   UDP_BW_DL=$UDP_BW_DL  UDP_BW_UL=$UDP_BW_UL
   TCP_PARALLEL=$TCP_PARALLEL  UDP_PARALLEL=$UDP_PARALLEL
   ENABLE_DL=$ENABLE_DL  ENABLE_UL=$ENABLE_UL  CONNECT_TIMEOUT=${CONNECT_TIMEOUT}s  PORT_RETRIES=$PORT_RETRIES
@@ -847,8 +848,11 @@ parse_iperf_log() {
     END {
         if (n == 0) exit 1
 
-        # Total data = whichever summary line is non-zero (covers -R flag reversal)
-        total_mb = (s_xfer > r_xfer) ? s_xfer : r_xfer
+        # Total data: for DL (-R reverse mode) the server is sender, client is receiver.
+        # Use receiver for DL (actual bytes delivered to us); sender for UL (bytes we sent).
+        # Retransmissions inflate sender on congested links — e.g. 13.1 MB sent / 3.6 MB received.
+        if (dir == "downlink") total_mb = (r_xfer > 0) ? r_xfer : s_xfer
+        else                   total_mb = (s_xfer > 0) ? s_xfer : r_xfer
         # Fallback: iperf3 crashed before writing sender/receiver summary — sum interval transfers
         if (total_mb == 0 && xfer_sum > 0) total_mb = xfer_sum
 
@@ -860,15 +864,21 @@ parse_iperf_log() {
         }
 
         # Stats
-        sum = 0
-        for (i = 1; i <= n; i++) sum += v[i]
+        # mean = time-average over all intervals (includes 0-Mbps stall seconds — matches iperf3 summary)
+        # P10/Median/P90 = computed over non-zero intervals only (shows burst rate when data flows;
+        #   avoids all-zero percentiles when most intervals are congestion stalls)
+        sum = 0; nz = 0
+        for (i = 1; i <= n; i++) { sum += v[i]; if (v[i] > 0) nz++ }
         mean = sum / n
         max_val = v[n]
-        if (n % 2 == 1) med = v[int(n/2) + 1]
-        else             med = (v[n/2] + v[n/2 + 1]) / 2
-        p10i = int(n * 0.10 + 0.5); if (p10i < 1) p10i = 1
-        p90i = int(n * 0.90 + 0.5); if (p90i < 1) p90i = 1; if (p90i > n) p90i = n
-        p10 = v[p10i]; p90 = v[p90i]
+        if (nz > 0) {
+            base = n - nz
+            if (nz % 2 == 1) med = v[base + int(nz/2) + 1]
+            else              med = (v[base + nz/2] + v[base + nz/2 + 1]) / 2
+            p10i = int(nz * 0.10 + 0.5); if (p10i < 1) p10i = 1
+            p90i = int(nz * 0.90 + 0.5); if (p90i > nz) p90i = nz
+            p10 = v[base + p10i]; p90 = v[base + p90i]
+        } else { med = 0; p10 = 0; p90 = 0 }
 
         printf "%-10s %-5s %10.1f %10.2f %8.2f %8.2f %8.2f %8.2f    %4d\n", \
             dir, toupper(proto), total_mb, mean, max_val, med, p10, p90, n

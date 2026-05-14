@@ -63,21 +63,23 @@ DEFAULT_CHART_HEIGHT  = 20
 #   'auto'       — selects 'statsfile' unconditionally (safe default); use
 #                  '-m procnetdev -I <iface>' or '-m ss' explicitly for wire-level readings.
 DEFAULT_RATE_METHOD   = 'auto'
+MAX_RTT_ALLOWED       = 5     # seconds — hard wall-clock limit for one traceroute subprocess
 
 
 # ---------------------------------------------------------------------------
 # Traceroute parsing
 # ---------------------------------------------------------------------------
 
-def run_traceroute(target, timeout=2):
+def run_traceroute(target, timeout=2, max_rtt=MAX_RTT_ALLOWED):
     """Run a single traceroute and return list of (hop_num, ip, rtt_ms) tuples.
 
     Returns None entries for hops that timed out (* * *).
+    max_rtt: hard wall-clock limit for the entire subprocess (kills it if exceeded).
     """
     cmd = ['traceroute', '-I', '-n', '-w', str(timeout), '-q', '1', target]
     try:
         res = subprocess.run(cmd, capture_output=True, text=True,
-                             check=False, timeout=timeout + 10)
+                             check=False, timeout=max_rtt)
         hops = []
         for line in res.stdout.splitlines():
             line = line.strip()
@@ -243,7 +245,7 @@ def detect_interface_for_target(target):
 def collect_latency_samples(target, duration_sec, interval_sec, timeout,
                             phase_name="PHASE", stats_file=None,
                             rate_method='statsfile', interface=None,
-                            min_probe_depth=0):
+                            min_probe_depth=0, max_rtt=MAX_RTT_ALLOWED):
     """Collect traceroute samples for the given duration.
 
     Args:
@@ -303,7 +305,7 @@ def collect_latency_samples(target, duration_sec, interval_sec, timeout,
         now = time.time()
         sample_count += 1
         ts = datetime.now().strftime("%H:%M:%S")
-        hops = run_traceroute(target, timeout)
+        hops = run_traceroute(target, timeout, max_rtt)
         total_probes += 1
 
         e2e_rtt = None
@@ -970,7 +972,10 @@ def parse_args():
     p.add_argument('-i', '--interval', type=int, default=DEFAULT_POLL_INTERVAL,
                    help="Traceroute poll interval in seconds")
     p.add_argument('-w', '--timeout', type=int, default=DEFAULT_TIMEOUT,
-                   help="Traceroute wait timeout in seconds")
+                   help="Traceroute wait timeout per hop in seconds")
+    p.add_argument('--max-rtt', type=int, default=MAX_RTT_ALLOWED,
+                   help="Hard wall-clock limit for one traceroute call (seconds); "
+                        "probe killed and counted as lost if exceeded")
     p.add_argument('-d', '--dl-clients', type=int, default=DEFAULT_DL_CLIENTS,
                    help="Download threads for traffic-gen.py")
     p.add_argument('-u', '--ul-clients', type=int, default=DEFAULT_UL_CLIENTS,
@@ -1100,6 +1105,15 @@ def main():
     print(f"  Traffic log  : {traffic_log}")
     print("=" * 72)
 
+    # Discover route depth before baseline — used to filter shallow probes in BOTH phases
+    print("  Discovering route depth...")
+    _disc = run_traceroute(args.target, args.timeout, args.max_rtt)
+    discovery_max_hop = max((h for h, _, r in _disc if r is not None), default=0)
+    min_probe_depth = max(3, discovery_max_hop - 5)
+    print(f"  Discovery: {discovery_max_hop} hops → min_probe_depth={min_probe_depth} "
+          f"(probes reaching fewer hops treated as lost)")
+    print(f"  MAX_RTT_ALLOWED: {args.max_rtt}s (traceroute subprocess killed if it exceeds this)")
+
     # --- Phase 1: Baseline ---
     baseline_data, baseline_probes, baseline_lost, baseline_ts = \
         collect_latency_samples(
@@ -1108,15 +1122,9 @@ def main():
             interval_sec=args.interval,
             timeout=args.timeout,
             phase_name="PHASE 1: BASELINE (no load)",
+            min_probe_depth=min_probe_depth,
+            max_rtt=args.max_rtt,
         )
-
-    # Compute deepest hop that responded during baseline — used to filter shallow stress probes
-    baseline_max_hop = 0
-    for hop_num, meas_list in baseline_data.items():
-        if any(r is not None for _, r in meas_list):
-            baseline_max_hop = max(baseline_max_hop, hop_num)
-    min_probe_depth = max(3, baseline_max_hop - 5)
-    print(f"  Baseline max hop: {baseline_max_hop} → min_probe_depth for stress: {min_probe_depth}")
 
     # --- Phase 2: Stress ---
     traffic_proc = start_traffic_gen(
@@ -1143,6 +1151,7 @@ def main():
                 rate_method=rate_method,
                 interface=interface,
                 min_probe_depth=min_probe_depth,
+                max_rtt=args.max_rtt,
             )
     finally:
         stop_traffic_gen(traffic_proc)

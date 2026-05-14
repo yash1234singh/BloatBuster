@@ -103,14 +103,12 @@ if [ -f "$RTT_LOG" ]; then
             if (lat > max[ts]) max[ts] = lat
             if (!(ts in order)) { order[ts] = ++n; ts_list[n] = ts }
             has_valid[ts] = 1
-        } else if ($3 == "Timeout") {
-            if (!(ts in order)) { order[ts] = ++n; ts_list[n] = ts }
         }
     } END {
         for (i = 1; i <= n; i++) {
             t = ts_list[i]
             if (has_valid[t]) printf "%s,%.2f\n", t, max[t]
-            else printf "%s,%.2f\n", t, tms
+            # else: timeout/no-response — omit row so chart shows '-' gap
         }
     }' "$RTT_LOG" > "$WORK_DIR/rtt.csv"
 fi

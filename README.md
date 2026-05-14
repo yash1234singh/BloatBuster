@@ -62,13 +62,22 @@ Two-phase bufferbloat measurement using real browsing traffic as stress. Same pe
 #### How It Works
 
 ```
+Discovery (1 traceroute):
+  └─ Determine route depth (N hops) → set min_probe_depth = max(3, N-5)
+
 Phase 1: BASELINE (30s)
   └─ Traceroute every 1s to all hops → record per-hop latency (no load)
+     Probes reaching < min_probe_depth hops → counted as SHALLOW (lost)
 
 Phase 2: STRESS (120s)
   ├─ Launch traffic-gen.py (30 DL + 50 UL threads browsing real websites)
   └─ Traceroute every 1s to all hops → record per-hop latency (under load)
+     Probes reaching < min_probe_depth hops → counted as SHALLOW (lost)
 ```
+
+> **Shallow probe detection**: Under heavy congestion, routers drop ICMP TTL-exceeded packets to save CPU. Traceroute may only hear from local hops (e.g. hop 1 at 0.1 ms) rather than the full path. Without filtering, this 0.1 ms would corrupt baseline and stress RTT statistics. Probes that don't reach `min_probe_depth` hops are discarded and shown as `SHALLOW (N/M hops)` in the console output.
+
+> **MAX_RTT_ALLOWED**: When every hop times out, a single traceroute call can block for `timeout × max_hops` seconds (e.g. 40 s). This stalls the 1-second sampling loop. `--max-rtt` (default 5 s) kills the subprocess if it exceeds the wall-clock limit and counts the probe as lost (`TIMEOUT`).
 
 #### Throughput Measurement Methods
 
@@ -247,7 +256,8 @@ python3 python/userbufferTest.py -T 8.8.8.8 -m statsfile
 | `-b, --baseline` | Baseline phase duration (seconds) | `30` |
 | `-s, --stress` | Stress phase duration (seconds) | `120` |
 | `-i, --interval` | Traceroute poll interval (seconds) | `1` |
-| `-w, --timeout` | Traceroute wait timeout (seconds) | `2` |
+| `-w, --timeout` | Traceroute per-hop wait timeout (seconds) | `2` |
+| `--max-rtt` | Hard wall-clock limit for one traceroute call (seconds); probe killed and counted as lost if exceeded | `5` |
 | `-d, --dl-clients` | Download threads for traffic-gen.py | `30` |
 | `-u, --ul-clients` | Upload threads for traffic-gen.py | `50` |
 | `-m, --rate-method` | Throughput method: `auto`, `procnetdev`, `statsfile`, `ss` | `auto` |
@@ -432,7 +442,8 @@ To use a different config file: `CONFIG_FILE=/path/to/config.json bash/bufferMan
 | `test.general.baseline_sec` | Phase 1 duration (s) | `30` |
 | `test.general.stress_sec` | Phase 2 duration (s) | `200` |
 | `test.general.poll_interval` | Traceroute frequency (s) | `1` |
-| `test.general.timeout` | Traceroute wait (s) | `2` |
+| `test.general.timeout` | Traceroute per-hop wait (s) | `2` |
+| `test.general.max_rtt_sec` | Hard wall-clock limit for one traceroute round (s); probes exceeding this are counted as lost | `5` |
 | `test.logging.main_log` | CSV output filename | `"bloat_results.log"` |
 | `test.logging.stress_type` | `"tcp"` or `"udp"` | `"tcp"` |
 | `test.iperf_common.enable_stress` | Run iperf3 or monitor-only | `true` |
@@ -577,13 +588,19 @@ Two-phase bufferbloat measurement using per-hop traceroute latency under idle an
 ### How It Works
 
 ```
+Discovery (1 traceroute):
+  └─ Determine route depth (N hops) → used for per-hop probe jobs
+
 Phase 1: BASELINE (30s)
-  └─ Traceroute every 1s to all hops → record per-hop latency (no load)
+  └─ Each hop probed in parallel every 1s → record per-hop latency (no load)
 
 Phase 2: STRESS (200s)
   ├─ Launch iperf3 downlink + uplink (TCP or UDP, parallel streams)
-  └─ Traceroute every 1s to all hops → record per-hop latency (under load)
+  └─ Each hop probed in parallel every 1s → record per-hop latency (under load)
+     Hops that don't respond → logged as Timeout (shown as '-' in chart)
 ```
+
+> **`max_rtt_sec`** (config, default 5 s): Printed in the startup banner for reference. Parallel per-hop probes already bound each round to ~`timeout` seconds, so no additional kill logic is needed in bash.
 
 #### Analysis Output
 
