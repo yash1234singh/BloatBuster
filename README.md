@@ -66,13 +66,16 @@ Discovery (1 traceroute):
   └─ Determine route depth (N hops) → set min_probe_depth = max(3, N-5)
 
 Phase 1: BASELINE (30s)
-  └─ Traceroute every 1s to all hops → record per-hop latency (no load)
-     Probes reaching < min_probe_depth hops → counted as SHALLOW (lost)
+  ├─ Traceroute every 1s to all hops → record per-hop latency (no load)
+  │  Probes reaching < min_probe_depth hops → counted as SHALLOW (lost)
+  └─ [--owd] OWD thread: keep-alive probes every 0.5s → FwdOWD†/BwdOWD†
 
 Phase 2: STRESS (120s)
   ├─ Launch traffic-gen.py (30 DL + 50 UL threads browsing real websites)
-  └─ Traceroute every 1s to all hops → record per-hop latency (under load)
-     Probes reaching < min_probe_depth hops → counted as SHALLOW (lost)
+  ├─ Traceroute every 1s to all hops → record per-hop latency (under load)
+  │  Probes reaching < min_probe_depth hops → counted as SHALLOW (lost)
+  └─ [--owd] OWD thread: keep-alive probes on the SAME TCP connection
+     (continuous TSval stream → valid IPDV across both phases)
 ```
 
 > **Shallow probe detection**: Under heavy congestion, routers drop ICMP TTL-exceeded packets to save CPU. Traceroute may only hear from local hops (e.g. hop 1 at 0.1 ms) rather than the full path. Without filtering, this 0.1 ms would corrupt baseline and stress RTT statistics. Probes that don't reach `min_probe_depth` hops are discarded and shown as `SHALLOW (N/M hops)` in the console output.
@@ -244,8 +247,11 @@ python3 python/userbufferTest.py -T 10.1.2.1 -b 20 -s 60 -d 15 -u 25
 # Save results to CSV
 python3 python/userbufferTest.py -T 1.1.1.1 -o results.csv
 
-# Use statsfile method (curl-based, works on non-Linux)
-python3 python/userbufferTest.py -T 8.8.8.8 -m statsfile
+# With OWD measurement (requires root + scapy)
+sudo python3 python/userbufferTest.py -T 1.1.1.1 --owd
+
+# OWD + custom port and probe rate
+sudo python3 python/userbufferTest.py -T 1.1.1.1 --owd --owd-port 80 --owd-interval 0.5
 ```
 
 #### CLI Options
@@ -265,17 +271,21 @@ python3 python/userbufferTest.py -T 8.8.8.8 -m statsfile
 | `-o, --output` | Save results to CSV file | — |
 | `-W, --chart-width` | ASCII chart width in columns | `80` |
 | `-H, --chart-height` | ASCII chart height in rows | `20` |
+| `--owd` | Enable TCP Timestamp OWD measurement in parallel (requires root + scapy) | off |
+| `--owd-port` | TCP port for OWD probe connection | `80` |
+| `--owd-interval` | Seconds between OWD keep-alive probes | `0.5` |
 
 #### Analysis Output
 
 1. **Per-Segment Bloat Table** — incremental delay between each hop pair
 2. **Ranked Bloat Summary** — worst bloating links sorted by severity
 3. **ASCII Network Diagram** — visual path with per-link baseline/stress/bloat
-4. **Overall Latency Summary** — end-to-end avg, P95, max, loss %
-5. **Throughput Summary** — DL/UL mean, max, median, P10, P90 Mbps
-6. **Time-Series Table** — 1-second RTT + throughput data
-7. **ASCII Chart** — dual-axis: throughput (▓ DL, ░ UL) + RTT (● stress, ○ baseline)
-8. **Traffic Summary** — per-client success/fail/socket stats from traffic-gen.py
+4. **Overall Latency Summary** — end-to-end avg, P95, max, loss %; when `--owd` is used, **FwdOWD† (inbound)** and **BwdOWD† (outbound)** rows appear in the same Phase/Samples/Avg/P95/Max format directly below the RTT rows
+5. **One-Way Delay Analysis** — `--owd` only: detailed BASELINE vs STRESS IPDV comparison table with Change row
+6. **Throughput Summary** — DL/UL mean, max, median, P10, P90 Mbps
+7. **Time-Series Table** — 1-second RTT + throughput data
+8. **ASCII Chart** — dual-axis: throughput (▓ DL, ░ UL) + RTT (● stress, ○ baseline); when `--owd` is used, **▲ FwdOWD† (inbound)** and **▽ BwdOWD† (outbound)** are overlaid on the same right-axis (Y-axis scales to cover OWD if higher than RTT)
+9. **Traffic Summary** — per-client success/fail/socket stats from traffic-gen.py
 
 #### Sample Output
 
@@ -291,10 +301,22 @@ Hop  Segment                            Link Base   Link P95    Bloat
 ========================================================================
                   OVERALL LATENCY SUMMARY (End-to-End)
 ========================================================================
-Phase       Samples  Loss %   Avg (ms)   P95 (ms)   Max (ms)
+Phase        Samples  Loss %   Avg (ms)   P95 (ms)   Max (ms)
 ------------------------------------------------------------------------
-BASELINE    1        0.0      61.50      61.50      61.50
-STRESS      120      0.0      547.46     1001.42    1326.19
+BASELINE           1     0.0      61.50      61.50      61.50
+STRESS           120     0.0     547.46    1001.42    1326.19
+
+  — FwdOWD† (inbound) —          (shown only with --owd)
+Phase        Samples  Loss %   Avg (ms)   P95 (ms)   Max (ms)
+------------------------------------------------------------------------
+BASELINE          60       —      12.30      14.10      16.00
+STRESS           120       —      45.20      67.80      95.00
+
+  — BwdOWD† (outbound) —
+Phase        Samples  Loss %   Avg (ms)   P95 (ms)   Max (ms)
+------------------------------------------------------------------------
+BASELINE          60       —      11.80      13.20      15.00
+STRESS           120       —      89.70     134.50     180.00
 
 ========================================================================
                  THROUGHPUT SUMMARY (Browsing Traffic)
@@ -303,6 +325,21 @@ Direction    Mean Mbps     Max  Median     P10     P90 Samples
 ------------------------------------------------------------------------
 download        394.94 2468.53    3.27    0.01 1692.65      49
 upload          187.52  463.39  139.85   13.61  391.88      20
+
+================================================================================
+         ASCII CHART: Throughput (▓DL ░UL) + RTT (●) + OWD (▲▽)   (--owd)
+================================================================================
+  Y-axis left: Throughput (0-500 Mbps)   Y-axis right: RTT+OWD (0-200 ms)
+
+ 500.0│                              ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓           │   200
+      │                           ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓           │   180
+      │○  ○  ○  ○  ○  ○  ○  ○    ░░░░░░░░░░░░░░░░░░░░░░░░           │   160
+      │                              ▽▽▽▽▽▽▽▽▽▽▽▽▽▽▽▽▽▽▽            │   140
+      │                              ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲            │   120
+      │                                    ●●●●●●●●●●●●●●●            │   100
+   0.0│                                                               │     0
+      └───────────────────────────────────────────────────┘
+  Legend: ▓ DL Mbps   ░ UL Mbps   ○ Base RTT   ● Stress RTT   ▲ FwdOWD†(in)   ▽ BwdOWD†(out)
 ```
 
 #### Requirements
@@ -311,6 +348,7 @@ upload          187.52  463.39  139.85   13.61  391.88      20
 - `curl` (with HTTP/3/QUIC support optional)
 - `dd` (for upload data generation)
 - `traceroute` (`apt install traceroute`)
+- `scapy` + root (`pip install scapy`) — required only for `--owd`
 
 ---
 
@@ -363,6 +401,168 @@ python3 python/traffic-gen.py -p 0
 | G3_HTTP | HTTP | msn.com, yahoo.com, cnn.com, bing.com, bbc.com |
 | G4_FILES | HTTP/S | 100MB/512MB test files from thinkbroadband, hetzner, leaseweb |
 | G5_UPLOADS | HTTP/S | httpbin.org/post |
+
+---
+
+### tcp_owd.py
+
+Estimates per-direction one-way delay (OWD) and jitter using the TCP Timestamp
+Option (RFC 7323) on a single established TCP connection — no server daemon, no NTP
+clock synchronisation required.
+
+Supports two modes:
+
+| Mode | Trigger | Use case |
+|------|---------|----------|
+| **Single-phase** | `--count N` (default) | Quick spot-check of current latency |
+| **Two-phase** | `--baseline S --stress S` | Automated bufferbloat diagnosis — idle vs under load |
+
+#### How It Works
+
+**Connection setup:**
+1. Establishes a raw TCP connection (Scapy + iptables) to any open port on the target.
+2. Sends a real HTTP `HEAD` request to bootstrap the session so CDN infrastructure
+   (Cloudflare, Google, etc.) does not rate-limit subsequent probes.
+3. Sends TCP keep-alive probes (`seq = last_ack − 1`) on the **same** connection.
+   The remote kernel responds to each with an ACK containing its current `TSval`.
+
+**Why a single established connection matters:**
+Modern hosts implement RFC 7323 §5.4 — each *new* TCP connection receives a unique
+random `TSval` base (derived from a secret key + the connection 4-tuple).  Sending a
+fresh SYN per probe produces unrelated `TSval` values whose differences are meaningless.
+A single established connection gives a monotonically increasing `TSval` stream whose
+increments directly reflect forward-path delay changes.
+
+**OWD calculation — cumulative IPDV integration:**
+
+For consecutive probes i−1 and i:
+
+```
+server_gap[i]  = (TSval[i] − TSval[i−1]) / hz     # server elapsed time (from TSval clock)
+client_gap[i]  = t_send[i] − t_send[i−1]           # client elapsed time (wall clock)
+
+fwd_ipdv[i]   = server_gap[i] − client_gap[i]
+              = fwd_delay[i]  − fwd_delay[i−1]      # exact Δ in inbound (server→client) delay
+bwd_ipdv[i]   = RTT_delta[i] − fwd_ipdv[i]
+              = bwd_delay[i]  − bwd_delay[i−1]      # exact Δ in outbound (client→server) delay
+```
+
+Because the per-probe IPDV terms are exact differences, they telescope — their cumulative
+sum gives the total delay change since the first probe:
+
+```
+FwdOWD[k] = RTT[1]/2  +  Σ fwd_ipdv[2..k]    (inbound,  server→client)
+BwdOWD[k] = RTT[1]/2  +  Σ bwd_ipdv[2..k]    (outbound, client→server)
+```
+
+The anchor `RTT[1]/2` treats the first probe as a symmetric baseline.  If the link is
+already asymmetric when the run starts, the absolute values will carry an unknown offset,
+but the **trends** — which direction is getting worse and by how much — are always accurate.
+
+#### Two-Phase Bufferbloat Test
+
+When `--baseline` and/or `--stress` are set the tool runs an automated congestion test:
+
+```
+[Phase 1 — BASELINE]  probe for --baseline seconds  (network idle)
+         ↓
+[traffic-gen.py starts]  waits 5 s for congestion to build
+         ↓
+[Phase 2 — STRESS]    probe for --stress seconds    (network under load)
+         ↓
+[traffic-gen.py stops]
+         ↓
+[Phase Comparison table]
+```
+
+All probes across both phases run on the **same TCP connection** so the TSval stream
+remains continuous and the IPDV integration stays valid across the phase boundary.
+
+The **Phase Comparison** summary shows avg and p95 per direction for each phase plus
+the delta, so it is immediately clear which direction was hit hardest by congestion:
+
+```
+--------------------------------------------------------------------------
+ Phase Comparison
+--------------------------------------------------------------------------
+  Phase        FwdOWD†avg  FwdOWD†p95  BwdOWD†avg  BwdOWD†p95   RTT avg   RTT p95
+  --------------------------------------------------------------------------
+  BASELINE          12.30       14.10       11.80       13.20      24.10     27.30
+  STRESS            45.20       67.80       89.70      134.50     134.90    202.30
+  --------------------------------------------------------------------------
+  Change           +32.90      +53.70      +77.90     +121.30    +110.80   +175.00
+```
+
+#### Output Columns
+
+| Column | Meaning |
+|--------|---------|
+| `Phase` | `BASELINE` or `STRESS` (two-phase mode only) |
+| `RTT(ms)` | Round-trip time for this probe |
+| `FwdOWD†(ms)` | Estimated inbound (server→client) one-way delay |
+| `BwdOWD†(ms)` | Estimated outbound (client→server) one-way delay |
+| `FwdIPDV(ms)` | Change in inbound delay vs previous probe (`+` = got worse) |
+| `BwdIPDV(ms)` | Change in outbound delay vs previous probe (`+` = got worse) |
+
+`†` = relative estimate anchored to `RTT[1]/2` at probe 1.
+
+#### Limitations
+
+- **Absolute values are approximate.** Both OWD columns are anchored to `RTT/2` at
+  probe 1.  If the link is already asymmetric at that moment the values will be offset
+  by the unknown initial asymmetry.
+- **Trends are always accurate** regardless of starting asymmetry — this is sufficient
+  for bufferbloat diagnosis and link quality monitoring.
+- True directional OWD (as measured by TWAMP) requires NTP/PTP-synchronized clocks on
+  both ends.  This tool provides the closest achievable approximation without any clock
+  infrastructure or remote software.
+- Linux only (requires `iptables` to suppress kernel-generated RST packets on the raw
+  Scapy connection).  Requires root or `CAP_NET_RAW`.
+
+#### CLI Options
+
+**Single-phase options:**
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--target / -T` | *(required)* | Target IP address |
+| `--port / -p` | `80` | Open TCP port on target |
+| `--count / -n` | `20` | Number of keep-alive probes (single-phase) |
+| `--interval / -i` | `0.2 s` | Time between probes |
+| `--timeout / -w` | `2.0 s` | Wait time per probe |
+| `--output / -o` | — | Save per-probe results to CSV |
+| `--verbose / -v` | — | Print raw TSval / TSecr per probe |
+
+**Two-phase options** (any value > 0 activates two-phase mode, replacing `--count`):
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--baseline / -b` | `0` | Idle baseline measurement duration (seconds) |
+| `--stress / -s` | `0` | Under-load stress measurement duration (seconds) |
+| `--dl-clients` | `4` | Download clients spawned by traffic-gen |
+| `--ul-clients` | `4` | Upload clients spawned by traffic-gen |
+
+#### Usage
+
+```bash
+# Install dependency
+pip install scapy
+
+# Single-phase: quick latency check
+sudo python3 python/tcp_owd.py --target 1.1.1.1 --port 80
+
+# Single-phase: 30 probes at 500 ms intervals, save CSV
+sudo python3 python/tcp_owd.py --target 8.8.8.8 --count 30 --interval 0.5 --output owd.csv
+
+# Two-phase bufferbloat test: 30 s baseline → congest → 60 s stress
+sudo python3 python/tcp_owd.py --target 1.1.1.1 --baseline 30 --stress 60
+
+# Two-phase with custom traffic load and CSV output
+sudo python3 python/tcp_owd.py --target 192.168.1.1 \
+    --baseline 20 --stress 60 \
+    --dl-clients 8 --ul-clients 4 \
+    --output bloat.csv
+```
 
 ---
 
