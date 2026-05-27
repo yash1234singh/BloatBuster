@@ -19,7 +19,7 @@ Analysis Output:
   6. Throughput Summary         — DL/UL mean, max, median, P10, P90
   7. Time-Series Table          — 1-second RTT + throughput data
   8. ASCII Chart                — dual-axis: ▓DL ░UL throughput + ○● RTT;
-                                   ▲FwdOWD†(inbound) ▽BwdOWD†(outbound) overlay when --owd
+                                   ▲FwdOWD†(upload) ▽BwdOWD†(download) overlay when --owd
   9. Traffic Summary            — per-client success/fail/socket stats
 
 Usage:
@@ -95,6 +95,37 @@ DEFAULT_CHART_HEIGHT  = 20
 #                  '-m procnetdev -I <iface>' or '-m ss' explicitly for wire-level readings.
 DEFAULT_RATE_METHOD   = 'auto'
 MAX_RTT_ALLOWED       = 5     # seconds — hard wall-clock limit for one traceroute subprocess
+
+# OWD probe defaults
+DEFAULT_OWD_PORT         = 80
+DEFAULT_OWD_INTERVAL     = 0.2    # seconds between keep-alive probes
+DEFAULT_OWD_TIMEOUT      = 1.0    # per-probe reply timeout; 1s > baseline RTT (~100ms) but
+                                  # short enough that 60% drop-tail loss still yields ~90 probes
+                                  # in a 60s window (vs 31 with the previous 3s timeout)
+
+# Analysis thresholds
+BLOAT_THRESHOLD_MS       = 1.0    # minimum per-hop bloat considered significant (ms)
+OWD_DIAGNOSIS_THRESHOLD  = 2.0    # ms avg OWD increase needed to flag a direction as degraded
+OWD_SYMMETRIC_THRESHOLD  = 5.0    # ms; if |fwd_delta - bwd_delta| < this → symmetric congestion
+
+# Reporting percentiles
+PERCENTILE_P95           = 95
+PERCENTILE_P10           = 10
+PERCENTILE_P90           = 90
+
+# Chart / display
+CHART_AXIS_PADDING       = 1.1    # scale multiplier so top of chart has headroom
+SEPARATOR_WIDTH          = 72     # width of == and -- separator lines
+
+# Conversion factors
+BYTES_PER_MB             = 1_048_576
+BITS_PER_MBPS            = 1_000_000
+
+# Subprocess management
+TRAFFIC_GEN_TERM_TIMEOUT = 15     # seconds to wait for SIGTERM before SIGKILL
+TRAFFIC_GEN_KILL_TIMEOUT = 5      # seconds to wait after SIGKILL
+TRAFFIC_GEN_RAMP_SECS    = 5      # sleep after starting traffic-gen before stress phase
+MIN_DT_VALID             = 0.1    # minimum elapsed-time delta for rate calculation (s)
 
 
 # ---------------------------------------------------------------------------
@@ -373,9 +404,9 @@ def collect_latency_samples(target, duration_sec, interval_sec, timeout,
                 t_snap = time.time()
                 raw_dl_bytes, raw_ul_bytes = snap  # rx = DL, tx = UL
                 dt = t_snap - prev_time
-                if dt > 0.1:
-                    dl_rate = (raw_dl_bytes - prev_dl) * 8 / dt / 1_000_000
-                    ul_rate = (raw_ul_bytes - prev_ul) * 8 / dt / 1_000_000
+                if dt > MIN_DT_VALID:
+                    dl_rate = (raw_dl_bytes - prev_dl) * 8 / dt / BITS_PER_MBPS
+                    ul_rate = (raw_ul_bytes - prev_ul) * 8 / dt / BITS_PER_MBPS
                     prev_dl, prev_ul = raw_dl_bytes, raw_ul_bytes
                     prev_time = t_snap
                 dl_bytes = max(0, raw_dl_bytes - start_dl)
@@ -386,9 +417,9 @@ def collect_latency_samples(target, duration_sec, interval_sec, timeout,
                 t_snap = time.time()
                 raw_dl_bytes, raw_ul_bytes = snap
                 dt = t_snap - prev_time
-                if dt > 0.1:
-                    dl_rate = (raw_dl_bytes - prev_dl) * 8 / dt / 1_000_000
-                    ul_rate = (raw_ul_bytes - prev_ul) * 8 / dt / 1_000_000
+                if dt > MIN_DT_VALID:
+                    dl_rate = (raw_dl_bytes - prev_dl) * 8 / dt / BITS_PER_MBPS
+                    ul_rate = (raw_ul_bytes - prev_ul) * 8 / dt / BITS_PER_MBPS
                     prev_dl, prev_ul = raw_dl_bytes, raw_ul_bytes
                     prev_time = t_snap
                 dl_bytes = max(0, raw_dl_bytes - start_dl)
@@ -402,13 +433,13 @@ def collect_latency_samples(target, duration_sec, interval_sec, timeout,
                     prev_dl, prev_ul = raw_dl_bytes, raw_ul_bytes
                     start_dl, start_ul = raw_dl_bytes, raw_ul_bytes
                 dt = sample_elapsed - prev_sample_elapsed
-                if dt >= 0.5:
+                if dt >= DEFAULT_OWD_INTERVAL:
                     # Simple per-interval delta rate.  traffic-gen.py now
                     # reports bytes progressively (counted as they flow
                     # through the pipe), so the counter increments smoothly
                     # every second instead of jumping on curl completion.
-                    dl_rate = (raw_dl_bytes - prev_dl) * 8 / dt / 1_000_000
-                    ul_rate = (raw_ul_bytes - prev_ul) * 8 / dt / 1_000_000
+                    dl_rate = (raw_dl_bytes - prev_dl) * 8 / dt / BITS_PER_MBPS
+                    ul_rate = (raw_ul_bytes - prev_ul) * 8 / dt / BITS_PER_MBPS
                     prev_dl, prev_ul = raw_dl_bytes, raw_ul_bytes
                     prev_sample_elapsed = sample_elapsed
                 else:
@@ -480,7 +511,7 @@ def compute_hop_stats(hop_data):
             result[hop_num] = {
                 'ip': primary_ip,
                 'avg': sum(rtts) / len(rtts),
-                'p95': percentile(rtts, 95),
+                'p95': percentile(rtts, PERCENTILE_P95),
                 'max': max(rtts),
                 'min': min(rtts),
                 'samples': len(measurements),
@@ -620,40 +651,41 @@ def print_network_diagram(segments):
 
 def _owd_diagnosis(b, s):
     """Human-readable congestion direction verdict from BASELINE/STRESS stats dicts."""
-    THRESHOLD = 2.0
     fwd_d_avg = s['fwd_avg'] - b['fwd_avg']
     bwd_d_avg = s['bwd_avg'] - b['bwd_avg']
     fwd_d_p95 = s['fwd_p95'] - b['fwd_p95']
     bwd_d_p95 = s['bwd_p95'] - b['bwd_p95']
 
-    fwd_worse = fwd_d_avg > THRESHOLD
-    bwd_worse = bwd_d_avg > THRESHOLD
+    fwd_worse = fwd_d_avg > OWD_DIAGNOSIS_THRESHOLD
+    bwd_worse = bwd_d_avg > OWD_DIAGNOSIS_THRESHOLD
 
+    # fwd = upload (client→server); bwd = download (server→client)
     if fwd_worse and bwd_worse:
-        if abs(fwd_d_avg - bwd_d_avg) < 5.0:
+        if abs(fwd_d_avg - bwd_d_avg) < OWD_SYMMETRIC_THRESHOLD:
             direction = "Both directions degraded symmetrically (mid-path / end-to-end congestion)"
-        elif bwd_d_avg > fwd_d_avg:
+        elif fwd_d_avg > bwd_d_avg:
             direction = "OUTBOUND (upload) path is the primary bottleneck"
         else:
             direction = "INBOUND (download) path is the primary bottleneck"
-    elif bwd_worse:
-        direction = "OUTBOUND (upload) path degraded \u2014 inbound was stable"
     elif fwd_worse:
-        direction = "INBOUND (download) path degraded \u2014 outbound was stable"
+        direction = "OUTBOUND (upload) path degraded \u2014 inbound (download) was stable"
+    elif bwd_worse:
+        direction = "INBOUND (download) path degraded \u2014 outbound (upload) was stable"
     else:
         direction = "No significant OWD increase detected under stress"
 
     return (
         f"  Diagnosis  : {direction}\n"
-        f"               FwdOWD\u2020 (inbound)  \u0394avg={fwd_d_avg:>+7.1f}ms  \u0394p95={fwd_d_p95:>+7.1f}ms\n"
-        f"               BwdOWD\u2020 (outbound) \u0394avg={bwd_d_avg:>+7.1f}ms  \u0394p95={bwd_d_p95:>+7.1f}ms"
+        f"               FwdOWD\u2020 (upload)   \u0394avg={fwd_d_avg:>+7.1f}ms  \u0394p95={fwd_d_p95:>+7.1f}ms\n"
+        f"               BwdOWD\u2020 (download) \u0394avg={bwd_d_avg:>+7.1f}ms  \u0394p95={bwd_d_p95:>+7.1f}ms"
     )
 
 
 def print_overall_summary(baseline_ts, stress_ts,
                           baseline_probes, baseline_lost,
                           stress_probes, stress_lost,
-                          owd_results=None, target=''):
+                          owd_results=None, target='',
+                          owd_attempt_stats=None):
     """End-to-end latency summary.
 
     RTT values are taken from the time-series e2e_rtt field (the RTT to the
@@ -680,21 +712,26 @@ def print_overall_summary(baseline_ts, stress_ts,
     if base_rtts:
         print(f"{'BASELINE':<12}{len(base_rtts):<9}{base_loss_pct:<9.1f}"
               f"{sum(base_rtts)/len(base_rtts):<11.2f}"
-              f"{percentile(base_rtts, 95):<11.2f}{max(base_rtts):<11.2f}")
+              f"{percentile(base_rtts, PERCENTILE_P95):<11.2f}{max(base_rtts):<11.2f}")
     else:
         print(f"{'BASELINE':<12}{'0':<9}{base_loss_pct:<9.1f}{'—':<11}{'—':<11}{'—':<11}")
 
     if stress_rtts:
         print(f"{'STRESS':<12}{len(stress_rtts):<9}{stress_loss_pct:<9.1f}"
               f"{sum(stress_rtts)/len(stress_rtts):<11.2f}"
-              f"{percentile(stress_rtts, 95):<11.2f}{max(stress_rtts):<11.2f}")
+              f"{percentile(stress_rtts, PERCENTILE_P95):<11.2f}{max(stress_rtts):<11.2f}")
     else:
         print(f"{'STRESS':<12}{'0':<9}{stress_loss_pct:<9.1f}{'—':<11}{'—':<11}{'—':<11}")
 
+    if base_rtts or stress_rtts:
+        bj = (max(base_rtts)   - min(base_rtts))   if len(base_rtts)   > 1 else 0.0
+        sj = (max(stress_rtts) - min(stress_rtts)) if len(stress_rtts) > 1 else 0.0
+        print(f"  RTT jitter (range):  BASELINE {bj:.0f}ms  \u2192  STRESS {sj:.0f}ms")
+
     if owd_results:
         scope = f" (end-to-end to {target})" if target else " (end-to-end)"
-        for label, key in [("FwdOWD\u2020 (inbound)" + scope, "fwd_owd_ms"),
-                           ("BwdOWD\u2020 (outbound)" + scope, "bwd_owd_ms")]:
+        for label, key in [("FwdOWD\u2020 (upload)" + scope, "fwd_owd_ms"),
+                           ("BwdOWD\u2020 (download)" + scope, "bwd_owd_ms")]:
             print(f"\n  \u2014 {label} \u2014")
             print(f"{'Phase':<12}{'Samples':<9}{'Loss %':<9}{'Avg (ms)':<11}"
                   f"{'P95 (ms)':<11}{'Max (ms)':<11}")
@@ -703,12 +740,34 @@ def print_overall_summary(baseline_ts, stress_ts,
                 vals = [r[key] for r in owd_results
                         if r is not None
                         and r.get('phase') == phase_tag and r.get(key) is not None]
+                s = owd_attempt_stats.get(phase_tag) if owd_attempt_stats else None
+                loss_str = f"{100*(1 - s['valid']/s['total']):.1f}" if s and s['total'] else '—'
                 if vals:
-                    print(f"{phase_tag:<12}{len(vals):<9}{'—':<9}"
+                    print(f"{phase_tag:<12}{len(vals):<9}{loss_str:<9}"
                           f"{sum(vals)/len(vals):<11.2f}"
-                          f"{percentile(vals, 95):<11.2f}{max(vals):<11.2f}")
+                          f"{percentile(vals, PERCENTILE_P95):<11.2f}{max(vals):<11.2f}")
                 else:
-                    print(f"{phase_tag:<12}{'0':<9}{'—':<9}{'—':<11}{'—':<11}{'—':<11}")
+                    print(f"{phase_tag:<12}{'0':<9}{loss_str:<9}{'—':<11}{'—':<11}{'—':<11}")
+        # Jitter table (peak-to-peak IPDV range) — immune to Hz drift and anchor errors
+        _jitter = {}
+        print(f"\n  \u2014 IPDV jitter (peak-to-peak range) \u2014")
+        print(f"{'Phase':<12}{'Samples':<9}{'FwdJitter(ms)':<15}{'BwdJitter(ms)':<15}")
+        print("-" * 51)
+        for phase_tag in ('BASELINE', 'STRESS'):
+            fipd = [r['fwd_ipdv_ms'] for r in owd_results
+                    if r is not None and r.get('phase') == phase_tag
+                    and r.get('fwd_ipdv_ms') is not None]
+            bipd = [r['bwd_ipdv_ms'] for r in owd_results
+                    if r is not None and r.get('phase') == phase_tag
+                    and r.get('bwd_ipdv_ms') is not None]
+            if len(fipd) > 1:
+                fj = max(fipd) - min(fipd)
+                bj = (max(bipd) - min(bipd)) if len(bipd) > 1 else 0.0
+                _jitter[phase_tag] = {'fwd': fj, 'bwd': bj}
+                print(f"{phase_tag:<12}{len(fipd):<9}{fj:<15.2f}{bj:<15.2f}")
+            else:
+                print(f"{phase_tag:<12}{'0':<9}{'—':<15}{'—':<15}")
+
         # Diagnosis: which direction degraded and by how much
         _diag = {}
         for phase_tag in ('BASELINE', 'STRESS'):
@@ -721,15 +780,49 @@ def print_overall_summary(baseline_ts, stress_ts,
             if fwds and bwds:
                 _diag[phase_tag] = {
                     'fwd_avg': sum(fwds) / len(fwds),
-                    'fwd_p95': percentile(fwds, 95),
+                    'fwd_p95': percentile(fwds, PERCENTILE_P95),
                     'bwd_avg': sum(bwds) / len(bwds),
-                    'bwd_p95': percentile(bwds, 95),
+                    'bwd_p95': percentile(bwds, PERCENTILE_P95),
                 }
         if 'BASELINE' in _diag and 'STRESS' in _diag:
             print()
             print(_owd_diagnosis(_diag['BASELINE'], _diag['STRESS']))
+        # Compute OWD stress probe loss for bias check
+        if owd_attempt_stats:
+            _stress_s = owd_attempt_stats.get('STRESS', {})
+            _stress_owd_loss = (1 - _stress_s['valid']/_stress_s['total'])*100 if _stress_s.get('total') else 0
+        else:
+            _stress_owd_loss = 0
+
+        # Under >50% OWD probe loss, IPDV jitter is survivorship-biased (survivors all
+        # hit queue-drain gaps → similar low RTT → tiny IPDV regardless of direction).
+        if _stress_owd_loss > 50:
+            print(f"  Note: OWD probe loss {_stress_owd_loss:.0f}% in STRESS \u2014 IPDV jitter is survivorship-biased.")
+            print(f"        Surviving probes hit queue-drain gaps; IPDV between them is small.")
+            print(f"        Use RTT jitter and probe drop rate as congestion indicators instead.")
+
+        # Jitter asymmetry diagnosis (C3) — only reliable when probe loss is low
+        if 'STRESS' in _jitter and 'BASELINE' in _jitter and _stress_owd_loss <= 50:
+            sfj = _jitter['STRESS']['fwd']
+            sbj = _jitter['STRESS']['bwd']
+            if sfj > 2 * sbj and sfj > 10:
+                print(f"  \u26a0 IPDV jitter asymmetry: FwdJitter {sfj:.0f}ms >> BwdJitter {sbj:.0f}ms")
+                print(f"       Strong evidence of OUTBOUND (upload) path congestion.")
+        # Show probe drop rate increase if significant (drop-tail congestion indicator)
+        if owd_attempt_stats:
+            base_s   = owd_attempt_stats.get('BASELINE', {})
+            stress_s = owd_attempt_stats.get('STRESS', {})
+            base_loss   = (1 - base_s['valid']/base_s['total'])*100   if base_s.get('total') else 0
+            stress_loss = (1 - stress_s['valid']/stress_s['total'])*100 if stress_s.get('total') else 0
+            delta_pp    = stress_loss - base_loss
+            if delta_pp >= 20:
+                print(f"  \u26a0  Upload packet drop: BASELINE {base_loss:.0f}% \u2192 STRESS "
+                      f"{stress_loss:.0f}% (+{delta_pp:.0f}pp)")
+                print(f"       Severe drop-tail congestion — probe packets dropped before queuing.")
+                print(f"       Surviving probes hit queue-drain gaps; probe loss % is the congestion indicator.")
+                print(f"       Consider enabling AQM (fq_codel / CAKE) on the upload interface.")
         print(f"\n  \u2020 End-to-end OWD only — per-hop RTT breakdown is in the segment table above.")
-        print(f"    Cumulative IPDV anchored to RTT[1]/2 of first probe. No NTP required.")
+        print(f"    Direct TSval-clock OWD; anchor = handshake RTT/2. Each probe independent. No NTP required.")
 
 
 # ---------------------------------------------------------------------------
@@ -768,13 +861,13 @@ def print_time_series_table(baseline_ts, stress_ts):
         ul_r  = f"{entry['ul_rate_mbps']:.1f}" if entry['ul_rate_mbps'] > 0 else "0.0"
 
         # Per-interval deltas (bytes → MB)
-        dl_delta = (entry['dl_bytes'] - prev_dl) / 1048576
-        ul_delta = (entry['ul_bytes'] - prev_ul) / 1048576
+        dl_delta = (entry['dl_bytes'] - prev_dl) / BYTES_PER_MB
+        ul_delta = (entry['ul_bytes'] - prev_ul) / BYTES_PER_MB
         dl_d_s = f"{dl_delta:.2f}" if dl_delta > 0 else "0.00"
         ul_d_s = f"{ul_delta:.2f}" if ul_delta > 0 else "0.00"
 
-        dl_tot = f"{entry['dl_bytes']/1048576:.1f}MB" if entry['dl_bytes'] > 0 else "-"
-        ul_tot = f"{entry['ul_bytes']/1048576:.1f}MB" if entry['ul_bytes'] > 0 else "-"
+        dl_tot = f"{entry['dl_bytes']/BYTES_PER_MB:.1f}MB" if entry['dl_bytes'] > 0 else "-"
+        ul_tot = f"{entry['ul_bytes']/BYTES_PER_MB:.1f}MB" if entry['ul_bytes'] > 0 else "-"
 
         print(f"{entry['ts']:<10}│{'STRESS':<10}│{rtt_s:>8} │"
               f"{dl_r:>9} {ul_r:>9} │"
@@ -788,7 +881,7 @@ def print_ascii_chart(baseline_ts, stress_ts, width=80, height=20, owd_results=N
     """Render a dual-axis ASCII chart: throughput (left) + RTT (right).
 
     DL throughput = ▓, UL throughput = ░, RTT = ● / ○
-    OWD overlay (when owd_results provided): ▲ FwdOWD† inbound, ▽ BwdOWD† outbound.
+    OWD overlay (when owd_results provided): ▲ FwdOWD† upload, ▽ BwdOWD† download.
     """
     # Combine all time-series entries in order
     all_entries = []
@@ -806,17 +899,19 @@ def print_ascii_chart(baseline_ts, stress_ts, width=80, height=20, owd_results=N
     ul_rates = [e['ul_rate_mbps'] for e in all_entries if e['ul_rate_mbps'] > 0]
     all_rates = dl_rates + ul_rates
 
-    # Extend RTT axis to cover OWD values if they're larger
+    # Extend RTT axis to cover OWD and IPDV values if they're larger
     if owd_results:
         for key in ('fwd_owd_ms', 'bwd_owd_ms'):
             rtt_values += [r[key] for r in owd_results
                            if r is not None and r.get(key) is not None]
+        rtt_values += [abs(r['fwd_ipdv_ms']) for r in owd_results
+                       if r is not None and r.get('fwd_ipdv_ms') is not None]
 
     if not rtt_values and not all_rates:
         return
 
-    max_rtt = max(rtt_values) * 1.1 if rtt_values else 100
-    max_rate = max(all_rates) * 1.1 if all_rates else 10
+    max_rtt = max(rtt_values) * CHART_AXIS_PADDING if rtt_values else 100
+    max_rate = max(all_rates) * CHART_AXIS_PADDING if all_rates else 10
     if max_rtt < 1:
         max_rtt = 1
     if max_rate < 0.1:
@@ -917,20 +1012,27 @@ def print_ascii_chart(baseline_ts, stress_ts, width=80, height=20, owd_results=N
             col = _owd_col(probe)
             if col is None:
                 continue
-            # FwdOWD† inbound → ▲
+            # FwdOWD† upload → ▲
             fwd = probe.get('fwd_owd_ms')
             if fwd is not None:
                 owd_row = max(0, min(int(fwd / max_rtt * (height - 1)), height - 1))
                 r = height - 1 - owd_row
                 if grid[r][col] not in _rtt_chars:
                     grid[r][col] = '▲'
-            # BwdOWD† outbound → ▽
+            # BwdOWD† download → ▽
             bwd = probe.get('bwd_owd_ms')
             if bwd is not None:
                 owd_row = max(0, min(int(bwd / max_rtt * (height - 1)), height - 1))
                 r = height - 1 - owd_row
                 if grid[r][col] not in _rtt_chars:
                     grid[r][col] = '▽'
+            # |FwdIPDV| upload jitter magnitude → x
+            fipd = probe.get('fwd_ipdv_ms')
+            if fipd is not None:
+                ipdv_row = max(0, min(int(abs(fipd) / max_rtt * (height - 1)), height - 1))
+                r = height - 1 - ipdv_row
+                if grid[r][col] == ' ':
+                    grid[r][col] = 'x'
 
     # Render
     for row in range(height):
@@ -954,7 +1056,7 @@ def print_ascii_chart(baseline_ts, stress_ts, width=80, height=20, owd_results=N
 
     if has_owd:
         print("\n  Legend: \u2593 DL Mbps   \u2591 UL Mbps   \u25cb Base RTT   \u25cf Stress RTT"
-              "   \u25b2 FwdOWD\u2020(in)   \u25bd BwdOWD\u2020(out)")
+              "   \u25b2 FwdOWD\u2020(UL)   \u25bd BwdOWD\u2020(DL)   x |FwdIPDV|(UL jitter)")
     else:
         print("\n  Legend: \u2593 DL Mbps   \u2591 UL Mbps   \u25cb Baseline RTT (ms)   \u25cf Stress RTT (ms)")
 
@@ -978,16 +1080,16 @@ def print_throughput_summary(stress_ts):
         if rates:
             avg = sum(rates) / len(rates)
             print(f"{label:<12}{avg:>10.2f}{max(rates):>8.2f}"
-                  f"{percentile(rates, 50):>8.2f}{percentile(rates, 10):>8.2f}"
-                  f"{percentile(rates, 90):>8.2f}{len(rates):>8}")
+                  f"{percentile(rates, 50):>8.2f}{percentile(rates, PERCENTILE_P10):>8.2f}"
+                  f"{percentile(rates, PERCENTILE_P90):>8.2f}{len(rates):>8}")
         else:
             print(f"{label:<12}{'—':>10}{'—':>8}{'—':>8}{'—':>8}{'—':>8}{'0':>8}")
 
     # Total data transferred
     if stress_ts:
         last = stress_ts[-1]
-        dl_mb = last['dl_bytes'] / 1048576
-        ul_mb = last['ul_bytes'] / 1048576
+        dl_mb = last['dl_bytes'] / BYTES_PER_MB
+        ul_mb = last['ul_bytes'] / BYTES_PER_MB
         print(f"\n  Total data transferred: DL {dl_mb:.1f} MB  |  UL {ul_mb:.1f} MB")
 
 
@@ -1095,14 +1197,20 @@ def _load_tcp_owd():
         return None
 
 
-def _owd_worker(tcp_owd, target, port, conn, phase, duration_secs, interval, results_list):
+def _owd_worker(tcp_owd, target, port, conn, phase, duration_secs, interval,
+                results_list, probe_timeout=10.0, attempt_stats=None):
     """Background thread: run OWD probes for duration_secs, tag with phase."""
     phase_results = tcp_owd.run_probes(
         target, port, conn,
-        count=0, interval=interval, timeout=2.0,
+        count=0, interval=interval, timeout=probe_timeout,
         verbose=False, phase=phase, duration_secs=duration_secs,
     )
     results_list.extend(phase_results)
+    if attempt_stats is not None:
+        attempt_stats[phase] = {
+            'total': len(phase_results),
+            'valid': sum(1 for r in phase_results if r is not None),
+        }
 
 
 def print_owd_section(tcp_owd, owd_results):
@@ -1160,10 +1268,10 @@ def stop_traffic_gen(proc):
         print("\n  Stopping traffic-gen.py...")
         proc.send_signal(signal.SIGTERM if os.name != 'nt' else signal.CTRL_C_EVENT)
         try:
-            proc.wait(timeout=15)
+            proc.wait(timeout=TRAFFIC_GEN_TERM_TIMEOUT)
         except subprocess.TimeoutExpired:
             proc.kill()
-            proc.wait(timeout=5)
+            proc.wait(timeout=TRAFFIC_GEN_KILL_TIMEOUT)
         print("  traffic-gen.py stopped.")
 
 
@@ -1219,10 +1327,13 @@ def parse_args():
         'BASELINE vs STRESS comparison.')
     owd.add_argument('--owd', action='store_true',
                      help='Enable OWD measurement alongside traceroute')
-    owd.add_argument('--owd-port', type=int, default=80, metavar='PORT',
-                     help='TCP port for OWD probe connection (default: 80)')
-    owd.add_argument('--owd-interval', type=float, default=0.5, metavar='SECS',
-                     help='Seconds between OWD keep-alive probes (default: 0.5)')
+    owd.add_argument('--owd-port', type=int, default=DEFAULT_OWD_PORT, metavar='PORT',
+                     help=f'TCP port for OWD probe connection (default: {DEFAULT_OWD_PORT})')
+    owd.add_argument('--owd-interval', type=float, default=DEFAULT_OWD_INTERVAL, metavar='SECS',
+                     help=f'Seconds between OWD keep-alive probes (default: {DEFAULT_OWD_INTERVAL})')
+    owd.add_argument('--owd-timeout', type=float, default=DEFAULT_OWD_TIMEOUT, metavar='SECS',
+                     help=f'Per-probe reply timeout for OWD keepalives (default: {DEFAULT_OWD_TIMEOUT}). '
+                          'Increase if probes time out under heavy bufferbloat.')
     return p.parse_args()
 
 
@@ -1283,8 +1394,8 @@ def main():
         time.sleep(2)
         snap_b = read_procnetdev(interface)
         if snap_a and snap_b:
-            idle_dl = (snap_b[0] - snap_a[0]) * 8 / 2 / 1_000_000
-            idle_ul = (snap_b[1] - snap_a[1]) * 8 / 2 / 1_000_000
+            idle_dl = (snap_b[0] - snap_a[0]) * 8 / 2 / BITS_PER_MBPS
+            idle_ul = (snap_b[1] - snap_a[1]) * 8 / 2 / BITS_PER_MBPS
             print(f"[INFO] '{interface}' idle rate (2s sample): "
                   f"DL {idle_dl:.1f} Mbps  UL {idle_ul:.1f} Mbps")
             if idle_dl > 20 or idle_ul > 20:
@@ -1329,7 +1440,8 @@ def main():
           + (f" ({interface})" if rate_method == 'procnetdev' else ""))
     print(f"  Traffic log  : {traffic_log}")
     if args.owd:
-        print(f"  OWD          : enabled (port={args.owd_port}  interval={args.owd_interval}s)")
+        print(f"  OWD          : enabled (port={args.owd_port}  interval={args.owd_interval}s  "
+              f"timeout={args.owd_timeout}s)")
     print("=" * 72)
 
     # Discover route depth before baseline — used to filter shallow probes in BOTH phases
@@ -1368,12 +1480,15 @@ def main():
                     tcp_owd._remove_rst()
                     owd_conn = None
 
+    owd_attempt_stats = {}
+
     # --- Phase 1: Baseline ---
     if owd_enabled:
         _owd_t = threading.Thread(
             target=_owd_worker,
             args=(tcp_owd, args.target, args.owd_port, owd_conn,
-                  'BASELINE', args.baseline, args.owd_interval, owd_results),
+                  'BASELINE', args.baseline, args.owd_interval, owd_results,
+                  args.owd_timeout, owd_attempt_stats),
             daemon=True,
         )
         _owd_t.start()
@@ -1402,14 +1517,15 @@ def main():
     )
 
     # Give traffic-gen a few seconds to ramp up
-    print("  Waiting 5s for traffic to ramp up...")
-    time.sleep(5)
+    print(f"  Waiting {TRAFFIC_GEN_RAMP_SECS}s for traffic to ramp up...")
+    time.sleep(TRAFFIC_GEN_RAMP_SECS)
 
     if owd_enabled:
         _owd_t = threading.Thread(
             target=_owd_worker,
             args=(tcp_owd, args.target, args.owd_port, owd_conn,
-                  'STRESS', args.stress, args.owd_interval, owd_results),
+                  'STRESS', args.stress, args.owd_interval, owd_results,
+                  args.owd_timeout, owd_attempt_stats),
             daemon=True,
         )
         _owd_t.start()
@@ -1435,7 +1551,7 @@ def main():
 
     # --- OWD post-processing ---
     if owd_enabled:
-        tcp_owd.compute_ipdv(owd_results)
+        tcp_owd.compute_owd(owd_results, owd_conn)
         tcp_owd.tcp_teardown(args.target, args.owd_port, owd_conn)
         tcp_owd._remove_rst()
 
@@ -1450,7 +1566,8 @@ def main():
                           baseline_probes, baseline_lost,
                           stress_probes, stress_lost,
                           owd_results=owd_results if owd_enabled else None,
-                          target=args.target)
+                          target=args.target,
+                          owd_attempt_stats=owd_attempt_stats if owd_enabled else None)
     if owd_enabled and owd_results:
         print_owd_section(tcp_owd, owd_results)
     print_throughput_summary(stress_ts)

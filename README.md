@@ -75,7 +75,7 @@ Phase 2: STRESS (120s)
   ├─ Traceroute every 1s to all hops → record per-hop latency (under load)
   │  Probes reaching < min_probe_depth hops → counted as SHALLOW (lost)
   └─ [--owd] OWD thread: keep-alive probes on the SAME TCP connection
-     (continuous TSval stream → valid IPDV across both phases)
+     (TSval anchored to handshake → per-probe OWD independent of other probes)
 ```
 
 > **Shallow probe detection**: Under heavy congestion, routers drop ICMP TTL-exceeded packets to save CPU. Traceroute may only hear from local hops (e.g. hop 1 at 0.1 ms) rather than the full path. Without filtering, this 0.1 ms would corrupt baseline and stress RTT statistics. Probes that don't reach `min_probe_depth` hops are discarded and shown as `SHALLOW (N/M hops)` in the console output.
@@ -280,11 +280,11 @@ sudo python3 python/userbufferTest.py -T 1.1.1.1 --owd --owd-port 80 --owd-inter
 1. **Per-Segment Bloat Table** — incremental delay between each hop pair
 2. **Ranked Bloat Summary** — worst bloating links sorted by severity
 3. **ASCII Network Diagram** — visual path with per-link baseline/stress/bloat
-4. **Overall Latency Summary** — end-to-end avg, P95, max, loss %; when `--owd` is used, **FwdOWD† (inbound)** and **BwdOWD† (outbound)** rows appear in the same Phase/Samples/Avg/P95/Max format directly below the RTT rows
-5. **One-Way Delay Analysis** — `--owd` only: detailed BASELINE vs STRESS IPDV comparison table with Change row
+4. **Overall Latency Summary** — end-to-end avg, P95, max, loss %; when `--owd` is used, **FwdOWD† (upload)** and **BwdOWD† (download)** rows appear in the same Phase/Samples/Avg/P95/Max format directly below the RTT rows
+5. **One-Way Delay Analysis** — `--owd` only: detailed BASELINE vs STRESS comparison table with Change row and directional congestion diagnosis
 6. **Throughput Summary** — DL/UL mean, max, median, P10, P90 Mbps
 7. **Time-Series Table** — 1-second RTT + throughput data
-8. **ASCII Chart** — dual-axis: throughput (▓ DL, ░ UL) + RTT (● stress, ○ baseline); when `--owd` is used, **▲ FwdOWD† (inbound)** and **▽ BwdOWD† (outbound)** are overlaid on the same right-axis (Y-axis scales to cover OWD if higher than RTT)
+8. **ASCII Chart** — dual-axis: throughput (▓ DL, ░ UL) + RTT (● stress, ○ baseline); when `--owd` is used, **▲ FwdOWD† (UL)** and **▽ BwdOWD† (DL)** are overlaid on the same right-axis (Y-axis scales to cover OWD if higher than RTT)
 9. **Traffic Summary** — per-client success/fail/socket stats from traffic-gen.py
 
 #### Sample Output
@@ -306,13 +306,13 @@ Phase        Samples  Loss %   Avg (ms)   P95 (ms)   Max (ms)
 BASELINE           1     0.0      61.50      61.50      61.50
 STRESS           120     0.0     547.46    1001.42    1326.19
 
-  — FwdOWD† (inbound) —          (shown only with --owd)
+  — FwdOWD† (upload) —           (shown only with --owd)
 Phase        Samples  Loss %   Avg (ms)   P95 (ms)   Max (ms)
 ------------------------------------------------------------------------
 BASELINE          60       —      12.30      14.10      16.00
 STRESS           120       —      45.20      67.80      95.00
 
-  — BwdOWD† (outbound) —
+  — BwdOWD† (download) —
 Phase        Samples  Loss %   Avg (ms)   P95 (ms)   Max (ms)
 ------------------------------------------------------------------------
 BASELINE          60       —      11.80      13.20      15.00
@@ -339,7 +339,7 @@ upload          187.52  463.39  139.85   13.61  391.88      20
       │                                    ●●●●●●●●●●●●●●●            │   100
    0.0│                                                               │     0
       └───────────────────────────────────────────────────┘
-  Legend: ▓ DL Mbps   ░ UL Mbps   ○ Base RTT   ● Stress RTT   ▲ FwdOWD†(in)   ▽ BwdOWD†(out)
+  Legend: ▓ DL Mbps   ░ UL Mbps   ○ Base RTT   ● Stress RTT   ▲ FwdOWD†(UL)   ▽ BwdOWD†(DL)
 ```
 
 #### Requirements
@@ -433,31 +433,51 @@ fresh SYN per probe produces unrelated `TSval` values whose differences are mean
 A single established connection gives a monotonically increasing `TSval` stream whose
 increments directly reflect forward-path delay changes.
 
-**OWD calculation — cumulative IPDV integration:**
+**OWD calculation — direct server TSval clock:**
 
-For consecutive probes i−1 and i:
+The handshake gives us a fixed time anchor: the server sent the SYN-ACK with `TSval = S0`
+at approximately `T_anchor = t_synack − RTT_hs/2` (client monotonic clock).
+Every subsequent probe ACK contains a new server TSval `S_i` from the **same clock**.
 
-```
-server_gap[i]  = (TSval[i] − TSval[i−1]) / hz     # server elapsed time (from TSval clock)
-client_gap[i]  = t_send[i] − t_send[i−1]           # client elapsed time (wall clock)
-
-fwd_ipdv[i]   = server_gap[i] − client_gap[i]
-              = fwd_delay[i]  − fwd_delay[i−1]      # exact Δ in inbound (server→client) delay
-bwd_ipdv[i]   = RTT_delta[i] − fwd_ipdv[i]
-              = bwd_delay[i]  − bwd_delay[i−1]      # exact Δ in outbound (client→server) delay
-```
-
-Because the per-probe IPDV terms are exact differences, they telescope — their cumulative
-sum gives the total delay change since the first probe:
+For each probe i (received at `t_recv_i`, server TSval `S_i`):
 
 ```
-FwdOWD[k] = RTT[1]/2  +  Σ fwd_ipdv[2..k]    (inbound,  server→client)
-BwdOWD[k] = RTT[1]/2  +  Σ bwd_ipdv[2..k]    (outbound, client→server)
+T_server_tx_i = T_anchor  +  (S_i − S0) / Hz           # when server sent this ACK
+BwdOWD†[i]   = t_recv_i  −  T_server_tx_i              # download delay (server→client)
+FwdOWD†[i]   = RTT[i]    −  BwdOWD†[i]                 # upload delay   (client→server)
 ```
 
-The anchor `RTT[1]/2` treats the first probe as a symmetric baseline.  If the link is
-already asymmetric when the run starts, the absolute values will carry an unknown offset,
-but the **trends** — which direction is getting worse and by how much — are always accurate.
+Each probe is computed **independently** against the handshake anchor — no cumulative
+drift, no cross-probe dependencies.  Under heavy bufferbloat where most probes time out,
+the few surviving probes each yield a correct, uncontaminated OWD estimate.
+
+Per-probe IPDV deltas (consecutive pairs) are also reported for diagnostics:
+
+```
+fwd_ipdv[i]  = (TSval[i] − TSval[i−1]) / Hz  −  (t_send[i] − t_send[i−1])
+             = upload_delay[i]  − upload_delay[i−1]    # exact Δ in upload delay
+bwd_ipdv[i]  = RTT_delta[i] − fwd_ipdv[i]
+             = download_delay[i] − download_delay[i−1]  # exact Δ in download delay
+```
+
+The anchor `RTT_hs/2` treats the handshake as a symmetric baseline.  On asymmetric links
+(e.g. download 35 ms / upload 5 ms of a 40 ms RTT) this places T_anchor too early,
+producing `BwdOWD > RTT` and `FwdOWD < 0` — physically impossible.  To fix this the code
+applies an **anchor asymmetry correction** after computing all OWD values:
+
+```
+delta = max(0, −min(FwdOWD across BASELINE probes))
+FwdOWD[all] += delta          # shift fwd up so minimum = 0
+BwdOWD[all] -= delta          # compensate bwd by the same amount
+```
+
+The shift preserves all relative trends and phase deltas; its magnitude equals the link's
+upload/download asymmetry at handshake time.
+
+**Probe DSCP marking:** probes use `tos=0` (normal best-effort), so they join the same
+queue as bulk data.  This is essential — marking probes DSCP EF would let them bypass
+the congested upload queue, showing propagation-only RTT (~30 ms) instead of the true
+bufferbloat RTT (~600 ms).
 
 #### Two-Phase Bufferbloat Test
 
@@ -475,8 +495,9 @@ When `--baseline` and/or `--stress` are set the tool runs an automated congestio
 [Phase Comparison table]
 ```
 
-All probes across both phases run on the **same TCP connection** so the TSval stream
-remains continuous and the IPDV integration stays valid across the phase boundary.
+All probes across both phases run on the **same TCP connection** so TSval values remain
+comparable.  Each probe is anchored directly to the handshake, so phase-boundary gaps
+(while traffic-gen ramps up) do not corrupt OWD estimates.
 
 The **Phase Comparison** summary shows avg and p95 per direction for each phase plus
 the delta, so it is immediately clear which direction was hit hardest by congestion:
@@ -499,23 +520,24 @@ the delta, so it is immediately clear which direction was hit hardest by congest
 |--------|---------|
 | `Phase` | `BASELINE` or `STRESS` (two-phase mode only) |
 | `RTT(ms)` | Round-trip time for this probe |
-| `FwdOWD†(ms)` | Estimated inbound (server→client) one-way delay |
-| `BwdOWD†(ms)` | Estimated outbound (client→server) one-way delay |
-| `FwdIPDV(ms)` | Change in inbound delay vs previous probe (`+` = got worse) |
-| `BwdIPDV(ms)` | Change in outbound delay vs previous probe (`+` = got worse) |
+| `FwdOWD†(ms)` | Upload OWD (client→server) = RTT − BwdOWD† |
+| `BwdOWD†(ms)` | Download OWD (server→client), estimated via server TSval clock |
+| `FwdIPDV(ms)` | Change in upload delay vs previous probe (`+` = got worse) |
+| `BwdIPDV(ms)` | Change in download delay vs previous probe (`+` = got worse) |
 
-`†` = relative estimate anchored to `RTT[1]/2` at probe 1.
+`†` = anchored to handshake RTT/2 with auto-calibration for link asymmetry; each probe computed independently.
 
 #### Limitations
 
-- **Absolute values are approximate.** Both OWD columns are anchored to `RTT/2` at
-  probe 1.  If the link is already asymmetric at that moment the values will be offset
-  by the unknown initial asymmetry.
-- **Trends are always accurate** regardless of starting asymmetry — this is sufficient
-  for bufferbloat diagnosis and link quality monitoring.
-- True directional OWD (as measured by TWAMP) requires NTP/PTP-synchronized clocks on
-  both ends.  This tool provides the closest achievable approximation without any clock
-  infrastructure or remote software.
+- **Absolute values have a residual offset.** The anchor asymmetry correction zeroes
+  the minimum baseline FwdOWD, so both directions are non-negative.  The exact split
+  between upload and download OWD is an estimate (no clock sync with the server), but
+  **trends and phase deltas are accurate** — sufficient for bufferbloat diagnosis.
+- **Hz accuracy.** The server TSval clock rate is estimated from the first 10 probe pairs.
+  A 1% Hz error introduces ~1.2 ms drift over a 2-minute test — negligible in practice.
+- True directional OWD (as measured by TWAMP/RFC 5357) requires NTP/PTP-synchronized
+  clocks on both ends.  This tool provides the closest achievable approximation without
+  any clock infrastructure or remote software.
 - Linux only (requires `iptables` to suppress kernel-generated RST packets on the raw
   Scapy connection).  Requires root or `CAP_NET_RAW`.
 

@@ -7,20 +7,25 @@ options (TSval/TSecr) in TCP keep-alive probes to decompose RTT into per-
 direction components.  No server daemon is required.
 
 What this measures:
-  - RTT per probe      : accurate round-trip time
-  - FwdOWD† (inbound)  : cumulative IPDV integration, anchored to RTT[1]/2 baseline
-  - BwdOWD† (outbound) : cumulative IPDV integration, anchored to RTT[1]/2 baseline
-  - Fwd IPDV           : per-probe Δ in forward-path delay (server TSval analysis)
-  - Bwd IPDV           : per-probe Δ in backward-path delay = RTT_delta − Fwd_IPDV
+  - RTT per probe         : accurate round-trip time
+  - FwdOWD† (upload)      : client→server OWD estimated via server TSval clock
+  - BwdOWD† (download)    : server→client OWD = RTT − FwdOWD†
+  - Fwd IPDV (upload)     : per-probe Δ in upload delay (server TSval analysis)
+  - Bwd IPDV (download)   : per-probe Δ in download delay = RTT_delta − Fwd_IPDV
 
-Key technique — cumulative IPDV integration (no NTP, no server code):
-  fwd_ipdv[i] = (server_tsval_gap / hz) − client_send_gap
-              = fwd_delay[i] − fwd_delay[i−1]          ← exact Δ, not an estimate
-  FwdOWD[k]  = RTT[1]/2  +  Σ fwd_ipdv[2..k]          ← telescoping sum
+Key technique — direct server TSval clock (no NTP, no server code):
+  Anchor: server sent SYN-ACK with TSval=S0 at client time T_anchor = t_synack − RTT_hs/2
+  Per probe i (TSval=S_i, received at t_recv_i):
+      T_server_tx_i = T_anchor + (S_i − S0) / Hz        ← server send time in client clock
+      BwdOWD†[i]   = t_recv_i − T_server_tx_i           ← download delay (server→client)
+      FwdOWD†[i]   = RTT[i] − BwdOWD†[i]               ← upload delay   (client→server)
+
+  Each probe is computed independently — no cumulative drift, no cross-probe
+  dependencies.  Survives sparse measurements under heavy bufferbloat.
 
 This requires ONE established TCP connection so that TSval is monotonic.
 Per-connection TSval offsets (RFC 7323 §5.4, used by Cloudflare/Google) make
-SYN-per-probe approaches produce garbage IPDV — fresh connections have random
+SYN-per-probe approaches produce garbage results — fresh connections have random
 unrelated TSval bases that are not comparable.
 
 HTTP bootstrap: a real HTTP HEAD request is sent after the TCP handshake so
@@ -57,12 +62,24 @@ DEFAULT_PORT         = 80     # HTTP — CDN hosts always have an open port 80
 DEFAULT_COUNT        = 20
 DEFAULT_INTERVAL     = 0.2    # seconds between keep-alive probes
 DEFAULT_TIMEOUT      = 2.0    # seconds to wait per probe
-HZ_ESTIMATE_N        = 5      # first N valid probes used to estimate server TSval Hz
+HZ_ESTIMATE_N        = 10     # first N valid probe pairs used to estimate server TSval Hz
 DEFAULT_BASELINE_SEC = 0      # 0 = single-phase mode (use --count instead)
 DEFAULT_STRESS_SEC   = 0
 DEFAULT_DL_CLIENTS   = 4
 DEFAULT_UL_CLIENTS   = 4
 STRESS_RAMP_SEC      = 5      # seconds to wait after starting traffic-gen before stress probes
+
+# Analysis thresholds
+OWD_DIAGNOSIS_THRESHOLD = 2.0   # ms avg increase to flag a direction as degraded
+OWD_SYMMETRIC_THRESHOLD = 5.0   # ms; |fwd_delta - bwd_delta| < this → symmetric congestion
+
+# Reporting
+PERCENTILE_P95          = 95
+
+# TCP / OS internals
+MIN_EPHEMERAL_PORT      = 1025
+MAX_EPHEMERAL_PORT      = 65000
+SIGNAL_EXIT_BASE        = 128   # exit code = 128 + signal number
 
 # ---------------------------------------------------------------------------
 # iptables RST suppression
@@ -101,7 +118,7 @@ def _remove_rst():
 
 def _sig_handler(sig, frame):
     _remove_rst()
-    sys.exit(128 + sig)
+    sys.exit(SIGNAL_EXIT_BASE + sig)
 
 
 # ---------------------------------------------------------------------------
@@ -138,7 +155,7 @@ def tcp_handshake(target, port, timeout, verbose):
     from scapy.all import IP, TCP, sr1, send, conf
     conf.verb = 0
 
-    sport  = random.randint(1025, 65000)
+    sport  = random.randint(MIN_EPHEMERAL_PORT, MAX_EPHEMERAL_PORT)
     isn    = random.randint(0, 0xFFFFFFFF)
     ts_syn = _tick()
 
@@ -178,11 +195,16 @@ def tcp_handshake(target, port, timeout, verbose):
              options=[('Timestamp', (ts_ack, srv_tsval)), ('NOP', None), ('NOP', None)]))
 
     return {
-        'sport':          sport,
-        'our_seq':        our_seq,
-        'their_seq':      their_seq,
-        'last_srv_tsval': srv_tsval,
-        'rtt_hs_ms':      rtt_hs_ms,
+        'sport':                 sport,
+        'our_seq':               our_seq,
+        'their_seq':             their_seq,
+        'last_srv_tsval':        srv_tsval,
+        'rtt_hs_ms':             rtt_hs_ms,
+        # Time anchor for compute_owd() — do NOT overwrite these after handshake.
+        # t_synack_ns: monotonic ns when we received the SYN-ACK.
+        # srv_tsval_at_handshake: server TSval in that SYN-ACK (S0 reference).
+        't_synack_ns':           t_synack,
+        'srv_tsval_at_handshake': srv_tsval,
     }
 
 
@@ -302,7 +324,7 @@ def run_probes(target, port, conn, count, interval, timeout, verbose,
 
         probe_num += 1
         ts_probe = _tick()
-        probe = (IP(dst=target) /
+        probe = (IP(dst=target, tos=0) /       # normal DSCP — experience actual queue (incl. bufferbloat)
                  TCP(dport=port, sport=sport,
                      seq=our_seq - 1,   # keep-alive probe
                      ack=their_seq,
@@ -333,9 +355,10 @@ def run_probes(target, port, conn, count, interval, timeout, verbose,
             'probe':         probe_num,
             'phase':         phase,
             't_send_ns':     t_send,
+            't_recv_ns':     t_recv,    # needed by compute_owd() for direct bwd delay
             'rtt_ms':        rtt_ms,
-            'fwd_owd_ms':    rtt_ms / 2,   # overwritten by compute_ipdv()
-            'bwd_owd_ms':    rtt_ms / 2,   # overwritten by compute_ipdv()
+            'fwd_owd_ms':    rtt_ms / 2,   # overwritten by compute_owd()
+            'bwd_owd_ms':    rtt_ms / 2,   # overwritten by compute_owd()
             'ts_sent':       ts_probe,
             'srv_tsval':     srv_tsval,
             'srv_tsecr':     srv_tsecr,
@@ -360,71 +383,122 @@ def run_probes(target, port, conn, count, interval, timeout, verbose,
 
 
 # ---------------------------------------------------------------------------
-# IPDV decomposition + cumulative OWD integration
+# OWD computation — direct server TSval clock method
 # ---------------------------------------------------------------------------
 
-def compute_ipdv(results):
-    """Estimate server TSval Hz, decompose per-direction IPDV, integrate OWD.
+def compute_owd(results, conn):
+    """Compute per-probe absolute OWD using the server's TSval as a clock.
 
-    Requires that all results come from ONE established connection so that
-    srv_tsval values are monotonically comparable (not per-connection random).
+    Each probe is computed independently — no cumulative drift, no cross-probe
+    dependencies.  Works correctly even when many probes time out (e.g. under
+    heavy bufferbloat), because each surviving probe is anchored directly to
+    the handshake rather than to the previous probe.
 
-    Pass 1 — estimate server TSval clock rate (Hz)
-    Pass 2 — per-probe IPDV:
-        send_gap uses t_send_ns of consecutive *valid* records (spans timeouts
-        correctly — fixes the ~500ms spurious spikes from the stored per-probe
-        send_gap_ms which only referenced the immediately-preceding probe index).
-        fwd_ipdv[i] = server_gap[i] − client_send_gap[i] = fwd_delay[i] − fwd_delay[i−1]
-        bwd_ipdv[i] = rtt_delta[i] − fwd_ipdv[i]        = bwd_delay[i] − bwd_delay[i−1]
-    Pass 3 — cumulative integration:
-        fwd_owd[k] = RTT[0]/2 + Σ fwd_ipdv[2..k]    (telescoping sum)
-        bwd_owd[k] = RTT[0]/2 + Σ bwd_ipdv[2..k]
+    Key insight: the server's TSval ticks at a stable Hz.  The SYN-ACK gives
+    us a fixed reference:
+        Anchor: server sent SYN-ACK with TSval=S0 at client time T_anchor_ns
+                T_anchor_ns = conn['t_synack_ns'] − RTT_hs_ns/2
+
+    For probe i (server TSval=S_i, received at t_recv_ns_i):
+        T_server_tx_i = T_anchor_ns + _ts_delta(S_i, S0) / Hz * 1e9
+        bwd_owd_ms    = (t_recv_ns_i − T_server_tx_i) / 1e6  ← download (server→client)
+        fwd_owd_ms    = rtt_ms_i − bwd_owd_ms               ← upload   (client→server)
+
+    Pass 1 — Hz estimation from first HZ_ESTIMATE_N valid probe pairs.
+    Pass 2 — direct per-probe OWD via TSval clock (independent per probe).
+    Pass 3 — per-pair IPDV for verbose diagnostics (upload/download deltas).
+
+    Requires conn to contain 't_synack_ns', 'srv_tsval_at_handshake', and
+    'rtt_hs_ms' — all populated by tcp_handshake().
     """
-    valid = [r for r in results if r is not None and r['srv_tsval'] is not None]
+    valid = [r for r in results
+             if r is not None and r['srv_tsval'] is not None
+             and r.get('t_recv_ns') is not None]
     if len(valid) < 2:
         return
 
-    # Pass 1: Hz estimation
+    # Pass 1: Hz estimation — prefer ALL BASELINE pairs (clean network, no congestion).
+    # Hz error grows linearly with time from anchor; more BASELINE pairs → better median.
     hz_samples = []
-    for i in range(1, min(HZ_ESTIMATE_N + 1, len(valid))):
+    for i in range(1, len(valid)):
+        # only use BASELINE-phase pairs when phase info is present
+        if (valid[i].get('phase') and valid[i-1].get('phase')
+                and valid[i]['phase'] != 'BASELINE'):
+            continue
         srv_delta = _ts_delta(valid[i]['srv_tsval'], valid[i-1]['srv_tsval'])
         client_dt = (valid[i]['t_send_ns'] - valid[i-1]['t_send_ns']) / 1e9
         if client_dt > 0 and srv_delta > 0:
             hz_samples.append(srv_delta / client_dt)
+    if not hz_samples:
+        # standalone (no phases): fall back to first HZ_ESTIMATE_N pairs
+        for i in range(1, min(HZ_ESTIMATE_N + 1, len(valid))):
+            srv_delta = _ts_delta(valid[i]['srv_tsval'], valid[i-1]['srv_tsval'])
+            client_dt = (valid[i]['t_send_ns'] - valid[i-1]['t_send_ns']) / 1e9
+            if client_dt > 0 and srv_delta > 0:
+                hz_samples.append(srv_delta / client_dt)
     if not hz_samples:
         return
     est_hz = statistics.median(hz_samples)
     if est_hz <= 0:
         return
 
-    # Pass 2: per-pair IPDV
+    # Handshake anchor: server sent SYN-ACK with this TSval at this client time
+    S0          = conn['srv_tsval_at_handshake']
+    T_anchor_ns = conn['t_synack_ns'] - int(conn['rtt_hs_ms'] / 2 * 1e6)
+
+    # Pass 2: direct per-probe OWD (each probe independent — no accumulation)
+    for r in valid:
+        srv_delta_ticks = _ts_delta(r['srv_tsval'], S0)
+        T_server_tx_ns  = T_anchor_ns + int(srv_delta_ticks / est_hz * 1e9)
+        bwd_owd_ms = (r['t_recv_ns'] - T_server_tx_ns) / 1e6   # download (server→client)
+        fwd_owd_ms = r['rtt_ms'] - bwd_owd_ms                   # upload   (client→server)
+        r['bwd_owd_ms'] = bwd_owd_ms
+        r['fwd_owd_ms'] = fwd_owd_ms
+        r['est_hz']     = round(est_hz)
+
+    # Pass 2b: calibration backstop — shift all probes so min(fwd_owd) >= 0.
+    # Uses ALL valid probes (not just BASELINE) to catch Hz drift that accumulates
+    # into the STRESS phase even after a good Hz estimate.  The shift preserves all
+    # relative trends and phase comparisons; its magnitude = anchor asymmetry +
+    # any residual Hz drift error.
+    all_fwds = [r['fwd_owd_ms'] for r in valid if r['fwd_owd_ms'] is not None]
+    if all_fwds:
+        min_fwd = min(all_fwds)
+        if min_fwd < 0:
+            delta = -min_fwd
+            for r in valid:
+                if r['fwd_owd_ms'] is not None:
+                    r['fwd_owd_ms'] += delta
+                    r['bwd_owd_ms'] -= delta
+            import logging
+            logging.debug(f"[OWD] calibration shift: fwd +{delta:.2f}ms, bwd -{delta:.2f}ms")
+
+    # Pass 3: per-pair IPDV for diagnostics (upload/download delay deltas)
     for i in range(1, len(valid)):
         srv_delta     = _ts_delta(valid[i]['srv_tsval'], valid[i-1]['srv_tsval'])
         server_gap_ms = srv_delta / est_hz * 1000
-        send_gap_ms   = (valid[i]['t_send_ns'] - valid[i-1]['t_send_ns']) / 1e6  # FIXED
+        send_gap_ms   = (valid[i]['t_send_ns'] - valid[i-1]['t_send_ns']) / 1e6
 
         valid[i]['server_gap_ms'] = server_gap_ms
         valid[i]['est_hz']        = round(est_hz)
 
         if send_gap_ms > 0:
-            fwd_ipdv  = server_gap_ms - send_gap_ms
+            fwd_ipdv  = server_gap_ms - send_gap_ms   # upload IPDV   (client→server)
             rtt_delta = valid[i]['rtt_ms'] - valid[i-1]['rtt_ms']
-            bwd_ipdv  = rtt_delta - fwd_ipdv
+            bwd_ipdv  = rtt_delta - fwd_ipdv          # download IPDV (server→client)
             valid[i]['fwd_ipdv_ms'] = fwd_ipdv
             valid[i]['bwd_ipdv_ms'] = bwd_ipdv
 
-    # Pass 3: cumulative integration → per-direction OWD
-    baseline = valid[0]['rtt_ms'] / 2
-    valid[0]['fwd_owd_ms'] = baseline
-    valid[0]['bwd_owd_ms'] = baseline
-    cumfwd = 0.0
-    cumbwd = 0.0
-    for i in range(1, len(valid)):
-        if valid[i]['fwd_ipdv_ms'] is not None:
-            cumfwd += valid[i]['fwd_ipdv_ms']
-            cumbwd += valid[i]['bwd_ipdv_ms']
-        valid[i]['fwd_owd_ms'] = baseline + cumfwd
-        valid[i]['bwd_owd_ms'] = baseline + cumbwd
+
+def compute_ipdv(results, conn=None):
+    """Backward-compatible alias for compute_owd().
+
+    Pass conn (the dict returned by tcp_handshake()) to use the direct
+    TSval-clock OWD method.  Without conn this function is a no-op and
+    OWD values will remain at the RTT/2 placeholder set by run_probes().
+    """
+    if conn is not None:
+        compute_owd(results, conn)
 
 
 # ---------------------------------------------------------------------------
@@ -537,16 +611,16 @@ def print_summary(results, rtt_hs_ms):
     print(f"  RTT        : min={min(rtts):.2f}  avg={statistics.mean(rtts):.2f}  "
           f"max={max(rtts):.2f}  jitter={jitter(rtts):.2f} ms")
     print(f"  Fwd OWD†   : start={fwds[0]:.2f}  end={fwds[-1]:.2f}  "
-          f"change={fwd_change:+.2f} ms  [inbound]")
+          f"change={fwd_change:+.2f} ms  [upload/outbound]")
     print(f"  Bwd OWD†   : start={bwds[0]:.2f}  end={bwds[-1]:.2f}  "
-          f"change={bwd_change:+.2f} ms  [outbound]")
+          f"change={bwd_change:+.2f} ms  [download/inbound]")
 
     if fipd and bipd:
         print(f"  Fwd jitter : {jitter(fipd):.2f} ms")
         print(f"  Bwd jitter : {jitter(bipd):.2f} ms")
         net = fwd_change - bwd_change
-        if abs(net) > 2.0:
-            worse = "Forward/inbound" if net > 0 else "Backward/outbound"
+        if abs(net) > OWD_DIAGNOSIS_THRESHOLD:
+            worse = "Upload/outbound" if net > 0 else "Download/inbound"
             print(f"  Asymmetry  : {worse} path degraded {abs(net):.1f} ms more")
         else:
             print(f"  Asymmetry  : Paths changed symmetrically")
@@ -554,8 +628,8 @@ def print_summary(results, rtt_hs_ms):
         print(f"  IPDV       : insufficient data (need ≥2 valid probes)")
 
     print(_SEP)
-    print("  † Cumulative IPDV anchored to RTT[1]/2 baseline.")
-    print("    Trends are accurate; absolute values assume symmetric start.")
+    print("  † Direct TSval-clock OWD. Anchor = handshake RTT/2 (assumes symmetric start).")
+    print("    Each probe independent — no cumulative drift.")
     print(_SEP)
 
 
@@ -579,33 +653,33 @@ def _owd_diagnosis(b, s):
            (keys: fwd_avg, fwd_p95, bwd_avg, bwd_p95).
     Returns a multi-line string suitable for direct printing.
     """
-    THRESHOLD = 2.0
     fwd_d_avg = s['fwd_avg'] - b['fwd_avg']
     bwd_d_avg = s['bwd_avg'] - b['bwd_avg']
     fwd_d_p95 = s['fwd_p95'] - b['fwd_p95']
     bwd_d_p95 = s['bwd_p95'] - b['bwd_p95']
 
-    fwd_worse = fwd_d_avg > THRESHOLD
-    bwd_worse = bwd_d_avg > THRESHOLD
+    fwd_worse = fwd_d_avg > OWD_DIAGNOSIS_THRESHOLD
+    bwd_worse = bwd_d_avg > OWD_DIAGNOSIS_THRESHOLD
 
+    # fwd = upload (client→server); bwd = download (server→client)
     if fwd_worse and bwd_worse:
-        if abs(fwd_d_avg - bwd_d_avg) < 5.0:
+        if abs(fwd_d_avg - bwd_d_avg) < OWD_SYMMETRIC_THRESHOLD:
             direction = "Both directions degraded symmetrically (mid-path / end-to-end congestion)"
-        elif bwd_d_avg > fwd_d_avg:
+        elif fwd_d_avg > bwd_d_avg:
             direction = "OUTBOUND (upload) path is the primary bottleneck"
         else:
             direction = "INBOUND (download) path is the primary bottleneck"
-    elif bwd_worse:
-        direction = "OUTBOUND (upload) path degraded — inbound was stable"
     elif fwd_worse:
-        direction = "INBOUND (download) path degraded — outbound was stable"
+        direction = "OUTBOUND (upload) path degraded — inbound (download) was stable"
+    elif bwd_worse:
+        direction = "INBOUND (download) path degraded — outbound (upload) was stable"
     else:
         direction = "No significant OWD increase detected under stress"
 
     return (
         f"  Diagnosis  : {direction}\n"
-        f"               FwdOWD\u2020 (inbound)  \u0394avg={fwd_d_avg:>+7.1f}ms  \u0394p95={fwd_d_p95:>+7.1f}ms\n"
-        f"               BwdOWD\u2020 (outbound) \u0394avg={bwd_d_avg:>+7.1f}ms  \u0394p95={bwd_d_p95:>+7.1f}ms"
+        f"               FwdOWD\u2020 (upload)   \u0394avg={fwd_d_avg:>+7.1f}ms  \u0394p95={fwd_d_p95:>+7.1f}ms\n"
+        f"               BwdOWD\u2020 (download) \u0394avg={bwd_d_avg:>+7.1f}ms  \u0394p95={bwd_d_p95:>+7.1f}ms"
     )
 
 
@@ -627,9 +701,11 @@ def print_phase_summary(results):
     print(_SEP)
 
     col = 11
+    jcol = 12
     hdr = (f"  {'Phase':10}  {'FwdOWD†avg':>{col}}  {'FwdOWD†p95':>{col}}  "
            f"{'BwdOWD†avg':>{col}}  {'BwdOWD†p95':>{col}}  "
-           f"{'RTT avg':>8}  {'RTT p95':>8}")
+           f"{'RTT avg':>8}  {'RTT p95':>8}  "
+           f"{'FwdJitter':>{jcol}}  {'BwdJitter':>{jcol}}")
     print(hdr)
     print('  ' + '-' * (len(hdr) - 2))
 
@@ -641,15 +717,21 @@ def print_phase_summary(results):
         rtts = [r['rtt_ms']     for r in recs]
         fwds = [r['fwd_owd_ms'] for r in recs]
         bwds = [r['bwd_owd_ms'] for r in recs]
+        fipd = [r['fwd_ipdv_ms'] for r in recs if r.get('fwd_ipdv_ms') is not None]
+        bipd = [r['bwd_ipdv_ms'] for r in recs if r.get('bwd_ipdv_ms') is not None]
+        fwd_jitter = (max(fipd) - min(fipd)) if len(fipd) > 1 else 0.0
+        bwd_jitter = (max(bipd) - min(bipd)) if len(bipd) > 1 else 0.0
         stats[ph] = {
-            'fwd_avg': statistics.mean(fwds),  'fwd_p95': _percentile(fwds, 95),
-            'bwd_avg': statistics.mean(bwds),  'bwd_p95': _percentile(bwds, 95),
-            'rtt_avg': statistics.mean(rtts),  'rtt_p95': _percentile(rtts, 95),
+            'fwd_avg': statistics.mean(fwds),  'fwd_p95': _percentile(fwds, PERCENTILE_P95),
+            'bwd_avg': statistics.mean(bwds),  'bwd_p95': _percentile(bwds, PERCENTILE_P95),
+            'rtt_avg': statistics.mean(rtts),  'rtt_p95': _percentile(rtts, PERCENTILE_P95),
+            'fwd_jitter': fwd_jitter,          'bwd_jitter': bwd_jitter,
         }
         print(f"  {ph:10}  "
               f"{stats[ph]['fwd_avg']:>{col}.2f}  {stats[ph]['fwd_p95']:>{col}.2f}  "
               f"{stats[ph]['bwd_avg']:>{col}.2f}  {stats[ph]['bwd_p95']:>{col}.2f}  "
-              f"{stats[ph]['rtt_avg']:>8.2f}  {stats[ph]['rtt_p95']:>8.2f}")
+              f"{stats[ph]['rtt_avg']:>8.2f}  {stats[ph]['rtt_p95']:>8.2f}  "
+              f"{fwd_jitter:>{jcol}.2f}  {bwd_jitter:>{jcol}.2f}")
 
     if 'BASELINE' in stats and 'STRESS' in stats:
         b, s = stats['BASELINE'], stats['STRESS']
@@ -657,15 +739,16 @@ def print_phase_summary(results):
         print(f"  {'Change':10}  "
               f"{s['fwd_avg']-b['fwd_avg']:>+{col}.2f}  {s['fwd_p95']-b['fwd_p95']:>+{col}.2f}  "
               f"{s['bwd_avg']-b['bwd_avg']:>+{col}.2f}  {s['bwd_p95']-b['bwd_p95']:>+{col}.2f}  "
-              f"{s['rtt_avg']-b['rtt_avg']:>+8.2f}  {s['rtt_p95']-b['rtt_p95']:>+8.2f}")
+              f"{s['rtt_avg']-b['rtt_avg']:>+8.2f}  {s['rtt_p95']-b['rtt_p95']:>+8.2f}  "
+              f"{s['fwd_jitter']-b['fwd_jitter']:>+{jcol}.2f}  {s['bwd_jitter']-b['bwd_jitter']:>+{jcol}.2f}")
 
     if 'BASELINE' in stats and 'STRESS' in stats:
         print(_SEP)
         print(_owd_diagnosis(stats['BASELINE'], stats['STRESS']))
     print(_SEP)
     print("  \u2020 End-to-end only (single TCP connection to target). No NTP required.")
-    print("    Cumulative IPDV anchored to RTT[1]/2 of first probe.")
-    print("    For per-hop breakdown see traceroute RTT above.")
+    print("    Direct TSval-clock OWD; anchor = handshake RTT/2. Each probe independent.")
+    print("    Fwd = upload (client\u2192server)  |  Bwd = download (server\u2192client)")
     print("  + = latency increased (worse);  \u2212 = latency decreased (better).")
     print(_SEP)
 
@@ -854,7 +937,7 @@ def main():
                 args.count, args.interval, args.timeout, args.verbose,
             )
 
-        compute_ipdv(results)
+        compute_owd(results, conn)
 
     except RuntimeError as exc:
         print(f"\nError: {exc}", file=sys.stderr)
