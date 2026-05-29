@@ -588,6 +588,66 @@ sudo python3 python/tcp_owd.py --target 192.168.1.1 \
 
 ---
 
+## Known Limitations (OWD / Jitter Measurement)
+
+### Absolute OWD split (Fwd/Bwd) is approximate
+
+`tcp_owd.py` estimates per-direction OWD by treating the server's TCP Timestamp (TSval)
+as a clock (RFC 7323). The method has two error sources:
+
+- **Hz estimation noise**: The server TSval rate (Hz) is estimated from quiet BASELINE
+  probes. Under CPU load the server stamps TSval at kernel-scheduled time, not wire
+  arrival — this introduces noise. A 50 ppm Hz error over 40 s = 20 ms OWD drift.
+- **Calibration shift**: When the estimated fwd OWD goes negative (impossible), all
+  probes are shifted by `-min(fwd_owd)`. This corrects systematic error but the
+  shift magnitude tells you how accurate the split is — shifts >5 ms mean the
+  absolute Fwd/Bwd split is approximate (±shift ms).
+
+The calibration shift and Hz estimate are shown in the summary footer so you can judge
+reliability at a glance. If the shift is large (>5 ms), trust IPDV jitter and RTT jitter
+more than the absolute OWD numbers.
+
+### IPDV jitter is more reliable than absolute OWD
+
+Fwd IPDV = `server_TSval_gap − client_send_gap`. This is immune to Hz drift and anchor
+errors because it only uses *differences* between adjacent TSval samples, not absolute
+positions. It is the primary per-direction congestion signal.
+
+### RTT jitter is the most reliable congestion indicator
+
+`max(RTT) − min(RTT)` per phase comes from traceroute ICMP data and has no TSval
+dependency. When OWD probe loss is high (>50%) or the calibration shift is large, RTT
+jitter from the segment bloat table is the most trustworthy congestion magnitude signal.
+
+### Probe survivorship bias under drop-tail congestion
+
+When the upload buffer is full (drop-tail), OWD probes are dropped at the queue. Probes
+that *survive* all hit queue-drain gaps and show similar low RTT — producing artificially
+small IPDV. `userbufferTest.py` warns when STRESS probe loss exceeds 50% and recommends
+using RTT jitter instead. At 0.2 s probe interval and 1.0 s timeout, ~90 probes are
+attempted in a 60 s STRESS window even under 60% loss.
+
+### OWD direction diagnosis can be inverted under high probe loss
+
+When STRESS probe loss exceeds 50%, the surviving probes are not a random sample —
+they are the "lucky" probes that slipped through during queue-drain gaps. These probes
+show *low* FwdOWD (fast upload) because the queue happened to be empty when they fired.
+Since BwdOWD = RTT − FwdOWD, and RTT is still somewhat elevated, BwdOWD appears high.
+The result: the diagnosis concludes "download degraded" when the congestion is actually
+in the upload direction — a complete inversion.
+
+`userbufferTest.py` detects this condition and **suppresses** the OWD direction diagnosis
+when STRESS probe loss > 50%, replacing it with an explicit warning. Similarly, when the
+calibration shift exceeds 5 ms, the diagnosis is marked low-confidence in both
+`userbufferTest.py` and standalone `tcp_owd.py`.
+
+**When probe loss is high, use these reliable signals instead:**
+- **Per-hop bloat table**: the hop with the highest bloat ms is where the queue is
+- **RTT jitter** (`max(RTT) − min(RTT)`): no TSval dependency, immune to survivorship bias
+- **Probe drop rate increase** (BASELINE% → STRESS%): direct drop-tail congestion indicator
+
+---
+
 ## Configuration (config.json)
 
 All settings are centralized in `config.json`. Each bash script reads the keys it needs at startup.

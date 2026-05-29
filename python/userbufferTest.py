@@ -99,9 +99,11 @@ MAX_RTT_ALLOWED       = 5     # seconds — hard wall-clock limit for one tracer
 # OWD probe defaults
 DEFAULT_OWD_PORT         = 80
 DEFAULT_OWD_INTERVAL     = 0.2    # seconds between keep-alive probes
-DEFAULT_OWD_TIMEOUT      = 1.0    # per-probe reply timeout; 1s > baseline RTT (~100ms) but
-                                  # short enough that 60% drop-tail loss still yields ~90 probes
-                                  # in a 60s window (vs 31 with the previous 3s timeout)
+DEFAULT_OWD_TIMEOUT      = 2.0    # per-probe reply timeout; matches standalone tcp_owd.py default.
+                                  # Must be >1.5s to capture queue-full probes (600–1900ms RTT)
+                                  # that create meaningful IPDV swings under drop-tail congestion.
+                                  # At 1.0s those probes time out and only drain-gap survivors remain,
+                                  # producing artificially small (~21ms) jitter regardless of congestion.
 
 # Analysis thresholds
 BLOAT_THRESHOLD_MS       = 1.0    # minimum per-hop bloat considered significant (ms)
@@ -738,8 +740,7 @@ def print_overall_summary(baseline_ts, stress_ts,
             print("-" * 72)
             for phase_tag in ("BASELINE", "STRESS"):
                 vals = [r[key] for r in owd_results
-                        if r is not None
-                        and r.get('phase') == phase_tag and r.get(key) is not None]
+                        if r.get('phase') == phase_tag and r.get(key) is not None]
                 s = owd_attempt_stats.get(phase_tag) if owd_attempt_stats else None
                 loss_str = f"{100*(1 - s['valid']/s['total']):.1f}" if s and s['total'] else '—'
                 if vals:
@@ -748,35 +749,51 @@ def print_overall_summary(baseline_ts, stress_ts,
                           f"{percentile(vals, PERCENTILE_P95):<11.2f}{max(vals):<11.2f}")
                 else:
                     print(f"{phase_tag:<12}{'0':<9}{loss_str:<9}{'—':<11}{'—':<11}{'—':<11}")
-        # Jitter table (peak-to-peak IPDV range) — immune to Hz drift and anchor errors
+        # Compute OWD probe loss per phase — needed by IPDV table, diagnosis, and guards.
+        def _owd_loss_pct(phase_tag):
+            if not owd_attempt_stats:
+                return 0.0
+            s = owd_attempt_stats.get(phase_tag, {})
+            return (1 - s['valid'] / s['total']) * 100 if s.get('total') else 0.0
+
+        _base_owd_loss   = _owd_loss_pct('BASELINE')
+        _stress_owd_loss = _owd_loss_pct('STRESS')
+
+        # OWD probe jitter table (timeout-inclusive RTT range).
+        # max(all RTTs incl. timeout_ms) - min(received RTTs) captures the full
+        # drain-gap → drop-tail swing, e.g. 2000ms - 25ms = 1975ms.
         _jitter = {}
-        print(f"\n  \u2014 IPDV jitter (peak-to-peak range) \u2014")
+        _any_timeout_shown = False
+        print(f"\n  \u2014 OWD probe jitter (RTT range) \u2014")
         print(f"{'Phase':<12}{'Samples':<9}{'FwdJitter(ms)':<15}{'BwdJitter(ms)':<15}")
         print("-" * 51)
         for phase_tag in ('BASELINE', 'STRESS'):
-            fipd = [r['fwd_ipdv_ms'] for r in owd_results
-                    if r is not None and r.get('phase') == phase_tag
-                    and r.get('fwd_ipdv_ms') is not None]
+            all_rtts  = [r['rtt_ms'] for r in owd_results if r.get('phase') == phase_tag]
+            recv_rtts = [r['rtt_ms'] for r in owd_results
+                         if r.get('phase') == phase_tag and not r.get('timed_out')]
             bipd = [r['bwd_ipdv_ms'] for r in owd_results
-                    if r is not None and r.get('phase') == phase_tag
-                    and r.get('bwd_ipdv_ms') is not None]
-            if len(fipd) > 1:
-                fj = max(fipd) - min(fipd)
+                    if r.get('phase') == phase_tag and r.get('bwd_ipdv_ms') is not None]
+            has_timeouts = len(all_rtts) > len(recv_rtts)
+            if all_rtts and recv_rtts:
+                fj = max(all_rtts) - min(recv_rtts)
                 bj = (max(bipd) - min(bipd)) if len(bipd) > 1 else 0.0
                 _jitter[phase_tag] = {'fwd': fj, 'bwd': bj}
-                print(f"{phase_tag:<12}{len(fipd):<9}{fj:<15.2f}{bj:<15.2f}")
+                fj_str = f"{fj:.2f}\u2020" if has_timeouts else f"{fj:.2f}"
+                if has_timeouts:
+                    _any_timeout_shown = True
+                print(f"{phase_tag:<12}{len(recv_rtts):<9}{fj_str:<15}{bj:<15.2f}")
             else:
                 print(f"{phase_tag:<12}{'0':<9}{'—':<15}{'—':<15}")
+        if _any_timeout_shown:
+            print(f"  \u2020 includes dropped (timeout) probes as RTT=2000ms \u2014 reflects drop-tail congestion swing.")
 
         # Diagnosis: which direction degraded and by how much
         _diag = {}
         for phase_tag in ('BASELINE', 'STRESS'):
             fwds = [r['fwd_owd_ms'] for r in owd_results
-                    if r is not None and r.get('phase') == phase_tag
-                    and r.get('fwd_owd_ms') is not None]
+                    if r.get('phase') == phase_tag and r.get('fwd_owd_ms') is not None]
             bwds = [r['bwd_owd_ms'] for r in owd_results
-                    if r is not None and r.get('phase') == phase_tag
-                    and r.get('bwd_owd_ms') is not None]
+                    if r.get('phase') == phase_tag and r.get('bwd_owd_ms') is not None]
             if fwds and bwds:
                 _diag[phase_tag] = {
                     'fwd_avg': sum(fwds) / len(fwds),
@@ -784,43 +801,37 @@ def print_overall_summary(baseline_ts, stress_ts,
                     'bwd_avg': sum(bwds) / len(bwds),
                     'bwd_p95': percentile(bwds, PERCENTILE_P95),
                 }
+        _cal_shift = max((r.get('cal_shift_ms', 0.0) for r in owd_results), default=0.0)
+
         if 'BASELINE' in _diag and 'STRESS' in _diag:
             print()
-            print(_owd_diagnosis(_diag['BASELINE'], _diag['STRESS']))
-        # Compute OWD stress probe loss for bias check
-        if owd_attempt_stats:
-            _stress_s = owd_attempt_stats.get('STRESS', {})
-            _stress_owd_loss = (1 - _stress_s['valid']/_stress_s['total'])*100 if _stress_s.get('total') else 0
-        else:
-            _stress_owd_loss = 0
+            if _stress_owd_loss > 50:
+                print(f"  Diagnosis  : \u26a0 Suppressed \u2014 {_stress_owd_loss:.0f}% STRESS probe loss (survivorship bias).")
+                print(f"               Surviving probes hit queue-drain gaps; FwdOWD/BwdOWD split reflects")
+                print(f"               fast survivors, not the congested path \u2014 direction verdict is unreliable.")
+                print(f"               \u2192 Use RTT jitter and per-hop bloat table for congestion direction.")
+            elif _cal_shift > 5:
+                print(f"  Diagnosis  : \u26a0 Low-confidence \u2014 calibration shift +{_cal_shift:.1f}ms (anchor error >5ms).")
+                print(f"               OWD direction split unreliable at this shift magnitude.")
+                print(f"               \u2192 Use RTT jitter and per-hop bloat table for congestion direction.")
+            else:
+                print(_owd_diagnosis(_diag['BASELINE'], _diag['STRESS']))
 
-        # Under >50% OWD probe loss, IPDV jitter is survivorship-biased (survivors all
-        # hit queue-drain gaps → similar low RTT → tiny IPDV regardless of direction).
-        if _stress_owd_loss > 50:
-            print(f"  Note: OWD probe loss {_stress_owd_loss:.0f}% in STRESS \u2014 IPDV jitter is survivorship-biased.")
-            print(f"        Surviving probes hit queue-drain gaps; IPDV between them is small.")
-            print(f"        Use RTT jitter and probe drop rate as congestion indicators instead.")
-
-        # Jitter asymmetry diagnosis (C3) — only reliable when probe loss is low
-        if 'STRESS' in _jitter and 'BASELINE' in _jitter and _stress_owd_loss <= 50:
+        # Jitter asymmetry diagnosis (C3)
+        if 'STRESS' in _jitter and 'BASELINE' in _jitter:
             sfj = _jitter['STRESS']['fwd']
             sbj = _jitter['STRESS']['bwd']
             if sfj > 2 * sbj and sfj > 10:
                 print(f"  \u26a0 IPDV jitter asymmetry: FwdJitter {sfj:.0f}ms >> BwdJitter {sbj:.0f}ms")
                 print(f"       Strong evidence of OUTBOUND (upload) path congestion.")
         # Show probe drop rate increase if significant (drop-tail congestion indicator)
-        if owd_attempt_stats:
-            base_s   = owd_attempt_stats.get('BASELINE', {})
-            stress_s = owd_attempt_stats.get('STRESS', {})
-            base_loss   = (1 - base_s['valid']/base_s['total'])*100   if base_s.get('total') else 0
-            stress_loss = (1 - stress_s['valid']/stress_s['total'])*100 if stress_s.get('total') else 0
-            delta_pp    = stress_loss - base_loss
-            if delta_pp >= 20:
-                print(f"  \u26a0  Upload packet drop: BASELINE {base_loss:.0f}% \u2192 STRESS "
-                      f"{stress_loss:.0f}% (+{delta_pp:.0f}pp)")
-                print(f"       Severe drop-tail congestion — probe packets dropped before queuing.")
-                print(f"       Surviving probes hit queue-drain gaps; probe loss % is the congestion indicator.")
-                print(f"       Consider enabling AQM (fq_codel / CAKE) on the upload interface.")
+        delta_pp = _stress_owd_loss - _base_owd_loss
+        if delta_pp >= 20:
+            print(f"  \u26a0  Upload packet drop: BASELINE {_base_owd_loss:.0f}% \u2192 STRESS "
+                  f"{_stress_owd_loss:.0f}% (+{delta_pp:.0f}pp)")
+            print(f"       Severe drop-tail congestion — probe packets dropped before queuing.")
+            print(f"       Surviving probes hit queue-drain gaps; probe loss % is the congestion indicator.")
+            print(f"       Consider enabling AQM (fq_codel / CAKE) on the upload interface.")
         print(f"\n  \u2020 End-to-end OWD only — per-hop RTT breakdown is in the segment table above.")
         print(f"    Direct TSval-clock OWD; anchor = handshake RTT/2. Each probe independent. No NTP required.")
 
@@ -899,13 +910,15 @@ def print_ascii_chart(baseline_ts, stress_ts, width=80, height=20, owd_results=N
     ul_rates = [e['ul_rate_mbps'] for e in all_entries if e['ul_rate_mbps'] > 0]
     all_rates = dl_rates + ul_rates
 
-    # Extend RTT axis to cover OWD and IPDV values if they're larger
+    # Extend RTT axis to cover OWD, IPDV, and timeout spike values if they're larger
     if owd_results:
         for key in ('fwd_owd_ms', 'bwd_owd_ms'):
-            rtt_values += [r[key] for r in owd_results
-                           if r is not None and r.get(key) is not None]
+            rtt_values += [r[key] for r in owd_results if r.get(key) is not None]
         rtt_values += [abs(r['fwd_ipdv_ms']) for r in owd_results
-                       if r is not None and r.get('fwd_ipdv_ms') is not None]
+                       if r.get('fwd_ipdv_ms') is not None]
+        # Include timeout probe RTTs so chart axis scales for X spikes
+        rtt_values += [r['rtt_ms'] for r in owd_results
+                       if r.get('timed_out') and r.get('rtt_ms')]
 
     if not rtt_values and not all_rates:
         return
@@ -981,8 +994,8 @@ def print_ascii_chart(baseline_ts, stress_ts, width=80, height=20, owd_results=N
         base_dur   = baseline_ts[-1]['elapsed'] if baseline_ts else 0
         stress_dur = stress_ts[-1]['elapsed']   if stress_ts   else 0
 
-        base_probes   = [r for r in owd_results if r is not None and r.get('phase') == 'BASELINE']
-        stress_probes = [r for r in owd_results if r is not None and r.get('phase') == 'STRESS']
+        base_probes   = [r for r in owd_results if r.get('phase') == 'BASELINE']
+        stress_probes = [r for r in owd_results if r.get('phase') == 'STRESS']
 
         owd_base_t0   = (min(r['t_send_ns'] for r in base_probes)   / 1e9
                          if base_probes else None)
@@ -1007,10 +1020,16 @@ def print_ascii_chart(baseline_ts, stress_ts, width=80, height=20, owd_results=N
         _rtt_chars = {'●', '○'}
 
         for probe in owd_results:
-            if probe is None:
-                continue
             col = _owd_col(probe)
             if col is None:
+                continue
+            # Dropped (timeout) probe → X spike at timeout RTT height
+            if probe.get('timed_out'):
+                spike_rtt = probe['rtt_ms']
+                owd_row = min(int(spike_rtt / max_rtt * (height - 1)), height - 1)
+                r = height - 1 - owd_row
+                if grid[r][col] == ' ':
+                    grid[r][col] = 'X'
                 continue
             # FwdOWD† upload → ▲
             fwd = probe.get('fwd_owd_ms')
@@ -1056,7 +1075,8 @@ def print_ascii_chart(baseline_ts, stress_ts, width=80, height=20, owd_results=N
 
     if has_owd:
         print("\n  Legend: \u2593 DL Mbps   \u2591 UL Mbps   \u25cb Base RTT   \u25cf Stress RTT"
-              "   \u25b2 FwdOWD\u2020(UL)   \u25bd BwdOWD\u2020(DL)   x |FwdIPDV|(UL jitter)")
+              "   \u25b2 FwdOWD\u2020(UL)   \u25bd BwdOWD\u2020(DL)   x |FwdIPDV|(UL jitter)"
+              "   X dropped probe (queue full)")
     else:
         print("\n  Legend: \u2593 DL Mbps   \u2591 UL Mbps   \u25cb Baseline RTT (ms)   \u25cf Stress RTT (ms)")
 
@@ -1209,18 +1229,36 @@ def _owd_worker(tcp_owd, target, port, conn, phase, duration_secs, interval,
     if attempt_stats is not None:
         attempt_stats[phase] = {
             'total': len(phase_results),
-            'valid': sum(1 for r in phase_results if r is not None),
+            'valid': sum(1 for r in phase_results if not r.get('timed_out')),
         }
 
 
-def print_owd_section(tcp_owd, owd_results):
+def print_owd_section(tcp_owd, owd_results, owd_attempt_stats=None):
     """Print the OWD BASELINE vs STRESS comparison table."""
     print(f"\n{'='*72}")
     print(f"{'ONE-WAY DELAY ANALYSIS (TCP Timestamp OWD†)':^72}")
     print(f"{'='*72}")
     print(f"  Note: OWD is end-to-end only (single TCP connection to target).")
     print(f"        Per-hop RTT breakdown is in the segment bloat table above.")
-    tcp_owd.print_phase_summary(owd_results)
+    def _loss_pct(phase_tag):
+        if not owd_attempt_stats:
+            return 0.0
+        s = owd_attempt_stats.get(phase_tag, {})
+        return (1 - s['valid'] / s['total']) * 100 if s.get('total') else 0.0
+    phase_loss = {'BASELINE': _loss_pct('BASELINE'), 'STRESS': _loss_pct('STRESS')}
+    # Compute timeout-inclusive jitter override so print_phase_summary shows correct numbers
+    phase_jitter_override = {}
+    for ph in ('BASELINE', 'STRESS'):
+        all_rtts  = [r['rtt_ms'] for r in owd_results if r.get('phase') == ph]
+        recv_rtts = [r['rtt_ms'] for r in owd_results
+                     if r.get('phase') == ph and not r.get('timed_out')]
+        bipd = [r['bwd_ipdv_ms'] for r in owd_results
+                if r.get('phase') == ph and r.get('bwd_ipdv_ms') is not None]
+        fj = (max(all_rtts) - min(recv_rtts)) if (all_rtts and recv_rtts) else 0.0
+        bj = (max(bipd) - min(bipd)) if len(bipd) > 1 else 0.0
+        phase_jitter_override[ph] = (fj, bj)
+    tcp_owd.print_phase_summary(owd_results, phase_loss=phase_loss,
+                                phase_jitter_override=phase_jitter_override)
 
 
 # ---------------------------------------------------------------------------
@@ -1569,7 +1607,8 @@ def main():
                           target=args.target,
                           owd_attempt_stats=owd_attempt_stats if owd_enabled else None)
     if owd_enabled and owd_results:
-        print_owd_section(tcp_owd, owd_results)
+        print_owd_section(tcp_owd, owd_results,
+                          owd_attempt_stats=owd_attempt_stats if owd_enabled else None)
     print_throughput_summary(stress_ts)
     print_time_series_table(baseline_ts, stress_ts)
     print_ascii_chart(baseline_ts, stress_ts,

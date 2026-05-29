@@ -46,6 +46,7 @@ Usage:
 import argparse
 import atexit
 import csv
+import logging
 import os
 import random
 import signal
@@ -339,7 +340,17 @@ def run_probes(target, port, conn, count, interval, timeout, verbose,
         if resp is None or not resp.haslayer(TCP):
             if verbose:
                 print(f"  probe {probe_num:>3}: TIMEOUT")
-            results.append(None)
+            results.append({
+                'probe':       probe_num,
+                'phase':       phase,
+                't_send_ns':   t_send,
+                'rtt_ms':      timeout * 1000,   # lower bound; actual delay >= this
+                'timed_out':   True,
+                'fwd_owd_ms':  None,
+                'bwd_owd_ms':  None,
+                'fwd_ipdv_ms': None,
+                'bwd_ipdv_ms': None,
+            })
             prev_t_send_ns = t_send
             time.sleep(max(0.0, interval - (time.monotonic_ns() - t_send) / 1e9))
             continue
@@ -412,7 +423,7 @@ def compute_owd(results, conn):
     'rtt_hs_ms' — all populated by tcp_handshake().
     """
     valid = [r for r in results
-             if r is not None and r['srv_tsval'] is not None
+             if not r.get('timed_out') and r['srv_tsval'] is not None
              and r.get('t_recv_ns') is not None]
     if len(valid) < 2:
         return
@@ -439,6 +450,7 @@ def compute_owd(results, conn):
     if not hz_samples:
         return
     est_hz = statistics.median(hz_samples)
+    hz_sample_count = len(hz_samples)
     if est_hz <= 0:
         return
 
@@ -453,8 +465,9 @@ def compute_owd(results, conn):
         bwd_owd_ms = (r['t_recv_ns'] - T_server_tx_ns) / 1e6   # download (server→client)
         fwd_owd_ms = r['rtt_ms'] - bwd_owd_ms                   # upload   (client→server)
         r['bwd_owd_ms'] = bwd_owd_ms
-        r['fwd_owd_ms'] = fwd_owd_ms
-        r['est_hz']     = round(est_hz)
+        r['fwd_owd_ms']      = fwd_owd_ms
+        r['est_hz']          = round(est_hz)
+        r['hz_sample_count'] = hz_sample_count
 
     # Pass 2b: calibration backstop — shift all probes so min(fwd_owd) >= 0.
     # Uses ALL valid probes (not just BASELINE) to catch Hz drift that accumulates
@@ -470,7 +483,7 @@ def compute_owd(results, conn):
                 if r['fwd_owd_ms'] is not None:
                     r['fwd_owd_ms'] += delta
                     r['bwd_owd_ms'] -= delta
-            import logging
+                    r['cal_shift_ms'] = delta
             logging.debug(f"[OWD] calibration shift: fwd +{delta:.2f}ms, bwd -{delta:.2f}ms")
 
     # Pass 3: per-pair IPDV for diagnostics (upload/download delay deltas)
@@ -480,7 +493,7 @@ def compute_owd(results, conn):
         send_gap_ms   = (valid[i]['t_send_ns'] - valid[i-1]['t_send_ns']) / 1e6
 
         valid[i]['server_gap_ms'] = server_gap_ms
-        valid[i]['est_hz']        = round(est_hz)
+        # est_hz already set on all probes in Pass 2
 
         if send_gap_ms > 0:
             fwd_ipdv  = server_gap_ms - send_gap_ms   # upload IPDV   (client→server)
@@ -553,7 +566,7 @@ _SEP = '-' * 74
 
 
 def print_table(results):
-    has_phase = any(r is not None and r.get('phase') for r in results)
+    has_phase = any(r.get('phase') for r in results)
     if has_phase:
         hdr = (f"{'#':>5}  {'Phase':>8}  {'RTT(ms)':>8}  {'FwdOWD†(ms)':>11}  "
                f"{'BwdOWD†(ms)':>11}  {'FwdIPDV(ms)':>11}  {'BwdIPDV(ms)':>11}")
@@ -563,7 +576,7 @@ def print_table(results):
     print(hdr)
     print('-' * len(hdr))
     for r in results:
-        if r is None:
+        if r.get('timed_out'):
             if has_phase:
                 print(f"{'--':>5}  {'--':>8}  {'timeout':>8}  {'--':>11}  "
                       f"{'--':>11}  {'--':>11}  {'--':>11}")
@@ -584,8 +597,13 @@ def print_table(results):
                   f"{fipd:>11}  {bipd:>11}")
 
 
+def _jitter_range(lst):
+    """Peak-to-peak range of a list (max - min). Returns 0.0 for lists < 2 items."""
+    return max(lst) - min(lst) if len(lst) > 1 else 0.0
+
+
 def print_summary(results, rtt_hs_ms):
-    valid = [r for r in results if r is not None]
+    valid = [r for r in results if not r.get('timed_out')]
     if not valid:
         print("No valid probe responses.")
         return
@@ -596,8 +614,7 @@ def print_summary(results, rtt_hs_ms):
     fipd = [r['fwd_ipdv_ms'] for r in valid if r['fwd_ipdv_ms'] is not None]
     bipd = [r['bwd_ipdv_ms'] for r in valid if r['bwd_ipdv_ms'] is not None]
 
-    def jitter(lst):
-        return max(lst) - min(lst) if len(lst) > 1 else 0.0
+    jitter = _jitter_range
 
     fwd_change = fwds[-1] - fwds[0] if len(fwds) > 1 else 0.0
     bwd_change = bwds[-1] - bwds[0] if len(bwds) > 1 else 0.0
@@ -627,9 +644,19 @@ def print_summary(results, rtt_hs_ms):
     else:
         print(f"  IPDV       : insufficient data (need ≥2 valid probes)")
 
+    est_hz_val = valid[0].get('est_hz') if valid else None
+    hz_n       = valid[0].get('hz_sample_count', 0) if valid else 0
+    cal_shift  = max((r.get('cal_shift_ms', 0.0) for r in valid), default=0.0)
+    if est_hz_val:
+        hz_line = f"  TSval clock : {est_hz_val} Hz  ({hz_n} pairs)"
+        if cal_shift > 0:
+            hz_line += f"  |  cal.shift +{cal_shift:.2f}ms"
+            if cal_shift > 5:
+                hz_line += "  \u26a0 large shift \u2014 OWD split unreliable"
+        print(hz_line)
     print(_SEP)
-    print("  † Direct TSval-clock OWD. Anchor = handshake RTT/2 (assumes symmetric start).")
-    print("    Each probe independent — no cumulative drift.")
+    print("  \u2020 Direct TSval-clock OWD. Anchor = handshake RTT/2 (assumes symmetric start).")
+    print("    Each probe independent \u2014 no cumulative drift.")
     print(_SEP)
 
 
@@ -683,11 +710,17 @@ def _owd_diagnosis(b, s):
     )
 
 
-def print_phase_summary(results):
-    """Print BASELINE vs STRESS side-by-side comparison table."""
+def print_phase_summary(results, phase_loss=None, phase_jitter_override=None):
+    """Print BASELINE vs STRESS side-by-side comparison table.
+
+    phase_loss: optional dict mapping phase tag → probe loss %.
+    phase_jitter_override: optional dict mapping phase tag → (fwd_jitter_ms, bwd_jitter_ms).
+      When provided, these values replace the IPDV-only jitter computed from received probes.
+      Typically passed from userbufferTest.py with timeout-inclusive RTT range jitter.
+    """
     phases = {}
     for r in results:
-        if r is None:
+        if r.get('timed_out'):
             continue
         ph = r.get('phase') or 'ALL'
         phases.setdefault(ph, []).append(r)
@@ -719,14 +752,19 @@ def print_phase_summary(results):
         bwds = [r['bwd_owd_ms'] for r in recs]
         fipd = [r['fwd_ipdv_ms'] for r in recs if r.get('fwd_ipdv_ms') is not None]
         bipd = [r['bwd_ipdv_ms'] for r in recs if r.get('bwd_ipdv_ms') is not None]
-        fwd_jitter = (max(fipd) - min(fipd)) if len(fipd) > 1 else 0.0
-        bwd_jitter = (max(bipd) - min(bipd)) if len(bipd) > 1 else 0.0
+        fwd_jitter = _jitter_range(fipd)
+        bwd_jitter = _jitter_range(bipd)
         stats[ph] = {
             'fwd_avg': statistics.mean(fwds),  'fwd_p95': _percentile(fwds, PERCENTILE_P95),
             'bwd_avg': statistics.mean(bwds),  'bwd_p95': _percentile(bwds, PERCENTILE_P95),
             'rtt_avg': statistics.mean(rtts),  'rtt_p95': _percentile(rtts, PERCENTILE_P95),
             'fwd_jitter': fwd_jitter,          'bwd_jitter': bwd_jitter,
         }
+        # Use override jitter (timeout-inclusive, from userbufferTest.py) if provided
+        if phase_jitter_override and ph in phase_jitter_override:
+            fwd_jitter, bwd_jitter = phase_jitter_override[ph]
+            stats[ph]['fwd_jitter'] = fwd_jitter
+            stats[ph]['bwd_jitter'] = bwd_jitter
         print(f"  {ph:10}  "
               f"{stats[ph]['fwd_avg']:>{col}.2f}  {stats[ph]['fwd_p95']:>{col}.2f}  "
               f"{stats[ph]['bwd_avg']:>{col}.2f}  {stats[ph]['bwd_p95']:>{col}.2f}  "
@@ -742,14 +780,30 @@ def print_phase_summary(results):
               f"{s['rtt_avg']-b['rtt_avg']:>+8.2f}  {s['rtt_p95']-b['rtt_p95']:>+8.2f}  "
               f"{s['fwd_jitter']-b['fwd_jitter']:>+{jcol}.2f}  {s['bwd_jitter']-b['bwd_jitter']:>+{jcol}.2f}")
 
+    all_valid  = [r for r in results if not r.get('timed_out')]
+    est_hz_val = all_valid[0].get('est_hz') if all_valid else None
+    hz_n       = all_valid[0].get('hz_sample_count', 0) if all_valid else 0
+    cal_shift  = max((r.get('cal_shift_ms', 0.0) for r in all_valid), default=0.0)
+
     if 'BASELINE' in stats and 'STRESS' in stats:
         print(_SEP)
-        print(_owd_diagnosis(stats['BASELINE'], stats['STRESS']))
+        if cal_shift > 5:
+            print(f"  Diagnosis  : \u26a0 Low-confidence \u2014 calibration shift +{cal_shift:.1f}ms (anchor error >5ms).")
+            print(f"               OWD direction split unreliable. Use IPDV jitter and RTT jitter.")
+        else:
+            print(_owd_diagnosis(stats['BASELINE'], stats['STRESS']))
     print(_SEP)
     print("  \u2020 End-to-end only (single TCP connection to target). No NTP required.")
     print("    Direct TSval-clock OWD; anchor = handshake RTT/2. Each probe independent.")
     print("    Fwd = upload (client\u2192server)  |  Bwd = download (server\u2192client)")
     print("  + = latency increased (worse);  \u2212 = latency decreased (better).")
+    if est_hz_val:
+        hz_line = f"    TSval clock: {est_hz_val} Hz  ({hz_n} pairs used for Hz estimate)"
+        if cal_shift > 0:
+            hz_line += f"  |  calibration shift applied: +{cal_shift:.2f}ms"
+            if cal_shift > 5:
+                hz_line += "  \u26a0 large \u2014 OWD split low-confidence"
+        print(hz_line)
     print(_SEP)
 
 
@@ -758,7 +812,7 @@ def print_phase_summary(results):
 # ---------------------------------------------------------------------------
 
 def save_csv(results, path, target, port):
-    has_phase = any(r is not None and r.get('phase') for r in results)
+    has_phase = any(r.get('phase') for r in results)
     base_fields = ['probe', 't_send_ns', 'rtt_ms', 'fwd_owd_ms', 'bwd_owd_ms',
                    'fwd_ipdv_ms', 'bwd_ipdv_ms', 'srv_tsval', 'server_gap_ms', 'send_gap_ms']
     fields = (['phase'] + base_fields) if has_phase else base_fields
@@ -767,7 +821,7 @@ def save_csv(results, path, target, port):
         w.writerow(['# tcp_owd.py', f'target={target}', f'port={port}'])
         w.writerow(fields)
         for r in results:
-            if r is None:
+            if r.get('timed_out'):
                 w.writerow(['timeout'] + [''] * (len(fields) - 1))
                 continue
             row = []
@@ -901,7 +955,7 @@ def main():
                     verbose=args.verbose, phase='BASELINE', duration_secs=args.baseline,
                 )
                 all_results.extend(baseline_results)
-                n_ok = sum(1 for r in baseline_results if r is not None)
+                n_ok = sum(1 for r in baseline_results if not r.get('timed_out'))
                 print(f"  Baseline complete: {n_ok}/{len(baseline_results)} probes responded.")
                 print()
 
@@ -920,7 +974,7 @@ def main():
                     verbose=args.verbose, phase='STRESS', duration_secs=args.stress,
                 )
                 all_results.extend(stress_results)
-                n_ok = sum(1 for r in stress_results if r is not None)
+                n_ok = sum(1 for r in stress_results if not r.get('timed_out'))
                 print(f"  Stress complete: {n_ok}/{len(stress_results)} probes responded.")
 
                 print("\nStopping traffic generator ...")
