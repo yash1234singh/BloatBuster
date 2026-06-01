@@ -34,7 +34,8 @@ Key Options:
     -o, --output       Save results to CSV file
     --owd              Enable TCP Timestamp OWD measurement (requires root + scapy)
     --owd-port         TCP port for OWD probe connection   (default: 80)
-    --owd-interval     Seconds between OWD keep-alive probes (default: 0.5)
+    --owd-interval     Seconds between OWD keep-alive probes (default: 0.2)
+    --owd-timeout      Drain-window: wait after last probe before declaring drops (default: 2.0)
     -m, --rate-method  Throughput method: auto|procnetdev|statsfile|ss
     -I, --interface    Network interface for procnetdev
     -W, --chart-width  ASCII chart width  (default: 80)
@@ -45,7 +46,7 @@ Examples:
     python3 userbufferTest.py -T 10.1.2.1 -b 20 -s 60 -d 15 -u 25
     python3 userbufferTest.py -T 1.1.1.1 -o results.csv
     sudo python3 userbufferTest.py -T 1.1.1.1 --owd
-    sudo python3 userbufferTest.py -T 1.1.1.1 --owd --owd-port 443 --owd-interval 0.5 -b 30 -s 120
+    sudo python3 userbufferTest.py -T 1.1.1.1 --owd --owd-port 443 --owd-interval 0.2 -b 30 -s 120
 """
 
 import argparse
@@ -759,33 +760,25 @@ def print_overall_summary(baseline_ts, stress_ts,
         _base_owd_loss   = _owd_loss_pct('BASELINE')
         _stress_owd_loss = _owd_loss_pct('STRESS')
 
-        # OWD probe jitter table (timeout-inclusive RTT range).
-        # max(all RTTs incl. timeout_ms) - min(received RTTs) captures the full
-        # drain-gap → drop-tail swing, e.g. 2000ms - 25ms = 1975ms.
+        # OWD probe jitter table — RTT range of received probes.
+        # Async probing ensures high-latency (bufferbloat) probes appear here with
+        # their true RTT; truly dropped probes are excluded (shown in Loss% above).
         _jitter = {}
-        _any_timeout_shown = False
         print(f"\n  \u2014 OWD probe jitter (RTT range) \u2014")
         print(f"{'Phase':<12}{'Samples':<9}{'FwdJitter(ms)':<15}{'BwdJitter(ms)':<15}")
         print("-" * 51)
         for phase_tag in ('BASELINE', 'STRESS'):
-            all_rtts  = [r['rtt_ms'] for r in owd_results if r.get('phase') == phase_tag]
             recv_rtts = [r['rtt_ms'] for r in owd_results
                          if r.get('phase') == phase_tag and not r.get('timed_out')]
             bipd = [r['bwd_ipdv_ms'] for r in owd_results
                     if r.get('phase') == phase_tag and r.get('bwd_ipdv_ms') is not None]
-            has_timeouts = len(all_rtts) > len(recv_rtts)
-            if all_rtts and recv_rtts:
-                fj = max(all_rtts) - min(recv_rtts)
+            if len(recv_rtts) > 1:
+                fj = max(recv_rtts) - min(recv_rtts)
                 bj = (max(bipd) - min(bipd)) if len(bipd) > 1 else 0.0
                 _jitter[phase_tag] = {'fwd': fj, 'bwd': bj}
-                fj_str = f"{fj:.2f}\u2020" if has_timeouts else f"{fj:.2f}"
-                if has_timeouts:
-                    _any_timeout_shown = True
-                print(f"{phase_tag:<12}{len(recv_rtts):<9}{fj_str:<15}{bj:<15.2f}")
+                print(f"{phase_tag:<12}{len(recv_rtts):<9}{fj:<15.2f}{bj:<15.2f}")
             else:
-                print(f"{phase_tag:<12}{'0':<9}{'—':<15}{'—':<15}")
-        if _any_timeout_shown:
-            print(f"  \u2020 includes dropped (timeout) probes as RTT=2000ms \u2014 reflects drop-tail congestion swing.")
+                print(f"{phase_tag:<12}{len(recv_rtts):<9}{'—':<15}{'—':<15}")
 
         # Diagnosis: which direction degraded and by how much
         _diag = {}
@@ -910,15 +903,13 @@ def print_ascii_chart(baseline_ts, stress_ts, width=80, height=20, owd_results=N
     ul_rates = [e['ul_rate_mbps'] for e in all_entries if e['ul_rate_mbps'] > 0]
     all_rates = dl_rates + ul_rates
 
-    # Extend RTT axis to cover OWD, IPDV, and timeout spike values if they're larger
+    # Extend RTT axis to cover OWD and IPDV values if they're larger
     if owd_results:
         for key in ('fwd_owd_ms', 'bwd_owd_ms'):
             rtt_values += [r[key] for r in owd_results if r.get(key) is not None]
         rtt_values += [abs(r['fwd_ipdv_ms']) for r in owd_results
                        if r.get('fwd_ipdv_ms') is not None]
-        # Include timeout probe RTTs so chart axis scales for X spikes
-        rtt_values += [r['rtt_ms'] for r in owd_results
-                       if r.get('timed_out') and r.get('rtt_ms')]
+        # High-RTT received probes (bufferbloat) also included via fwd/bwd_owd_ms above
 
     if not rtt_values and not all_rates:
         return
@@ -1023,13 +1014,10 @@ def print_ascii_chart(baseline_ts, stress_ts, width=80, height=20, owd_results=N
             col = _owd_col(probe)
             if col is None:
                 continue
-            # Dropped (timeout) probe → X spike at timeout RTT height
+            # Dropped (truly unresponsive) probe → X at top of chart
             if probe.get('timed_out'):
-                spike_rtt = probe['rtt_ms']
-                owd_row = min(int(spike_rtt / max_rtt * (height - 1)), height - 1)
-                r = height - 1 - owd_row
-                if grid[r][col] == ' ':
-                    grid[r][col] = 'X'
+                if grid[0][col] == ' ':
+                    grid[0][col] = 'X'
                 continue
             # FwdOWD† upload → ▲
             fwd = probe.get('fwd_owd_ms')
@@ -1220,10 +1208,11 @@ def _load_tcp_owd():
 def _owd_worker(tcp_owd, target, port, conn, phase, duration_secs, interval,
                 results_list, probe_timeout=10.0, attempt_stats=None):
     """Background thread: run OWD probes for duration_secs, tag with phase."""
-    phase_results = tcp_owd.run_probes(
+    phase_results = tcp_owd.run_probes_async(
         target, port, conn,
-        count=0, interval=interval, timeout=probe_timeout,
-        verbose=False, phase=phase, duration_secs=duration_secs,
+        count=0, interval=interval, verbose=False,
+        phase=phase, duration_secs=duration_secs,
+        drain_timeout=probe_timeout,
     )
     results_list.extend(phase_results)
     if attempt_stats is not None:
@@ -1246,15 +1235,16 @@ def print_owd_section(tcp_owd, owd_results, owd_attempt_stats=None):
         s = owd_attempt_stats.get(phase_tag, {})
         return (1 - s['valid'] / s['total']) * 100 if s.get('total') else 0.0
     phase_loss = {'BASELINE': _loss_pct('BASELINE'), 'STRESS': _loss_pct('STRESS')}
-    # Compute timeout-inclusive jitter override so print_phase_summary shows correct numbers
+    # Compute received-only RTT range as jitter override for print_phase_summary.
+    # Async probing gives truly dropped probes rtt_ms=None; bufferbloat probes
+    # have their actual high RTT and are included in recv_rtts naturally.
     phase_jitter_override = {}
     for ph in ('BASELINE', 'STRESS'):
-        all_rtts  = [r['rtt_ms'] for r in owd_results if r.get('phase') == ph]
         recv_rtts = [r['rtt_ms'] for r in owd_results
                      if r.get('phase') == ph and not r.get('timed_out')]
         bipd = [r['bwd_ipdv_ms'] for r in owd_results
                 if r.get('phase') == ph and r.get('bwd_ipdv_ms') is not None]
-        fj = (max(all_rtts) - min(recv_rtts)) if (all_rtts and recv_rtts) else 0.0
+        fj = (max(recv_rtts) - min(recv_rtts)) if len(recv_rtts) > 1 else 0.0
         bj = (max(bipd) - min(bipd)) if len(bipd) > 1 else 0.0
         phase_jitter_override[ph] = (fj, bj)
     tcp_owd.print_phase_summary(owd_results, phase_loss=phase_loss,

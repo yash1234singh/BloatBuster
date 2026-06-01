@@ -53,6 +53,7 @@ import signal
 import statistics
 import subprocess
 import sys
+import threading
 import time
 
 # ---------------------------------------------------------------------------
@@ -391,6 +392,206 @@ def run_probes(target, port, conn, count, interval, timeout, verbose,
         time.sleep(max(0.0, interval - elapsed))
 
     return results
+
+
+def run_probes_async(target, port, conn, count, interval, verbose,
+                     phase=None, duration_secs=None, drain_timeout=5.0):
+    """Send TCP keep-alive probes fire-and-forget; match responses via sniff() thread.
+
+    Unlike run_probes(), this function does not block waiting for each response.
+    A background sniff() thread captures all incoming TCP packets from the target
+    and matches them to pending probes.
+
+    Matching strategy (most-to-least reliable):
+    1. Exact TSecr match — server echoes our TSval back; used when timestamps
+       are preserved end-to-end (most networks).
+    2. FIFO fallback — oldest unmatched pending entry; used when TCP Timestamps
+       are stripped by middleboxes (cellular NAT, VPN, some firewalls).
+
+    Benefits over synchronous sr1():
+    - Bufferbloat probes queued > drain_timeout are still measured correctly
+      (their true RTT is recorded, not clamped to a timeout value).
+    - Truly dropped probes (no response during drain window) are identified as
+      timed_out=True with rtt_ms=None — not confused with high-latency probes.
+    - Probes in flight during phase transitions are still matched correctly.
+
+    drain_timeout: seconds to wait after last probe is sent before declaring
+    remaining pending probes as dropped. Default 5s catches up to ~5s queuing.
+    """
+    import collections
+    from scapy.all import IP, TCP, send, sniff, conf
+    conf.verb = 0
+
+    sport          = conn['sport']
+    our_seq        = conn['our_seq']  & 0xFFFFFFFF   # mask to 32-bit TCP range
+    their_seq      = conn['their_seq'] & 0xFFFFFFFF
+    last_srv_tsval = conn['last_srv_tsval']
+
+    pending      = {}                    # ts_key → entry (exact TSecr match + drop detection)
+    pending_lifo = collections.deque()   # entries in send order (LIFO fallback, newest-first)
+    matched_keys = set()                 # ts_keys already consumed by exact TSecr match
+    results      = []
+    lock         = threading.Lock()
+
+    # Capture 32-bit-masked values here so _handle_response closure uses them correctly
+    _our_seq   = our_seq
+    _their_seq = their_seq
+
+    def _handle_response(pkt):
+        nonlocal last_srv_tsval
+        if not pkt.haslayer(TCP):
+            return
+        tcp = pkt[TCP]
+        if tcp.sport != port or tcp.dport != sport:
+            return
+        # Only process genuine keep-alive ACK responses:
+        # - flags == ACK only (0x10): rejects FIN/ACK (0x11), RST/ACK (0x14), etc.
+        # - tcp.ack == our_seq: server ACKs our sequence
+        # - tcp.seq == their_seq: server at its current position (not a server keep-alive
+        #   probe which has seq=their_seq-1 per RFC 793)
+        # - no payload: pure ACK only
+        if int(tcp.flags) != 0x10 or tcp.ack != _our_seq or tcp.seq != _their_seq or bytes(tcp.payload):
+            return
+        srv_tsval, srv_tsecr = _extract_ts(tcp)
+        t_recv = time.monotonic_ns()
+        with lock:
+            # Primary: exact TSecr match (works for servers that echo keep-alive TSvals).
+            info = pending.pop(srv_tsecr, None) if srv_tsecr is not None else None
+            if info is not None:
+                matched_keys.add(info['ts_key'])
+            else:
+                # LIFO fallback: match the most-recently-sent unmatched probe.
+                # Cloudflare echoes the bootstrap TSval (not probe TSval) for out-of-window
+                # keep-alives, so TSecr exact matching always returns None. LIFO gives
+                # correct RTTs: the cumulative ACK for probes N and N+1 arrives shortly after
+                # probe N+1 was sent; LIFO pops N+1 → RTT ≈ real RTT. FIFO (oldest-first)
+                # would pop probe 1 giving RTT = cumulative time = hundreds or thousands of ms.
+                # Time-window guard (≤ 5 000 ms) rejects late-arriving spurious packets.
+                while pending_lifo and pending_lifo[-1]['ts_key'] in matched_keys:
+                    matched_keys.discard(pending_lifo.pop()['ts_key'])
+                if pending_lifo:
+                    candidate = pending_lifo[-1]
+                    elapsed_ms = (t_recv - candidate['t_send_ns']) / 1e6
+                    if elapsed_ms <= 5000:
+                        info = pending_lifo.pop()
+                        pending.pop(info['ts_key'], None)
+            if srv_tsval is not None:
+                last_srv_tsval = srv_tsval
+        if info is None:
+            return   # no matching probe
+        rtt_ms = (t_recv - info['t_send_ns']) / 1e6
+        send_gap_ms = ((info['t_send_ns'] - info['prev_t_send_ns']) / 1e6
+                       if info['prev_t_send_ns'] is not None else None)
+        rec = {
+            'probe':         info['probe'],
+            'phase':         phase,
+            't_send_ns':     info['t_send_ns'],
+            't_recv_ns':     t_recv,
+            'rtt_ms':        rtt_ms,
+            'fwd_owd_ms':    rtt_ms / 2,
+            'bwd_owd_ms':    rtt_ms / 2,
+            'ts_sent':       srv_tsecr,
+            'srv_tsval':     srv_tsval,
+            'srv_tsecr':     srv_tsecr,
+            'send_gap_ms':   send_gap_ms,
+            'server_gap_ms': None,
+            'fwd_ipdv_ms':   None,
+            'bwd_ipdv_ms':   None,
+        }
+        with lock:
+            results.append(rec)
+        if verbose:
+            gap = f'{send_gap_ms:.1f}' if send_gap_ms is not None else '--'
+            ph  = f'[{phase}] ' if phase else ''
+            print(f"  {ph}probe {info['probe']:>3}: RTT={rtt_ms:7.2f} ms  "
+                  f"srv_tsval={srv_tsval}  send_gap={gap} ms")
+
+    # Start background sniffer using sniff() — same proven mechanism as http_bootstrap
+    _sniff_done  = threading.Event()
+    _max_sniff_t = ((duration_secs if duration_secs is not None else count * interval)
+                    + drain_timeout + 2.0)
+
+    def _do_sniff():
+        sniff(
+            filter=f"tcp and src host {target} and src port {port} and dst port {sport}",
+            prn=_handle_response,
+            store=False,
+            stop_filter=lambda _: _sniff_done.is_set(),
+            timeout=_max_sniff_t,
+        )
+
+    sniffer_t = threading.Thread(target=_do_sniff, daemon=True)
+    sniffer_t.start()
+    time.sleep(0.15)   # brief wait for pcap socket to open
+
+    prev_t_send_ns = None
+    probe_num      = 0
+    deadline       = (time.monotonic() + duration_secs) if duration_secs is not None else None
+
+    while True:
+        if deadline is not None and time.monotonic() >= deadline:
+            break
+        if deadline is None and probe_num >= count:
+            break
+        probe_num += 1
+        ts_probe = _tick()
+        with lock:
+            cur_srv_tsval = last_srv_tsval
+        pkt = (IP(dst=target, tos=0) /
+               TCP(dport=port, sport=sport,
+                   seq=our_seq - 1, ack=their_seq,
+                   flags='A',
+                   options=[('Timestamp', (ts_probe, cur_srv_tsval)),
+                             ('NOP', None), ('NOP', None)]))
+        t_send = time.monotonic_ns()
+        entry = {
+            'probe':          probe_num,
+            't_send_ns':      t_send,
+            'prev_t_send_ns': prev_t_send_ns,
+            'ts_key':         ts_probe,
+        }
+        with lock:
+            pending[ts_probe]    = entry
+            pending_lifo.append(entry)
+        send(pkt)
+        prev_t_send_ns = t_send
+        time.sleep(max(0.0, interval - (time.monotonic_ns() - t_send) / 1e9))
+
+    # Drain window — wait for late-arriving responses
+    drain_end = time.monotonic() + drain_timeout
+    while time.monotonic() < drain_end:
+        with lock:
+            n_pending = len(pending)
+        if n_pending == 0:
+            break
+        time.sleep(0.05)
+
+    _sniff_done.set()
+    sniffer_t.join(timeout=2.0)   # wait for in-flight packets to be processed
+
+    # Any probes still pending after drain window = truly dropped
+    with lock:
+        dropped  = list(pending.values())
+        all_results = list(results)
+
+    for info in dropped:
+        if verbose:
+            ph = f'[{phase}] ' if phase else ''
+            print(f"  {ph}probe {info['probe']:>3}: DROPPED (no response in {drain_timeout:.0f}s)")
+        all_results.append({
+            'probe':       info['probe'],
+            'phase':       phase,
+            't_send_ns':   info['t_send_ns'],
+            'rtt_ms':      None,
+            'timed_out':   True,
+            'fwd_owd_ms':  None,
+            'bwd_owd_ms':  None,
+            'fwd_ipdv_ms': None,
+            'bwd_ipdv_ms': None,
+        })
+
+    all_results.sort(key=lambda r: r['probe'])
+    return all_results
 
 
 # ---------------------------------------------------------------------------

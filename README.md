@@ -20,8 +20,9 @@ BloatBuster/
 ├── config.json   # Bash tool configs
 │
 ├── python/                         # Python-based (no server needed)
-│   ├── userbufferTest.py           #   Bufferbloat measurement
-│   └── traffic-gen.py              #   Browsing traffic generator
+│   ├── userbufferTest.py           #   Bufferbloat measurement + OWD analysis
+│   ├── traffic-gen.py              #   Browsing traffic generator
+│   └── tcp_owd.py                  #   TCP Timestamp OWD estimator (standalone + library)
 │
 ├── bash/                           # Bash-based (requires iperf3 server)
 │   ├── bufferManager.sh            #   Traffic shaping (CAKE/HTB/fq_codel)
@@ -36,6 +37,7 @@ BloatBuster/
 |--------|---------|----------|
 | **python/userbufferTest.py** | Measure bufferbloat via per-hop traceroute + real browsing traffic stress | Python 3, `curl`, `traceroute` |
 | **python/traffic-gen.py** | Standalone browsing traffic simulator (HTTP/HTTPS/QUIC) | Python 3, `curl`, `dd` |
+| **python/tcp_owd.py** | Estimate per-direction OWD/jitter via TCP Timestamps — no server required; used as library by `userbufferTest.py` | Python 3, `scapy`, root/CAP_NET_RAW, Linux |
 | **bash/bufferManager.sh** | Apply/remove traffic shaping strategies (CAKE, HTB, fq_codel) and TCP tuning (BBR, ECN) | `tc`, `ip`, `sysctl`, `jq`, root |
 | **bash/bufferTest.sh** | Measure bufferbloat via per-hop traceroute + iperf3 stress testing | `iperf3`, `traceroute`, `jq`, iperf3 server |
 | **bash/bufferScenarioTest.sh** | Orchestrate A/B comparisons: apply strategy → run test → compare results | Both bash scripts above, `jq`, `bc` |
@@ -68,14 +70,19 @@ Discovery (1 traceroute):
 Phase 1: BASELINE (30s)
   ├─ Traceroute every 1s to all hops → record per-hop latency (no load)
   │  Probes reaching < min_probe_depth hops → counted as SHALLOW (lost)
-  └─ [--owd] OWD thread: keep-alive probes every 0.5s → FwdOWD†/BwdOWD†
+  └─ [--owd] OWD thread: fire-and-forget keep-alive probes via send(); a daemon
+     thread runs sniff() to capture server ACKs; responses matched by TSecr (server
+     echoes our TSval back, RFC 7323). Only pure ACK packets accepted (FIN/ACK and
+     other control frames filtered by TCP flags). → FwdOWD†/BwdOWD†
 
-Phase 2: STRESS (120s)
+Phase 2: STRESS (60s default)
   ├─ Launch traffic-gen.py (30 DL + 50 UL threads browsing real websites)
   ├─ Traceroute every 1s to all hops → record per-hop latency (under load)
   │  Probes reaching < min_probe_depth hops → counted as SHALLOW (lost)
-  └─ [--owd] OWD thread: keep-alive probes on the SAME TCP connection
-     (TSval anchored to handshake → per-probe OWD independent of other probes)
+  └─ [--owd] OWD thread: async keep-alive probes on the SAME TCP connection
+     Bufferbloat probes (queued): return with real high RTT → large jitter
+     Drop-tail probes (discarded): timed_out=True, rtt_ms=None → high Loss%
+     ~50% natural probe loss is normal on CDN targets (delayed-ACK batching)
 ```
 
 > **Shallow probe detection**: Under heavy congestion, routers drop ICMP TTL-exceeded packets to save CPU. Traceroute may only hear from local hops (e.g. hop 1 at 0.1 ms) rather than the full path. Without filtering, this 0.1 ms would corrupt baseline and stress RTT statistics. Probes that don't reach `min_probe_depth` hops are discarded and shown as `SHALLOW (N/M hops)` in the console output.
@@ -273,7 +280,8 @@ sudo python3 python/userbufferTest.py -T 1.1.1.1 --owd --owd-port 80 --owd-inter
 | `-H, --chart-height` | ASCII chart height in rows | `20` |
 | `--owd` | Enable TCP Timestamp OWD measurement in parallel (requires root + scapy) | off |
 | `--owd-port` | TCP port for OWD probe connection | `80` |
-| `--owd-interval` | Seconds between OWD keep-alive probes | `0.5` |
+| `--owd-interval` | Seconds between OWD keep-alive probes | `0.2` |
+| `--owd-timeout` | Drain-window: seconds to wait after last probe before declaring remaining probes dropped | `2.0` |
 
 #### Analysis Output
 
@@ -281,10 +289,10 @@ sudo python3 python/userbufferTest.py -T 1.1.1.1 --owd --owd-port 80 --owd-inter
 2. **Ranked Bloat Summary** — worst bloating links sorted by severity
 3. **ASCII Network Diagram** — visual path with per-link baseline/stress/bloat
 4. **Overall Latency Summary** — end-to-end avg, P95, max, loss %; when `--owd` is used, **FwdOWD† (upload)** and **BwdOWD† (download)** rows appear in the same Phase/Samples/Avg/P95/Max format directly below the RTT rows
-5. **One-Way Delay Analysis** — `--owd` only: detailed BASELINE vs STRESS comparison table with Change row and directional congestion diagnosis
+5. **One-Way Delay Analysis** — `--owd` only: BASELINE vs STRESS jitter table (received-only RTT range); large jitter = bufferbloat (queued probes returned with real high RTT); high loss% = drop-tail (probes truly discarded). Directional congestion diagnosis (suppressed when STRESS probe loss >50%).
 6. **Throughput Summary** — DL/UL mean, max, median, P10, P90 Mbps
 7. **Time-Series Table** — 1-second RTT + throughput data
-8. **ASCII Chart** — dual-axis: throughput (▓ DL, ░ UL) + RTT (● stress, ○ baseline); when `--owd` is used, **▲ FwdOWD† (UL)** and **▽ BwdOWD† (DL)** are overlaid on the same right-axis (Y-axis scales to cover OWD if higher than RTT)
+8. **ASCII Chart** — dual-axis: throughput (▓ DL, ░ UL) + RTT (● stress, ○ baseline); when `--owd` is used, **▲ FwdOWD† (UL)** and **▽ BwdOWD† (DL)** overlaid; **X** marks truly dropped probes (no response after drain window)
 9. **Traffic Summary** — per-client success/fail/socket stats from traffic-gen.py
 
 #### Sample Output
@@ -339,7 +347,7 @@ upload          187.52  463.39  139.85   13.61  391.88      20
       │                                    ●●●●●●●●●●●●●●●            │   100
    0.0│                                                               │     0
       └───────────────────────────────────────────────────┘
-  Legend: ▓ DL Mbps   ░ UL Mbps   ○ Base RTT   ● Stress RTT   ▲ FwdOWD†(UL)   ▽ BwdOWD†(DL)
+  Legend: ▓ DL Mbps   ░ UL Mbps   ○ Base RTT   ● Stress RTT   ▲ FwdOWD†(UL)   ▽ BwdOWD†(DL)   X Dropped probe
 ```
 
 #### Requirements
@@ -479,6 +487,48 @@ queue as bulk data.  This is essential — marking probes DSCP EF would let them
 the congested upload queue, showing propagation-only RTT (~30 ms) instead of the true
 bufferbloat RTT (~600 ms).
 
+**Async probing (fire-and-forget) — `run_probes_async()`:**
+
+When called from `userbufferTest.py`, all probes are sent without blocking (`send()`).
+A background **daemon thread** running `sniff()` captures server ACKs; each response is
+matched to its originating probe via `TSecr` (the server echoes our `TSval` back in every
+ACK). The response filter accepts **only pure ACK packets** (`flags == 0x10`) — this
+rejects TCP FIN/ACK frames that CDN edge servers (e.g. Cloudflare) send when an idle
+connection times out, which would otherwise be mistaken for probe responses. After all
+probes are sent, the drain window (`--owd-timeout`, default 2 s) collects late-arriving
+responses before declaring remaining probes dropped.
+
+```
+Main thread:                         sniff() daemon thread:
+  send probe 1 → pending[TSval1]       pkt (flags=ACK): TSecr=TSval1
+  send probe 2 → pending[TSval2]         → exact match → pop pending[TSval1]
+  send probe 3 → pending[TSval3]         → RTT = t_recv - t_send → results
+  ...                                  pkt (flags=ACK): TSecr=TSval3 (late, 1.8 s) → match
+  wait drain window (2 s)              pkt (flags=FIN|ACK): → rejected (flags≠0x10)
+  probe 2 still in pending → timed_out=True, rtt_ms=None (truly dropped)
+```
+
+Result:
+- **Bufferbloat** (probe queued, eventually responds): arrives at real high RTT (e.g. 800 ms) → `rtt_ms=800` → included in jitter naturally
+- **Drop-tail** (probe discarded, no response): `timed_out=True, rtt_ms=None` → counted as Loss%; jitter computed from surviving probes only
+- **~50% probe loss** is normal for CDN targets (Cloudflare, Google): their TCP stack
+  applies delayed-ACK batching, sending one cumulative ACK per two consecutive keep-alive
+  probes.  This produces consistent ~50% loss in BASELINE and STRESS — not a measurement
+  error.  During heavy bufferbloat the loss drops because probe RTTs exceed the inter-probe
+  interval, preventing batching.
+
+Probe matching uses two strategies:
+1. **Exact TSecr** — server echoes our probe TSval; direct key lookup gives correct RTT.
+2. **LIFO fallback** — for CDNs like Cloudflare that echo only the last in-window TSval
+   (bootstrap HTTP HEAD, not probe TSval): match the **most-recently-sent** unmatched probe.
+   A cumulative ACK for probes N and N+1 arrives shortly after probe N+1 was sent, so LIFO
+   gives RTT ≈ real network RTT.  A time-window guard (≤ 5 000 ms) rejects spurious
+   late-arriving packets.  Probes not matched within the drain window are counted as loss.
+
+The standalone `__main__` path uses synchronous `run_probes()` with `sr1()` (per-probe
+blocking receive with a 2 s timeout per probe) — simpler and also correct, at the cost of
+serialised probe sending.
+
 #### Two-Phase Bufferbloat Test
 
 When `--baseline` and/or `--stress` are set the tool runs an automated congestion test:
@@ -538,6 +588,10 @@ the delta, so it is immediately clear which direction was hit hardest by congest
 - True directional OWD (as measured by TWAMP/RFC 5357) requires NTP/PTP-synchronized
   clocks on both ends.  This tool provides the closest achievable approximation without
   any clock infrastructure or remote software.
+- **Drain window adds latency per phase.** After all probes are sent, the tool waits up
+  to 5 s for late responses before declaring drops. On a 60 s STRESS phase this adds ~5 s
+  of wait time. On satellite or very high-latency links, increase the drain timeout to
+  match the expected maximum queue delay.
 - Linux only (requires `iptables` to suppress kernel-generated RST packets on the raw
   Scapy connection).  Requires root or `CAP_NET_RAW`.
 
@@ -619,27 +673,32 @@ positions. It is the primary per-direction congestion signal.
 dependency. When OWD probe loss is high (>50%) or the calibration shift is large, RTT
 jitter from the segment bloat table is the most trustworthy congestion magnitude signal.
 
-### Probe survivorship bias under drop-tail congestion
+### Bufferbloat vs drop-tail congestion: different signals
 
-When the upload buffer is full (drop-tail), OWD probes are dropped at the queue. Probes
-that *survive* all hit queue-drain gaps and show similar low RTT — producing artificially
-small IPDV. `userbufferTest.py` warns when STRESS probe loss exceeds 50% and recommends
-using RTT jitter instead. At 0.2 s probe interval and 1.0 s timeout, ~90 probes are
-attempted in a 60 s STRESS window even under 60% loss.
+The async probing architecture (`run_probes_async` + `sniff()` daemon thread) correctly
+distinguishes the two types of congestion:
+
+| Congestion type | OWD jitter (RTT range) | Loss% | Primary signal |
+|---|---|---|---|
+| **Bufferbloat** (queue building, packets delayed) | **Large** — queued probes return with real high RTT (e.g. 2500 ms) | Low | Jitter — large spread in received RTTs |
+| **Drop-tail** (queue full, packets discarded) | **Small** — only drain-gap survivors; `rtt_ms=None` for drops | **High (>50%)** | Loss% — probes are truly gone |
+
+Under drop-tail, the surviving probes all hit queue-drain gaps and show similar low RTT
+(~25 ms), producing small jitter that understates congestion severity. Loss% is the correct
+signal. On the ASCII chart, truly dropped probes appear as `X` marks at the top row.
 
 ### OWD direction diagnosis can be inverted under high probe loss
 
-When STRESS probe loss exceeds 50%, the surviving probes are not a random sample —
-they are the "lucky" probes that slipped through during queue-drain gaps. These probes
-show *low* FwdOWD (fast upload) because the queue happened to be empty when they fired.
-Since BwdOWD = RTT − FwdOWD, and RTT is still somewhat elevated, BwdOWD appears high.
-The result: the diagnosis concludes "download degraded" when the congestion is actually
-in the upload direction — a complete inversion.
+When STRESS probe loss exceeds 50%, surviving probes are not a random sample — they are
+"lucky" probes that slipped through queue-drain gaps. These probes show *low* FwdOWD
+(fast upload) because the queue happened to be empty. Since BwdOWD = RTT − FwdOWD, and
+RTT is still elevated, BwdOWD appears high — the diagnosis can conclude "download degraded"
+when the congestion is actually in the upload direction.
 
-`userbufferTest.py` detects this condition and **suppresses** the OWD direction diagnosis
-when STRESS probe loss > 50%, replacing it with an explicit warning. Similarly, when the
-calibration shift exceeds 5 ms, the diagnosis is marked low-confidence in both
-`userbufferTest.py` and standalone `tcp_owd.py`.
+`userbufferTest.py` detects this and **suppresses** the OWD direction diagnosis when
+STRESS probe loss > 50%, replacing it with an explicit warning. When the calibration shift
+exceeds 5 ms, diagnosis is marked low-confidence in both `userbufferTest.py` and standalone
+`tcp_owd.py`.
 
 **When probe loss is high, use these reliable signals instead:**
 - **Per-hop bloat table**: the hop with the highest bloat ms is where the queue is
