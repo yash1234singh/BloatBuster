@@ -1475,8 +1475,22 @@ def _phase_throughput(baseline_ts, stress_ts):
     }
 
 
+def _icmp_stats(baseline_ts, stress_ts):
+    """Compute ICMP traceroute RTT stats per phase from time-series e2e_rtt values."""
+    def _stats(ts):
+        vals = [e['e2e_rtt'] for e in ts if e.get('e2e_rtt') is not None]
+        if not vals:
+            return None
+        return {'_raw': vals, 'avg': sum(vals) / len(vals),
+                'p95': percentile(vals, PERCENTILE_P95), 'loss': 0.0}
+    b = _stats(baseline_ts)
+    s = _stats(stress_ts)
+    return {'BASELINE': b, 'STRESS': s} if (b and s) else None
+
+
 def print_owd_section(tcp_owd, owd_results, owd_attempt_stats=None,
-                      h2_results=None, throughput=None, config=None):
+                      h2_results=None, throughput=None, config=None,
+                      twamp_results=None, twamp_backend=None, icmp_stats=None):
     """Print the OWD BASELINE vs STRESS comparison table."""
     print(f"\n{'='*72}")
     print(f"{'ONE-WAY DELAY ANALYSIS (TCP Timestamp OWD†)':^72}")
@@ -1494,7 +1508,10 @@ def print_owd_section(tcp_owd, owd_results, owd_attempt_stats=None,
     tcp_owd.print_phase_summary(owd_results, phase_loss=phase_loss)
     tcp_owd.print_grand_summary(owd_results, h2_results=h2_results,
                                 phase_loss=phase_loss, throughput=throughput,
-                                config=config)
+                                config=config,
+                                twamp_results=twamp_results,
+                                twamp_backend=twamp_backend,
+                                icmp_stats=icmp_stats)
 
 
 # ---------------------------------------------------------------------------
@@ -1999,10 +2016,11 @@ def main():
                               'baseline_secs': args.baseline,
                               'stress_secs':   args.stress,
                               'interval':      args.owd_interval,
-                          })
-    if twamp_enabled and twamp_results:
-        print_twamp_section(twamp_mod, twamp_results,
-                            twamp_attempt_stats=twamp_attempt_stats if twamp_enabled else None)
+                              'twamp_port':    args.twamp_port if twamp_enabled else None,
+                          },
+                          twamp_results=twamp_results if twamp_enabled else None,
+                          twamp_backend=args.twamp_backend if twamp_enabled else None,
+                          icmp_stats=_icmp_stats(baseline_ts, stress_ts))
     print_throughput_summary(stress_ts)
     print_time_series_table(baseline_ts, stress_ts)
     print_ascii_chart(baseline_ts, stress_ts,

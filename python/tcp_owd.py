@@ -1678,10 +1678,39 @@ def print_phase_summary(results, phase_loss=None, phase_jitter_override=None, rt
 _GSEP = '═' * 82
 
 
+def _color(text, code):
+    """Wrap text in ANSI color if stdout is a TTY."""
+    if not sys.stdout.isatty():
+        return text
+    return f"\033[{code}m{text}\033[0m"
+
+
+def _color_delta(formatted_str, raw_val):
+    """Color a pre-formatted delta string by magnitude (format first, then color)."""
+    if raw_val < 0:
+        return _color(formatted_str, '92')    # bright green
+    elif raw_val >= 100:
+        return _color(formatted_str, '91')    # bright red
+    elif raw_val >= 10:
+        return _color(formatted_str, '93')    # bright yellow
+    return formatted_str
+
+
+def _color_loss(formatted_str, raw_pct):
+    """Color a pre-formatted loss% string by severity."""
+    if raw_pct >= 10:
+        return _color(formatted_str, '91')    # bright red
+    elif raw_pct >= 2:
+        return _color(formatted_str, '93')    # bright yellow
+    return formatted_str
+
+
 def print_grand_summary(http_results, h2_results=None,
                         rtt_hs_ms=0.0, phase_loss=None,
                         throughput=None, http_port=80, h2_port=443,
-                        config=None):
+                        config=None,
+                        twamp_results=None, twamp_backend=None,
+                        icmp_stats=None):
     """Print a unified BASELINE vs STRESS grand summary table.
 
     Rows:
@@ -1702,8 +1731,11 @@ def print_grand_summary(http_results, h2_results=None,
         phase_loss   : {'BASELINE': pct, 'STRESS': pct} for HTTP probes; computed if None
         throughput   : {'BASELINE': {'dl': Mbps, 'ul': Mbps}, 'STRESS': {...}}; None = omit
         config       : optional dict with test params:
-                         target, baseline_secs, stress_secs, interval
+                         target, baseline_secs, stress_secs, interval, twamp_port
                        If None, values are derived from the result records.
+        twamp_results: optional list of TWAMP probe dicts (same schema as http_results)
+        twamp_backend: 'native' or 'nokia' for table label; None = omit label
+        icmp_stats   : {'BASELINE': {'_raw': [...], 'loss': pct}, 'STRESS': {...}}
     """
     def _phase_probes(results, phase):
         return [r for r in results if r.get('phase') == phase and not r.get('timed_out')]
@@ -1754,9 +1786,13 @@ def print_grand_summary(http_results, h2_results=None,
     total_dur = (base_dur or 0) + (stress_dur or 0)
 
     h2_port_str = f"   H2 PING :{h2_port}" if h2_results else ""
+    twamp_cfg = ''
+    if twamp_results and cfg.get('twamp_port'):
+        backend_str = f' ({twamp_backend})' if twamp_backend else ''
+        twamp_cfg = f"   TWAMP :{cfg['twamp_port']}{backend_str}"
     hs_str = f"   Handshake RTT: {rtt_hs_ms:.1f}ms" if rtt_hs_ms > 0 else ""
     if target:
-        print(f"  Target  : {target}    HTTP :{http_port}{h2_port_str}{hs_str}")
+        print(f"  Target  : {target}    HTTP :{http_port}{h2_port_str}{twamp_cfg}{hs_str}")
 
     base_str   = f"{base_dur:.0f}s ({n_base} probes)"   if base_dur   else f"({n_base} probes)"
     stress_str = f"{stress_dur:.0f}s ({n_stress} probes)" if stress_dur else f"({n_stress} probes)"
@@ -1796,22 +1832,24 @@ def print_grand_summary(http_results, h2_results=None,
         avg_s, p95_s = _fmt(stress_vals, PERCENTILE_P95)
 
         if show_loss:
-            lb = f"{loss_b:>{lw}.1f}" if loss_b is not None else f"{'—':>{lw}}"
-            ls = f"{loss_s:>{lw}.1f}" if loss_s is not None else f"{'—':>{lw}}"
+            lb_raw = loss_b if loss_b is not None else None
+            ls_raw = loss_s if loss_s is not None else None
+            lb = _color_loss(f"{lb_raw:>{lw}.1f}", lb_raw) if lb_raw is not None else f"{'—':>{lw}}"
+            ls = _color_loss(f"{ls_raw:>{lw}.1f}", ls_raw) if ls_raw is not None else f"{'—':>{lw}}"
         else:
             lb = ls = f"{'—':>{lw}}"
 
         if base_vals and stress_vals:
             d_avg = statistics.mean(stress_vals) - statistics.mean(base_vals)
             d_p95 = _percentile(stress_vals, PERCENTILE_P95) - _percentile(base_vals, PERCENTILE_P95)
-            da = f"{d_avg:>+{w}.1f}"
-            dp = f"{d_p95:>+{w}.1f}"
+            da = _color_delta(f"{d_avg:>+{w}.1f}", d_avg)
+            dp = _color_delta(f"{d_p95:>+{w}.1f}", d_p95)
         else:
             da = dp = f"{'—':>{w}}"
 
         return f"  {label:<{label_w}}  {avg_b}  {p95_b}  {lb}  {avg_s}  {p95_s}  {ls}  {da}  {dp}"
 
-    def _print_method_rows(label, results, loss_b, loss_s, port):
+    def _print_method_rows(label, results, loss_b, loss_s, port, always_owd=False):
         """Print RTT row + optional Fwd/Bwd OWD sub-rows for one method."""
         base_v   = _phase_probes(results, 'BASELINE')
         stress_v = _phase_probes(results, 'STRESS')
@@ -1819,15 +1857,25 @@ def print_grand_summary(http_results, h2_results=None,
         rtt_s  = [r['rtt_ms'] for r in stress_v]
         print(_row(f"{label}  (:{port})", rtt_b, rtt_s, loss_b, loss_s, show_loss=True))
 
-        # Only show directional OWD split if compute_owd() was called (est_hz present)
-        owd_computed = any(r.get('est_hz') for r in base_v + stress_v)
+        # Show directional OWD split if compute_owd() was called (est_hz) or always_owd=True
+        owd_computed = always_owd or any(r.get('est_hz') for r in base_v + stress_v)
         if owd_computed:
             fwd_b = [r['fwd_owd_ms'] for r in base_v   if r.get('fwd_owd_ms') is not None]
             fwd_s = [r['fwd_owd_ms'] for r in stress_v if r.get('fwd_owd_ms') is not None]
             bwd_b = [r['bwd_owd_ms'] for r in base_v   if r.get('bwd_owd_ms') is not None]
             bwd_s = [r['bwd_owd_ms'] for r in stress_v if r.get('bwd_owd_ms') is not None]
-            print(_row('  \u2191 Fwd  [upload]', fwd_b, fwd_s, show_loss=False))
-            print(_row('  \u2193 Bwd  [dload]',  bwd_b, bwd_s, show_loss=False))
+            if fwd_b or fwd_s:
+                print(_row('  \u2191 Fwd  [upload]', fwd_b, fwd_s, show_loss=False))
+            if bwd_b or bwd_s:
+                print(_row('  \u2193 Bwd  [dload]',  bwd_b, bwd_s, show_loss=False))
+
+    # ICMP Traceroute row — optional, shown first with a separator below
+    if icmp_stats and icmp_stats.get('BASELINE') and icmp_stats.get('STRESS'):
+        ib = icmp_stats['BASELINE']
+        is_ = icmp_stats['STRESS']
+        print(_row('ICMP Traceroute', ib.get('_raw', []), is_.get('_raw', []),
+                   loss_b=ib.get('loss', 0.0), loss_s=is_.get('loss', 0.0)))
+        print(sep)
 
     # HTTP HEAD (M1/M2)
     lb_http = phase_loss.get('BASELINE') if phase_loss else _loss_pct(http_results, 'BASELINE')
@@ -1841,6 +1889,17 @@ def print_grand_summary(http_results, h2_results=None,
         ls_h2 = _loss_pct(h2_results, 'STRESS')
         _print_method_rows('H2 PING', h2_results, lb_h2, ls_h2, h2_port)
 
+    # TWAMP UDP — optional
+    has_twamp = twamp_results and (any(r.get('phase') == 'BASELINE' for r in twamp_results) or
+                                   any(r.get('phase') == 'STRESS'   for r in twamp_results))
+    if has_twamp:
+        backend_label = f' ({twamp_backend})' if twamp_backend else ''
+        lb_tw = _loss_pct(twamp_results, 'BASELINE')
+        ls_tw = _loss_pct(twamp_results, 'STRESS')
+        twamp_port = cfg.get('twamp_port', '?')
+        _print_method_rows(f'TWAMP UDP{backend_label}', twamp_results,
+                           lb_tw, ls_tw, twamp_port, always_owd=True)
+
     # Throughput rows — optional
     if throughput:
         print(sep)
@@ -1852,7 +1911,8 @@ def print_grand_summary(http_results, h2_results=None,
             dash  = f"{'—':>{w}}"
             dash_l = f"{'—':>{lw}}"
             if b_val is not None and s_val is not None:
-                d_str = f"{s_val - b_val:>+{w}.1f}"
+                d_val = s_val - b_val
+                d_str = _color_delta(f"{d_val:>+{w}.1f}", d_val)
             else:
                 d_str = dash
             print(f"  {direction+' (Mbps)':<{label_w}}  {b_str}  {dash}  {dash_l}"
@@ -1876,6 +1936,9 @@ def print_grand_summary(http_results, h2_results=None,
     print("  \u2020 RTT = full round-trip.  Fwd = upload (client\u2192server)."
           "  Bwd = download (server\u2192client).")
     print("    loss% = probe timeouts.  \u0394 = STRESS \u2212 BASELINE (+ = worse).")
+    if has_twamp:
+        print("  \u2021 TWAMP FwdOWD/BwdOWD accurate only with NTP-synced clocks;"
+              " IPDV is always accurate.")
     print(_GSEP)
 
 
