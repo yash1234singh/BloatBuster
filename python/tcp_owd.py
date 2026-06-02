@@ -1207,11 +1207,11 @@ def compute_owd(results, conn):
     if len(hz_probes) < 2:
         hz_probes = valid   # fallback: use all probes
 
-    t0_ns  = hz_probes[0]['t_send_ns']
+    t0_ns  = hz_probes[0]['t_recv_ns']
     S0_hz  = hz_probes[0]['srv_tsval']
     pts = []
     for r in hz_probes:
-        t_s = (r['t_send_ns'] - t0_ns) / 1e9
+        t_s = (r['t_recv_ns'] - t0_ns) / 1e9
         tv  = _ts_delta(r['srv_tsval'], S0_hz)
         if t_s > 0 and tv > 0:
             pts.append((t_s, tv))
@@ -1470,9 +1470,14 @@ def print_summary(results, rtt_hs_ms, h2_results=None):
     print(_SEP)
     print(" Summary")
     print(_SEP)
+    avg_rtt = statistics.mean(rtts)
     print(f"  Probes     : {len(valid)}/{len(results)} responded")
     print(f"  Handshake  : {rtt_hs_ms:.2f} ms RTT")
-    print(f"  RTT        : min={min(rtts):.2f}  avg={statistics.mean(rtts):.2f}  "
+    if rtt_hs_ms > 0 and avg_rtt > rtt_hs_ms * 5 and rtt_hs_ms < 20:
+        print(f"  \u26a0 CDN note  : HTTP RTT ({avg_rtt:.0f}ms) >> handshake RTT ({rtt_hs_ms:.1f}ms).")
+        print(f"               Target uses CDN TCP termination. Absolute OWD reflects")
+        print(f"               CDN proxy path. FwdIPDV/BwdIPDV and phase deltas remain valid.")
+    print(f"  RTT        : min={min(rtts):.2f}  avg={avg_rtt:.2f}  "
           f"max={max(rtts):.2f}  jitter={jitter(rtts):.2f} ms")
     print(f"  Fwd OWD†   : start={fwds[0]:.2f}  end={fwds[-1]:.2f}  "
           f"change={fwd_change:+.2f} ms  [upload/outbound]")
@@ -1560,7 +1565,7 @@ def _owd_diagnosis(b, s):
     )
 
 
-def print_phase_summary(results, phase_loss=None, phase_jitter_override=None):
+def print_phase_summary(results, phase_loss=None, phase_jitter_override=None, rtt_hs_ms=0.0):
     """Print BASELINE vs STRESS side-by-side comparison table.
 
     phase_loss: optional dict mapping phase tag → probe loss %.
@@ -1582,6 +1587,15 @@ def print_phase_summary(results, phase_loss=None, phase_jitter_override=None):
     print(_SEP)
     print(" Phase Comparison")
     print(_SEP)
+
+    if rtt_hs_ms > 0 and rtt_hs_ms < 20:
+        all_rtts = [r['rtt_ms'] for r in results if not r.get('timed_out')]
+        if all_rtts and statistics.mean(all_rtts) > rtt_hs_ms * 5:
+            avg_rtt = statistics.mean(all_rtts)
+            print(f"  \u26a0 CDN note  : HTTP RTT ({avg_rtt:.0f}ms) >> handshake RTT ({rtt_hs_ms:.1f}ms).")
+            print(f"               Target uses CDN TCP termination. Absolute OWD reflects")
+            print(f"               CDN proxy path. FwdIPDV/BwdIPDV and phase deltas remain valid.")
+            print()
 
     col = 11
     jcol = 12
@@ -1772,7 +1786,30 @@ def main():
 
     conn    = None
     results = []
+    all_h2  = []
+    h2_conn = None
     tg_proc = None
+
+    def _run_h2_phase(phase, duration_secs, count, interval, verbose, drain_timeout):
+        """Run H2 PING probes for one phase; append to all_h2 / set h2_conn."""
+        nonlocal h2_conn
+        h2_res, c = run_h2_ping_probes(
+            args.target,
+            count=count, interval=interval, verbose=verbose,
+            phase=phase, duration_secs=duration_secs,
+            drain_timeout=drain_timeout,
+        )
+        if h2_res:
+            all_h2.extend(h2_res)
+        if c:
+            h2_conn = c
+
+    def _run_parallel(fn1, fn2):
+        t1 = threading.Thread(target=fn1, daemon=True)
+        t2 = threading.Thread(target=fn2, daemon=True)
+        t1.start(); t2.start()
+        t1.join();  t2.join()
+
     try:
         conn = connect_kernel_http(args.target, args.port, verbose=True)
         print()
@@ -1782,19 +1819,34 @@ def main():
         if two_phase:
             all_results = []
 
+            # ── BASELINE ───────────────────────────────────────────────────
             if args.baseline > 0:
-                print(f"Phase 1 — BASELINE ({args.baseline:.0f}s, network idle) ...")
-                baseline_results = run_probes_kernel_http(
-                    args.target, args.port, conn,
-                    count=0, interval=args.interval, verbose=args.verbose,
-                    phase='BASELINE', duration_secs=args.baseline,
-                    drain_timeout=_drain,
-                )
-                all_results.extend(baseline_results)
-                n_ok = sum(1 for r in baseline_results if not r.get('timed_out'))
-                print(f"  Baseline complete: {n_ok}/{len(baseline_results)} probes responded.")
+                print(f"Phase 1 — BASELINE ({args.baseline:.0f}s, network idle) ..."
+                      f"  [M1/M2 + M3 in parallel]")
+
+                def _http_base():
+                    r = run_probes_kernel_http(
+                        args.target, args.port, conn,
+                        count=0, interval=args.interval, verbose=args.verbose,
+                        phase='BASELINE', duration_secs=args.baseline,
+                        drain_timeout=_drain,
+                    )
+                    all_results.extend(r)
+                    n = sum(1 for x in r if not x.get('timed_out'))
+                    print(f"  Baseline M1/M2 complete: {n}/{len(r)} probes responded.")
+
+                def _h2_base():
+                    before = len(all_h2)
+                    _run_h2_phase('BASELINE', args.baseline, 0,
+                                  args.interval, args.verbose, _drain)
+                    chunk = all_h2[before:]
+                    n = sum(1 for x in chunk if not x.get('timed_out'))
+                    print(f"  Baseline M3    complete: {n}/{len(chunk)} H2 PING probes responded.")
+
+                _run_parallel(_http_base, _h2_base)
                 print()
 
+            # ── STRESS ─────────────────────────────────────────────────────
             if args.stress > 0:
                 total_tg_secs = args.stress + STRESS_RAMP_SEC + 10
                 print("Starting traffic generator ...")
@@ -1803,16 +1855,29 @@ def main():
                 time.sleep(STRESS_RAMP_SEC)
                 print()
 
-                print(f"Phase 2 — STRESS ({args.stress:.0f}s, network under load) ...")
-                stress_results = run_probes_kernel_http(
-                    args.target, args.port, conn,
-                    count=0, interval=args.interval, verbose=args.verbose,
-                    phase='STRESS', duration_secs=args.stress,
-                    drain_timeout=_drain,
-                )
-                all_results.extend(stress_results)
-                n_ok = sum(1 for r in stress_results if not r.get('timed_out'))
-                print(f"  Stress complete: {n_ok}/{len(stress_results)} probes responded.")
+                print(f"Phase 2 — STRESS ({args.stress:.0f}s, network under load) ..."
+                      f"  [M1/M2 + M3 in parallel]")
+                stress_h2_before = len(all_h2)
+
+                def _http_stress():
+                    r = run_probes_kernel_http(
+                        args.target, args.port, conn,
+                        count=0, interval=args.interval, verbose=args.verbose,
+                        phase='STRESS', duration_secs=args.stress,
+                        drain_timeout=_drain,
+                    )
+                    all_results.extend(r)
+                    n = sum(1 for x in r if not x.get('timed_out'))
+                    print(f"  Stress M1/M2 complete: {n}/{len(r)} probes responded.")
+
+                def _h2_stress():
+                    _run_h2_phase('STRESS', args.stress, 0,
+                                  args.interval, args.verbose, _drain)
+                    chunk = all_h2[stress_h2_before:]
+                    n = sum(1 for x in chunk if not x.get('timed_out'))
+                    print(f"  Stress M3    complete: {n}/{len(chunk)} H2 PING probes responded.")
+
+                _run_parallel(_http_stress, _h2_stress)
 
                 print("\nStopping traffic generator ...")
                 stop_traffic_gen(tg_proc)
@@ -1822,14 +1887,26 @@ def main():
             results = all_results
 
         else:
-            print(f"Sending {args.count} HTTP HEAD probes ...")
-            results = run_probes_kernel_http(
-                args.target, args.port, conn,
-                count=args.count, interval=args.interval, verbose=args.verbose,
-                drain_timeout=_drain,
-            )
+            # ── SINGLE-PHASE ────────────────────────────────────────────────
+            print(f"Sending {args.count} HTTP HEAD probes  [M1/M2 + M3 H2 PING in parallel] ...")
+            http_buf = []
+
+            def _run_http():
+                r = run_probes_kernel_http(
+                    args.target, args.port, conn,
+                    count=args.count, interval=args.interval, verbose=args.verbose,
+                    drain_timeout=_drain,
+                )
+                http_buf.extend(r)
+
+            _run_parallel(_run_http,
+                          lambda: _run_h2_phase(None, None, args.count,
+                                                args.interval, args.verbose, _drain))
+            results = http_buf
 
         compute_owd(results, conn)
+        if h2_conn and all_h2:
+            compute_owd(all_h2, h2_conn)
 
     except (RuntimeError, OSError) as exc:
         print(f"\nError: {exc}", file=sys.stderr)
@@ -1848,27 +1925,17 @@ def main():
     print()
     print_table(results)
 
-    # H2 PING probes — run after HTTP HEAD probes for side-by-side comparison
-    h2_results = None
-    if results and conn:
-        print()
-        print(f"Running HTTP/2 PING probes ({args.target}:443) ...")
-        h2_res, conn_h2 = run_h2_ping_probes(
-            args.target,
-            count=len(results),
-            interval=args.interval,
-            verbose=args.verbose,
-        )
-        if conn_h2 and h2_res:
-            compute_owd(h2_res, conn_h2)
-            h2_results = h2_res
-            n_h2 = sum(1 for r in h2_results if not r.get('timed_out'))
-            print(f"  H2 PING complete: {n_h2}/{len(h2_results)} probes responded.")
-        else:
-            print("  H2 PING: not available (port 443 closed or HTTP/2 not supported).")
+    h2_results = all_h2 if all_h2 else None
+    if h2_results:
+        n_h2 = sum(1 for r in h2_results if not r.get('timed_out'))
+        print(f"\n  H2 PING total: {n_h2}/{len(h2_results)} probes responded.")
+    else:
+        print("\n  H2 PING: not available (port 443 closed or HTTP/2 not supported).")
 
     if two_phase:
-        print_phase_summary(results)
+        print_phase_summary(results, rtt_hs_ms=conn['rtt_hs_ms'] if conn else 0.0)
+        if h2_results:
+            _print_method_comparison(results, h2_results)
     else:
         print_summary(results, conn['rtt_hs_ms'] if conn else 0.0,
                       h2_results=h2_results)
