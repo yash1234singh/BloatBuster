@@ -70,19 +70,19 @@ Discovery (1 traceroute):
 Phase 1: BASELINE (30s)
   ├─ Traceroute every 1s to all hops → record per-hop latency (no load)
   │  Probes reaching < min_probe_depth hops → counted as SHALLOW (lost)
-  └─ [--owd] OWD thread: fire-and-forget keep-alive probes via send(); a daemon
+  └─ [--owd] OWD thread: fire-and-forget HTTP HEAD probes via send(); a daemon
      thread runs sniff() to capture server ACKs; responses matched by TSecr (server
-     echoes our TSval back, RFC 7323). Only pure ACK packets accepted (FIN/ACK and
-     other control frames filtered by TCP flags). → FwdOWD†/BwdOWD†
+     echoes our TSval back, RFC 7323). In-window data → exact TSecr match → correct RTT.
+     → FwdOWD†/BwdOWD†
 
 Phase 2: STRESS (60s default)
   ├─ Launch traffic-gen.py (30 DL + 50 UL threads browsing real websites)
   ├─ Traceroute every 1s to all hops → record per-hop latency (under load)
   │  Probes reaching < min_probe_depth hops → counted as SHALLOW (lost)
-  └─ [--owd] OWD thread: async keep-alive probes on the SAME TCP connection
+  └─ [--owd] OWD thread: async HTTP HEAD probes on the SAME TCP connection
      Bufferbloat probes (queued): return with real high RTT → large jitter
      Drop-tail probes (discarded): timed_out=True, rtt_ms=None → high Loss%
-     ~50% natural probe loss is normal on CDN targets (delayed-ACK batching)
+     100% probe loss under severe upload congestion = drop-tail signal
 ```
 
 > **Shallow probe detection**: Under heavy congestion, routers drop ICMP TTL-exceeded packets to save CPU. Traceroute may only hear from local hops (e.g. hop 1 at 0.1 ms) rather than the full path. Without filtering, this 0.1 ms would corrupt baseline and stress RTT statistics. Probes that don't reach `min_probe_depth` hops are discarded and shown as `SHALLOW (N/M hops)` in the console output.
@@ -280,7 +280,7 @@ sudo python3 python/userbufferTest.py -T 1.1.1.1 --owd --owd-port 80 --owd-inter
 | `-H, --chart-height` | ASCII chart height in rows | `20` |
 | `--owd` | Enable TCP Timestamp OWD measurement in parallel (requires root + scapy) | off |
 | `--owd-port` | TCP port for OWD probe connection | `80` |
-| `--owd-interval` | Seconds between OWD keep-alive probes | `0.2` |
+| `--owd-interval` | Seconds between OWD probes | `0.2` |
 | `--owd-timeout` | Drain-window: seconds to wait after last probe before declaring remaining probes dropped | `2.0` |
 
 #### Analysis Output
@@ -431,8 +431,9 @@ Supports two modes:
 1. Establishes a raw TCP connection (Scapy + iptables) to any open port on the target.
 2. Sends a real HTTP `HEAD` request to bootstrap the session so CDN infrastructure
    (Cloudflare, Google, etc.) does not rate-limit subsequent probes.
-3. Sends TCP keep-alive probes (`seq = last_ack − 1`) on the **same** connection.
-   The remote kernel responds to each with an ACK containing its current `TSval`.
+3. Sends HTTP HEAD probes (`seq = our_seq`, `flags=PA`) on the **same** connection.
+   The server echoes our exact `TSval` in the ACK `TSecr` field (RFC 7323), enabling
+   unambiguous probe matching and correct round-trip RTT measurement.
 
 **Why a single established connection matters:**
 Modern hosts implement RFC 7323 §5.4 — each *new* TCP connection receives a unique
@@ -511,19 +512,62 @@ Main thread:                         sniff() daemon thread:
 Result:
 - **Bufferbloat** (probe queued, eventually responds): arrives at real high RTT (e.g. 800 ms) → `rtt_ms=800` → included in jitter naturally
 - **Drop-tail** (probe discarded, no response): `timed_out=True, rtt_ms=None` → counted as Loss%; jitter computed from surviving probes only
-- **~50% probe loss** is normal for CDN targets (Cloudflare, Google): their TCP stack
-  applies delayed-ACK batching, sending one cumulative ACK per two consecutive keep-alive
-  probes.  This produces consistent ~50% loss in BASELINE and STRESS — not a measurement
-  error.  During heavy bufferbloat the loss drops because probe RTTs exceed the inter-probe
-  interval, preventing batching.
+**Probe format — HTTP HEAD requests (in-window data):**  The async prober
+(`run_probes_async`) sends `HEAD / HTTP/1.1` requests as probes.  These are *in-window* data
+segments (`seq=our_seq`, `flags=PA`): the server echoes our exact probe `TSval` in the ACK
+(`TSecr`), enabling **unambiguous one-to-one TSecr matching** and correct RTT measurement.
+The sniffer ACKs the server's HTTP response automatically to keep the TCP window clear.
 
-Probe matching uses two strategies:
-1. **Exact TSecr** — server echoes our probe TSval; direct key lookup gives correct RTT.
-2. **LIFO fallback** — for CDNs like Cloudflare that echo only the last in-window TSval
-   (bootstrap HTTP HEAD, not probe TSval): match the **most-recently-sent** unmatched probe.
-   A cumulative ACK for probes N and N+1 arrives shortly after probe N+1 was sent, so LIFO
-   gives RTT ≈ real network RTT.  A time-window guard (≤ 5 000 ms) rejects spurious
-   late-arriving packets.  Probes not matched within the drain window are counted as loss.
+Keep-alives (`seq=our_seq-1`, *out-of-window*) are not used: RFC 7323 §3.4 prohibits servers
+from updating `TSecr` from out-of-window segments, so CDNs (Cloudflare, etc.) would echo the
+bootstrap `TSval` instead of the probe `TSval`, requiring an unreliable LIFO fallback.
+
+**TCP flag filtering in the response sniffer:**  The response handler explicitly filters:
+- **RST (0x04):** Connection reset — silently discarded; pending probe times out at drain window.
+- **FIN / FIN+ACK (0x01):** Server closing connection — discarded to prevent a FIN from being
+  matched as a probe response (the FIN's `TSecr` is the last valid TSval sent, not a probe key).
+- **Pure ACK (0x10) and PSH+ACK (0x18):** Accepted and matched via exact TSecr lookup.
+
+**Known limitation (M2 probe method):** HTTP HEAD responses include variable server-side
+processing time (~0–50ms for CDN edge nodes). This adds noise to probe RTT (~±25ms) and
+FwdIPDV measurements compared to a pure network echo. Phase *deltas* (BASELINE→STRESS change)
+remain reliable; absolute OWD values are estimates.
+
+**HTTP/2 PING probes (M3) — `run_h2_ping_probes()`:**  A second probe method connects to
+port 443 via TLS with HTTP/2 (ALPN `h2`) negotiation and sends RFC 7540 §6.7 `PING` frames.
+The server responds with a `PING ACK` frame at the **kernel TCP level** with no application-layer
+processing (CDN edge nodes echo H2 PINGs immediately in the TCP stack, similar to ICMP echo).
+The expected RTT for H2 PING ≈ traceroute ICMP RTT; FwdIPDV noise is much lower (~1–10ms vs
+~50–100ms for HTTP HEAD).  OWD direction split uses the same server TSval clock method.
+
+A parallel Scapy sniffer captures TCP timestamps on port 443 (both outgoing and incoming
+packets) to:
+1. Learn the kernel-assigned `TSval` for each outgoing PING frame (not controlled by the app layer)
+2. Match the server's `TSecr` in the incoming ACK to compute RTT and BwdOWD
+
+No `iptables` RST suppression is needed for H2 PING — the kernel manages the connection and
+does not send spurious RSTs.
+
+**OWD comparison output:**  The tool reports all three OWD estimation methods side by side:
+
+| Method | Port | Probe | FwdOWD split | Notes |
+|--------|------|-------|--------------|-------|
+| M1: RTT/2 | 80 | HTTP HEAD | Symmetric (RTT/2 each) | Simplest; valid when path is symmetric |
+| M2: TSval-dir | 80 | HTTP HEAD | Server TSval clock | Directional; noise from CDN processing |
+| M3: H2 PING | 443 | HTTP/2 PING | Server TSval clock | Cleanest RTT; kernel-level echo |
+
+M1 and M2 use the identical HTTP HEAD probe data — they differ only in how the RTT is split
+into directions.  M3 uses a separate TLS+H2 connection running concurrently during the same
+measurement phase, so all three methods see the same network conditions.
+
+**Probe matching — exact TSecr lookup:**  Each probe embeds a unique `TSval`; the server
+echoes it as `TSecr` in its ACK.  The match is direct dictionary lookup (`pending[tsecr]`)
+with no fallback needed.  Probes not matched within the drain window are counted as loss.
+
+**Probe loss ~50–66% on CDN targets** remains possible when the server batches ACKs
+(delayed-ACK: one ACK per two consecutive incoming segments).  This is a normal TCP
+behaviour and not a measurement error.  Only one of the two batched probes gets an
+individual ACK; the other is counted as no-response.
 
 The standalone `__main__` path uses synchronous `run_probes()` with `sr1()` (per-probe
 blocking receive with a 2 s timeout per probe) — simpler and also correct, at the cost of
@@ -569,13 +613,21 @@ the delta, so it is immediately clear which direction was hit hardest by congest
 | Column | Meaning |
 |--------|---------|
 | `Phase` | `BASELINE` or `STRESS` (two-phase mode only) |
-| `RTT(ms)` | Round-trip time for this probe |
+| `RTT(ms)` | Round-trip time for this probe (pure network RTT, matches traceroute) |
 | `FwdOWD†(ms)` | Upload OWD (client→server) = RTT − BwdOWD† |
 | `BwdOWD†(ms)` | Download OWD (server→client), estimated via server TSval clock |
 | `FwdIPDV(ms)` | Change in upload delay vs previous probe (`+` = got worse) |
 | `BwdIPDV(ms)` | Change in download delay vs previous probe (`+` = got worse) |
+| `RTTJitter(ms)` | Total path jitter: `max(RTT) − min(RTT)` within the phase |
+| `FwdJitter(ms)` | Upload jitter: range of `FwdIPDV` values within the phase |
+| `BwdJitter(ms)` | Download jitter: range of `BwdIPDV` values within the phase |
 
 `†` = anchored to handshake RTT/2 with auto-calibration for link asymmetry; each probe computed independently.
+
+**Note on jitter columns:** `FwdJitter` and `BwdJitter` are IPDV ranges (`max − min` of per-probe
+delay deltas), not OWD ranges.  They measure how much the per-direction delay *varied* between
+consecutive probes — the correct metric for congestion jitter.  A positive `FwdJitter` spike
+during STRESS is the primary indicator of upload path congestion.
 
 #### Limitations
 
@@ -592,8 +644,25 @@ the delta, so it is immediately clear which direction was hit hardest by congest
   to 5 s for late responses before declaring drops. On a 60 s STRESS phase this adds ~5 s
   of wait time. On satellite or very high-latency links, increase the drain timeout to
   match the expected maximum queue delay.
+- **OWD probe loss under heavy upload congestion.** HTTP HEAD probes compete for the same
+  upload buffer as real traffic.  Under severe upload bufferbloat (drop-tail), probes queue
+  behind megabytes of pending data and either time out or are dropped entirely.
+  **100% probe loss during STRESS = confirmed drop-tail congestion** — a diagnostic signal,
+  not a measurement failure.  The **per-hop bloat table** (from traceroute) remains the
+  reliable magnitude signal; OWD probe loss % indicates whether the bottleneck queue is
+  drop-tail or AQM-managed.
+- **M2 probe RTT includes server processing time.** HTTP HEAD responses from CDN edge nodes
+  include variable processing time (~0–50ms for Cloudflare).  Probe RTT range at idle is
+  typically ~±25ms wider than traceroute ICMP RTT range.  Use M3 (H2 PING) for a cleaner
+  RTT that matches traceroute; use phase *deltas* (BASELINE→STRESS) for reliable congestion
+  direction even with M2 processing noise.
+- **M3 (H2 PING) requires port 443 and HTTP/2 support.**  If the target does not support
+  TLS or HTTP/2 (ALPN `h2` negotiation fails), M3 is skipped and only M1/M2 are reported.
+  M3 also uses a separate TLS connection; its RTT includes TLS handshake overhead on the
+  *first* probe only — subsequent probes are purely network + kernel ACK latency.
 - Linux only (requires `iptables` to suppress kernel-generated RST packets on the raw
-  Scapy connection).  Requires root or `CAP_NET_RAW`.
+  Scapy connection for M1/M2).  Requires root or `CAP_NET_RAW`.  M3 (H2 PING) does not
+  need iptables suppression as it uses a normal kernel TCP connection.
 
 #### CLI Options
 
@@ -603,7 +672,7 @@ the delta, so it is immediately clear which direction was hit hardest by congest
 |--------|---------|-------------|
 | `--target / -T` | *(required)* | Target IP address |
 | `--port / -p` | `80` | Open TCP port on target |
-| `--count / -n` | `20` | Number of keep-alive probes (single-phase) |
+| `--count / -n` | `20` | Number of OWD probes (single-phase) |
 | `--interval / -i` | `0.2 s` | Time between probes |
 | `--timeout / -w` | `2.0 s` | Wait time per probe |
 | `--output / -o` | — | Save per-probe results to CSV |

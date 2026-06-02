@@ -55,6 +55,7 @@ import math
 import os
 import re
 import signal
+import statistics
 import subprocess
 import sys
 import threading
@@ -688,7 +689,8 @@ def print_overall_summary(baseline_ts, stress_ts,
                           baseline_probes, baseline_lost,
                           stress_probes, stress_lost,
                           owd_results=None, target='',
-                          owd_attempt_stats=None):
+                          owd_attempt_stats=None,
+                          h2_results=None):
     """End-to-end latency summary.
 
     RTT values are taken from the time-series e2e_rtt field (the RTT to the
@@ -760,25 +762,28 @@ def print_overall_summary(baseline_ts, stress_ts,
         _base_owd_loss   = _owd_loss_pct('BASELINE')
         _stress_owd_loss = _owd_loss_pct('STRESS')
 
-        # OWD probe jitter table — RTT range of received probes.
-        # Async probing ensures high-latency (bufferbloat) probes appear here with
-        # their true RTT; truly dropped probes are excluded (shown in Loss% above).
+        # OWD probe jitter — RTT range (total path) + per-direction IPDV ranges.
+        # Async probing records true RTT for high-latency bufferbloat probes;
+        # truly dropped probes are excluded (shown in Loss% above).
         _jitter = {}
-        print(f"\n  \u2014 OWD probe jitter (RTT range) \u2014")
-        print(f"{'Phase':<12}{'Samples':<9}{'FwdJitter(ms)':<15}{'BwdJitter(ms)':<15}")
-        print("-" * 51)
+        print(f"\n  \u2014 OWD probe jitter \u2014")
+        print(f"{'Phase':<12}{'Samples':<9}{'RTTJitter(ms)':<15}{'FwdIPDV(ms)':<14}{'BwdIPDV(ms)':<14}")
+        print("-" * 64)
         for phase_tag in ('BASELINE', 'STRESS'):
             recv_rtts = [r['rtt_ms'] for r in owd_results
                          if r.get('phase') == phase_tag and not r.get('timed_out')]
-            bipd = [r['bwd_ipdv_ms'] for r in owd_results
-                    if r.get('phase') == phase_tag and r.get('bwd_ipdv_ms') is not None]
+            fipdv = [r['fwd_ipdv_ms'] for r in owd_results
+                     if r.get('phase') == phase_tag and r.get('fwd_ipdv_ms') is not None]
+            bipd  = [r['bwd_ipdv_ms'] for r in owd_results
+                     if r.get('phase') == phase_tag and r.get('bwd_ipdv_ms') is not None]
             if len(recv_rtts) > 1:
-                fj = max(recv_rtts) - min(recv_rtts)
-                bj = (max(bipd) - min(bipd)) if len(bipd) > 1 else 0.0
+                rj = max(recv_rtts) - min(recv_rtts)
+                fj = (max(fipdv) - min(fipdv)) if len(fipdv) > 1 else 0.0
+                bj = (max(bipd)  - min(bipd))  if len(bipd)  > 1 else 0.0
                 _jitter[phase_tag] = {'fwd': fj, 'bwd': bj}
-                print(f"{phase_tag:<12}{len(recv_rtts):<9}{fj:<15.2f}{bj:<15.2f}")
+                print(f"{phase_tag:<12}{len(recv_rtts):<9}{rj:<15.2f}{fj:<14.2f}{bj:<14.2f}")
             else:
-                print(f"{phase_tag:<12}{len(recv_rtts):<9}{'—':<15}{'—':<15}")
+                print(f"{phase_tag:<12}{len(recv_rtts):<9}{'—':<15}{'—':<14}{'—':<14}")
 
         # Diagnosis: which direction degraded and by how much
         _diag = {}
@@ -827,6 +832,61 @@ def print_overall_summary(baseline_ts, stress_ts,
             print(f"       Consider enabling AQM (fq_codel / CAKE) on the upload interface.")
         print(f"\n  \u2020 End-to-end OWD only — per-hop RTT breakdown is in the segment table above.")
         print(f"    Direct TSval-clock OWD; anchor = handshake RTT/2. Each probe independent. No NTP required.")
+
+        # 3-method comparison (M1 RTT/2, M2 TSval-dir, M3 H2 PING)
+        if owd_results or h2_results:
+            print(f"\n  \u2014 OWD Method Comparison \u2014")
+            print(f"  {'Method':<26}  {'Port':>4}  {'Phase':<8}  "
+                  f"{'RTT avg':>8}  {'FwdOWD avg':>10}  {'BwdOWD avg':>10}  {'Probes':>8}")
+            print(f"  {'-'*73}")
+            for phase_tag in ('BASELINE', 'STRESS'):
+                # M1 + M2: from HTTP HEAD probes
+                if owd_results:
+                    ph_http = [r for r in owd_results
+                               if r.get('phase') == phase_tag and not r.get('timed_out')]
+                    if ph_http:
+                        rtts = [r['rtt_ms'] for r in ph_http]
+                        fwds = [r['fwd_owd_ms'] for r in ph_http if r.get('fwd_owd_ms') is not None]
+                        bwds = [r['bwd_owd_ms'] for r in ph_http if r.get('bwd_owd_ms') is not None]
+                        avg_rtt = sum(rtts) / len(rtts)
+                        tot_http = sum(1 for r in owd_results if r.get('phase') == phase_tag)
+                        # M1: RTT/2
+                        print(f"  {'M1: RTT/2 (symmetric)':<26}  {'80':>4}  {phase_tag:<8}  "
+                              f"{avg_rtt:>7.2f}ms  {avg_rtt/2:>9.2f}ms  {avg_rtt/2:>9.2f}ms  "
+                              f"{len(ph_http):>4}/{tot_http}")
+                        # M2: TSval-dir
+                        if fwds and bwds:
+                            print(f"  {'M2: TSval-dir (server clk)':<26}  {'80':>4}  {phase_tag:<8}  "
+                                  f"{avg_rtt:>7.2f}ms  {sum(fwds)/len(fwds):>9.2f}ms  "
+                                  f"{sum(bwds)/len(bwds):>9.2f}ms  {len(ph_http):>4}/{tot_http}")
+                    else:
+                        tot_http = sum(1 for r in owd_results if r.get('phase') == phase_tag)
+                        if tot_http:
+                            print(f"  {'M1: RTT/2 (symmetric)':<26}  {'80':>4}  {phase_tag:<8}  "
+                                  f"{'N/A':>8}  {'N/A':>10}  {'N/A':>10}  {'0':>4}/{tot_http}")
+                            print(f"  {'M2: TSval-dir (server clk)':<26}  {'80':>4}  {phase_tag:<8}  "
+                                  f"{'N/A':>8}  {'N/A':>10}  {'N/A':>10}  {'0':>4}/{tot_http}")
+                # M3: H2 PING probes
+                if h2_results:
+                    ph_h2 = [r for r in h2_results
+                             if r.get('phase') == phase_tag and not r.get('timed_out')]
+                    tot_h2 = sum(1 for r in h2_results if r.get('phase') == phase_tag)
+                    if ph_h2:
+                        rtts_h2 = [r['rtt_ms'] for r in ph_h2]
+                        fwds_h2 = [r['fwd_owd_ms'] for r in ph_h2 if r.get('fwd_owd_ms') is not None]
+                        bwds_h2 = [r['bwd_owd_ms'] for r in ph_h2 if r.get('bwd_owd_ms') is not None]
+                        avg_h2  = sum(rtts_h2) / len(rtts_h2)
+                        fwd_h2  = sum(fwds_h2) / len(fwds_h2) if fwds_h2 else avg_h2 / 2
+                        bwd_h2  = sum(bwds_h2) / len(bwds_h2) if bwds_h2 else avg_h2 / 2
+                        print(f"  {'M3: H2 PING (TLS port 443)':<26}  {'443':>4}  {phase_tag:<8}  "
+                              f"{avg_h2:>7.2f}ms  {fwd_h2:>9.2f}ms  {bwd_h2:>9.2f}ms  "
+                              f"{len(ph_h2):>4}/{tot_h2}")
+                    else:
+                        print(f"  {'M3: H2 PING (TLS port 443)':<26}  {'443':>4}  {phase_tag:<8}  "
+                              f"{'N/A':>8}  {'N/A':>10}  {'N/A':>10}  {'0':>4}/{tot_h2}")
+            print(f"  {'-'*73}")
+            print(f"  M1/M2: HTTP HEAD probe data — M1 assumes symmetric, M2 uses server TSval clock.")
+            print(f"  M3: H2 PING — kernel-level ACK (no server HTTP processing delay).")
 
 
 # ---------------------------------------------------------------------------
@@ -1206,20 +1266,53 @@ def _load_tcp_owd():
 
 
 def _owd_worker(tcp_owd, target, port, conn, phase, duration_secs, interval,
-                results_list, probe_timeout=10.0, attempt_stats=None):
-    """Background thread: run OWD probes for duration_secs, tag with phase."""
-    phase_results = tcp_owd.run_probes_async(
-        target, port, conn,
-        count=0, interval=interval, verbose=False,
-        phase=phase, duration_secs=duration_secs,
-        drain_timeout=probe_timeout,
-    )
-    results_list.extend(phase_results)
-    if attempt_stats is not None:
-        attempt_stats[phase] = {
-            'total': len(phase_results),
-            'valid': sum(1 for r in phase_results if not r.get('timed_out')),
-        }
+                results_list, probe_timeout=10.0, attempt_stats=None,
+                h2_results_list=None):
+    """Background thread: run OWD probes for duration_secs, tag with phase.
+
+    Runs HTTP HEAD probes (port 80) and HTTP/2 PING probes (port 443) in
+    parallel sub-threads so both methods measure the same network conditions.
+    h2_results_list: if provided, H2 PING results are appended here.
+    """
+    h2_buf = []
+
+    def _run_http():
+        phase_results = tcp_owd.run_probes_async(
+            target, port, conn,
+            count=0, interval=interval, verbose=False,
+            phase=phase, duration_secs=duration_secs,
+            drain_timeout=probe_timeout,
+        )
+        results_list.extend(phase_results)
+        if attempt_stats is not None:
+            attempt_stats[phase] = {
+                'total': len(phase_results),
+                'valid': sum(1 for r in phase_results if not r.get('timed_out')),
+            }
+
+    def _run_h2():
+        h2_res, conn_h2 = tcp_owd.run_h2_ping_probes(
+            target,
+            count=0,
+            interval=interval,
+            verbose=False,
+            phase=phase,
+            duration_secs=duration_secs,
+            drain_timeout=probe_timeout,
+        )
+        if conn_h2 and h2_res:
+            tcp_owd.compute_owd(h2_res, conn_h2)
+        h2_buf.extend(h2_res)
+
+    t_http = threading.Thread(target=_run_http, daemon=True)
+    t_h2   = threading.Thread(target=_run_h2,   daemon=True)
+    t_http.start()
+    t_h2.start()
+    t_http.join()
+    t_h2.join()
+
+    if h2_results_list is not None:
+        h2_results_list.extend(h2_buf)
 
 
 def print_owd_section(tcp_owd, owd_results, owd_attempt_stats=None):
@@ -1235,20 +1328,9 @@ def print_owd_section(tcp_owd, owd_results, owd_attempt_stats=None):
         s = owd_attempt_stats.get(phase_tag, {})
         return (1 - s['valid'] / s['total']) * 100 if s.get('total') else 0.0
     phase_loss = {'BASELINE': _loss_pct('BASELINE'), 'STRESS': _loss_pct('STRESS')}
-    # Compute received-only RTT range as jitter override for print_phase_summary.
-    # Async probing gives truly dropped probes rtt_ms=None; bufferbloat probes
-    # have their actual high RTT and are included in recv_rtts naturally.
-    phase_jitter_override = {}
-    for ph in ('BASELINE', 'STRESS'):
-        recv_rtts = [r['rtt_ms'] for r in owd_results
-                     if r.get('phase') == ph and not r.get('timed_out')]
-        bipd = [r['bwd_ipdv_ms'] for r in owd_results
-                if r.get('phase') == ph and r.get('bwd_ipdv_ms') is not None]
-        fj = (max(recv_rtts) - min(recv_rtts)) if len(recv_rtts) > 1 else 0.0
-        bj = (max(bipd) - min(bipd)) if len(bipd) > 1 else 0.0
-        phase_jitter_override[ph] = (fj, bj)
-    tcp_owd.print_phase_summary(owd_results, phase_loss=phase_loss,
-                                phase_jitter_override=phase_jitter_override)
+    # print_phase_summary computes FwdJitter/BwdJitter from fwd_ipdv_ms/bwd_ipdv_ms
+    # ranges internally — no override needed.
+    tcp_owd.print_phase_summary(owd_results, phase_loss=phase_loss)
 
 
 # ---------------------------------------------------------------------------
@@ -1486,6 +1568,7 @@ def main():
     owd_enabled  = False
     owd_conn     = None
     owd_results  = []
+    h2_results   = []
 
     if args.owd:
         if os.geteuid() != 0:
@@ -1516,7 +1599,7 @@ def main():
             target=_owd_worker,
             args=(tcp_owd, args.target, args.owd_port, owd_conn,
                   'BASELINE', args.baseline, args.owd_interval, owd_results,
-                  args.owd_timeout, owd_attempt_stats),
+                  args.owd_timeout, owd_attempt_stats, h2_results),
             daemon=True,
         )
         _owd_t.start()
@@ -1553,7 +1636,7 @@ def main():
             target=_owd_worker,
             args=(tcp_owd, args.target, args.owd_port, owd_conn,
                   'STRESS', args.stress, args.owd_interval, owd_results,
-                  args.owd_timeout, owd_attempt_stats),
+                  args.owd_timeout, owd_attempt_stats, h2_results),
             daemon=True,
         )
         _owd_t.start()
@@ -1579,7 +1662,8 @@ def main():
 
     # --- OWD post-processing ---
     if owd_enabled:
-        tcp_owd.compute_owd(owd_results, owd_conn)
+        tcp_owd.compute_owd(owd_results, owd_conn)   # HTTP HEAD (port 80) OWD
+        # H2 PING OWD already computed per-phase inside _owd_worker
         tcp_owd.tcp_teardown(args.target, args.owd_port, owd_conn)
         tcp_owd._remove_rst()
 
@@ -1595,7 +1679,8 @@ def main():
                           stress_probes, stress_lost,
                           owd_results=owd_results if owd_enabled else None,
                           target=args.target,
-                          owd_attempt_stats=owd_attempt_stats if owd_enabled else None)
+                          owd_attempt_stats=owd_attempt_stats if owd_enabled else None,
+                          h2_results=h2_results if owd_enabled and h2_results else None)
     if owd_enabled and owd_results:
         print_owd_section(tcp_owd, owd_results,
                           owd_attempt_stats=owd_attempt_stats if owd_enabled else None)
