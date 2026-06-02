@@ -14,12 +14,15 @@ Analysis Output:
   2. Ranked Bloat Summary       — worst links sorted by severity
   3. ASCII Network Diagram      — visual path with per-link bloat
   4. Overall Latency Summary    — RTT avg/P95/max/loss%; plus FwdOWD†/BwdOWD†
-                                   rows in same format when --owd is used
+                                   rows in same format when --owd is used;
+                                   FwdOWD‡/BwdOWD‡ rows when --twamp is used
   5. One-Way Delay Analysis     — [--owd] BASELINE vs STRESS IPDV comparison table
+  5b. TWAMP OWD Analysis        — [--twamp] BASELINE vs STRESS TWAMP-Light table
   6. Throughput Summary         — DL/UL mean, max, median, P10, P90
   7. Time-Series Table          — 1-second RTT + throughput data
   8. ASCII Chart                — dual-axis: ▓DL ░UL throughput + ○● RTT;
-                                   ▲FwdOWD†(upload) ▽BwdOWD†(download) overlay when --owd
+                                   ▲FwdOWD†(upload) ▽BwdOWD†(download) overlay when --owd;
+                                   ◆FwdOWD‡(upload) ◇BwdOWD‡(download) overlay when --twamp
   9. Traffic Summary            — per-client success/fail/socket stats
 
 Usage:
@@ -47,6 +50,9 @@ Examples:
     python3 userbufferTest.py -T 1.1.1.1 -o results.csv
     sudo python3 userbufferTest.py -T 1.1.1.1 --owd
     sudo python3 userbufferTest.py -T 1.1.1.1 --owd --owd-port 443 --owd-interval 0.2 -b 30 -s 120
+    python3 userbufferTest.py -T 8.8.8.8 --twamp
+    python3 userbufferTest.py -T 8.8.8.8 --twamp --twamp-server 34.209.241.130 --twamp-port 4200
+    sudo python3 userbufferTest.py -T 8.8.8.8 --owd --twamp -b 30 -s 120
 """
 
 import argparse
@@ -106,6 +112,14 @@ DEFAULT_OWD_TIMEOUT      = 2.0    # per-probe reply timeout; matches standalone 
                                   # that create meaningful IPDV swings under drop-tail congestion.
                                   # At 1.0s those probes time out and only drain-gap survivors remain,
                                   # producing artificially small (~21ms) jitter regardless of congestion.
+
+# TWAMP-Light probe defaults
+DEFAULT_TWAMP_SERVER     = '34.209.241.130'
+DEFAULT_TWAMP_PORT       = 4200
+DEFAULT_TWAMP_INTERVAL   = 0.2    # seconds between UDP test packets
+DEFAULT_TWAMP_TIMEOUT    = 2.0    # per-probe receive timeout (seconds)
+DEFAULT_TWAMP_PADDING    = 27     # padding bytes; sender pkt = 14+27 = 41 bytes total (Nokia default)
+DEFAULT_TWAMP_BACKEND    = 'native'  # 'native' or 'nokia'
 
 # Analysis thresholds
 BLOAT_THRESHOLD_MS       = 1.0    # minimum per-hop bloat considered significant (ms)
@@ -690,7 +704,9 @@ def print_overall_summary(baseline_ts, stress_ts,
                           stress_probes, stress_lost,
                           owd_results=None, target='',
                           owd_attempt_stats=None,
-                          h2_results=None):
+                          h2_results=None,
+                          twamp_results=None,
+                          twamp_attempt_stats=None):
     """End-to-end latency summary.
 
     RTT values are taken from the time-series e2e_rtt field (the RTT to the
@@ -888,6 +904,48 @@ def print_overall_summary(baseline_ts, stress_ts,
             print(f"  M1/M2: HTTP HEAD probe data — M1 assumes symmetric, M2 uses server TSval clock.")
             print(f"  M3: H2 PING — kernel-level ACK (no server HTTP processing delay).")
 
+    # --- TWAMP summary block ---
+    if twamp_results:
+        scope = f" (end-to-end to {target})" if target else " (end-to-end)"
+        for label, key in [("FwdOWD\u2021 (upload)" + scope, "fwd_owd_ms"),
+                           ("BwdOWD\u2021 (download)" + scope, "bwd_owd_ms")]:
+            print(f"\n  \u2014 {label} [TWAMP-Light] \u2014")
+            print(f"{'Phase':<12}{'Samples':<9}{'Loss %':<9}{'Avg (ms)':<11}"
+                  f"{'P95 (ms)':<11}{'Max (ms)':<11}")
+            print("-" * 72)
+            for phase_tag in ("BASELINE", "STRESS"):
+                vals = [r[key] for r in twamp_results
+                        if r.get('phase') == phase_tag and r.get(key) is not None]
+                s = twamp_attempt_stats.get(phase_tag) if twamp_attempt_stats else None
+                loss_str = f"{100*(1 - s['valid']/s['total']):.1f}" if s and s['total'] else '—'
+                if vals:
+                    print(f"{phase_tag:<12}{len(vals):<9}{loss_str:<9}"
+                          f"{sum(vals)/len(vals):<11.2f}"
+                          f"{percentile(vals, PERCENTILE_P95):<11.2f}{max(vals):<11.2f}")
+                else:
+                    print(f"{phase_tag:<12}{'0':<9}{loss_str:<9}{'—':<11}{'—':<11}{'—':<11}")
+        # TWAMP IPDV jitter table
+        print(f"\n  \u2014 TWAMP probe jitter \u2014")
+        print(f"{'Phase':<12}{'Samples':<9}{'RTTJitter(ms)':<15}{'FwdIPDV(ms)':<14}{'BwdIPDV(ms)':<14}")
+        print("-" * 64)
+        for phase_tag in ('BASELINE', 'STRESS'):
+            recv_rtts = [r['rtt_ms'] for r in twamp_results
+                         if r.get('phase') == phase_tag and not r.get('timed_out')]
+            fipdv = [r['fwd_ipdv_ms'] for r in twamp_results
+                     if r.get('phase') == phase_tag and r.get('fwd_ipdv_ms') is not None]
+            bipd  = [r['bwd_ipdv_ms'] for r in twamp_results
+                     if r.get('phase') == phase_tag and r.get('bwd_ipdv_ms') is not None]
+            if len(recv_rtts) > 1:
+                rj = max(recv_rtts) - min(recv_rtts)
+                fj = (max(fipdv) - min(fipdv)) if len(fipdv) > 1 else 0.0
+                bj = (max(bipd)  - min(bipd))  if len(bipd)  > 1 else 0.0
+                print(f"{phase_tag:<12}{len(recv_rtts):<9}{rj:<15.2f}{fj:<14.2f}{bj:<14.2f}")
+            else:
+                print(f"{phase_tag:<12}{len(recv_rtts):<9}{'—':<15}{'—':<14}{'—':<14}")
+        print(f"\n  \u2021 TWAMP-Light UDP end-to-end OWD. FwdOWD\u2021/BwdOWD\u2021 are accurate only with")
+        print(f"    NTP-synchronised clocks; without sync they reflect RTT/2 (symmetric assumption).")
+        print(f"    IPDV/jitter values are always accurate regardless of clock sync.")
+
 
 # ---------------------------------------------------------------------------
 # Time-series table and ASCII charts
@@ -941,11 +999,13 @@ def print_time_series_table(baseline_ts, stress_ts):
         prev_ul = entry['ul_bytes']
 
 
-def print_ascii_chart(baseline_ts, stress_ts, width=80, height=20, owd_results=None):
+def print_ascii_chart(baseline_ts, stress_ts, width=80, height=20,
+                      owd_results=None, twamp_results=None):
     """Render a dual-axis ASCII chart: throughput (left) + RTT (right).
 
     DL throughput = ▓, UL throughput = ░, RTT = ● / ○
     OWD overlay (when owd_results provided): ▲ FwdOWD† upload, ▽ BwdOWD† download.
+    TWAMP overlay (when twamp_results provided): ◆ FwdOWD‡ upload, ◇ BwdOWD‡ download.
     """
     # Combine all time-series entries in order
     all_entries = []
@@ -970,6 +1030,9 @@ def print_ascii_chart(baseline_ts, stress_ts, width=80, height=20, owd_results=N
         rtt_values += [abs(r['fwd_ipdv_ms']) for r in owd_results
                        if r.get('fwd_ipdv_ms') is not None]
         # High-RTT received probes (bufferbloat) also included via fwd/bwd_owd_ms above
+    if twamp_results:
+        for key in ('fwd_owd_ms', 'bwd_owd_ms'):
+            rtt_values += [r[key] for r in twamp_results if r.get(key) is not None]
 
     if not rtt_values and not all_rates:
         return
@@ -1001,14 +1064,23 @@ def print_ascii_chart(baseline_ts, stress_ts, width=80, height=20, owd_results=N
         entries = all_entries
         chart_w = len(entries)
 
-    has_owd = bool(owd_results)
-    title = ('ASCII CHART: Throughput (\u2593DL \u2591UL) + RTT (\u25cf) + OWD (\u25b2\u25bd)'
-             if has_owd else
-             'ASCII CHART: Throughput (DL \u2593, UL \u2591) + RTT (\u25cf)')
+    has_owd   = bool(owd_results)
+    has_twamp = bool(twamp_results)
+    if has_owd and has_twamp:
+        title = 'ASCII CHART: Throughput (\u2593DL \u2591UL) + RTT (\u25cf) + OWD (\u25b2\u25bd) + TWAMP (\u25c6\u25c7)'
+    elif has_owd:
+        title = 'ASCII CHART: Throughput (\u2593DL \u2591UL) + RTT (\u25cf) + OWD (\u25b2\u25bd)'
+    elif has_twamp:
+        title = 'ASCII CHART: Throughput (\u2593DL \u2591UL) + RTT (\u25cf) + TWAMP (\u25c6\u25c7)'
+    else:
+        title = 'ASCII CHART: Throughput (DL \u2593, UL \u2591) + RTT (\u25cf)'
     print(f"\n{'='*80}")
     print(f"{title:^80}")
     print(f"{'='*80}")
-    rtt_label = "RTT+OWD" if has_owd else "RTT"
+    if has_owd or has_twamp:
+        rtt_label = "RTT+OWD"
+    else:
+        rtt_label = "RTT"
     print(f"  Y-axis left: Throughput (0-{max_rate:.0f} Mbps)   "
           f"Y-axis right: {rtt_label} (0-{max_rtt:.0f} ms)\n")
 
@@ -1101,6 +1173,60 @@ def print_ascii_chart(baseline_ts, stress_ts, width=80, height=20, owd_results=N
                 if grid[r][col] == ' ':
                     grid[r][col] = 'x'
 
+    # TWAMP overlay — map each probe to chart column by wall-clock elapsed time
+    # TWAMP probes store t1_posix (float seconds) rather than t_send_ns
+    if has_twamp and n_entries >= 2:
+        base_dur_tw   = baseline_ts[-1]['elapsed'] if baseline_ts else 0
+        stress_dur_tw = stress_ts[-1]['elapsed']   if stress_ts   else 0
+
+        tw_base   = [r for r in twamp_results if r.get('phase') == 'BASELINE']
+        tw_stress = [r for r in twamp_results if r.get('phase') == 'STRESS']
+
+        tw_base_t0   = (min(r['t1_posix'] for r in tw_base   if r.get('t1_posix'))
+                        if tw_base   else None)
+        tw_stress_t0 = (min(r['t1_posix'] for r in tw_stress if r.get('t1_posix'))
+                        if tw_stress else None)
+
+        def _twamp_col(probe):
+            phase = probe.get('phase')
+            t1 = probe.get('t1_posix')
+            if t1 is None:
+                return None
+            if phase == 'BASELINE' and tw_base_t0 and base_dur_tw > 0:
+                elapsed = t1 - tw_base_t0
+                raw_pos = elapsed / base_dur_tw * max(n_base - 1, 1)
+            elif phase == 'STRESS' and tw_stress_t0 and stress_dur_tw > 0:
+                elapsed = t1 - tw_stress_t0
+                raw_pos = n_base + elapsed / stress_dur_tw * max(n_stress - 1, 1)
+            else:
+                return None
+            col = round(raw_pos * chart_w / n_entries)
+            return max(0, min(col, chart_w - 1))
+
+        _protected = {'●', '○', '▲', '▽'}
+        for probe in twamp_results:
+            col = _twamp_col(probe)
+            if col is None:
+                continue
+            if probe.get('timed_out'):
+                if grid[0][col] == ' ':
+                    grid[0][col] = 'T'   # TWAMP timeout marker
+                continue
+            # FwdOWD‡ upload → ◆
+            fwd = probe.get('fwd_owd_ms')
+            if fwd is not None:
+                owd_row = max(0, min(int(fwd / max_rtt * (height - 1)), height - 1))
+                r = height - 1 - owd_row
+                if grid[r][col] not in _protected:
+                    grid[r][col] = '\u25c6'
+            # BwdOWD‡ download → ◇
+            bwd = probe.get('bwd_owd_ms')
+            if bwd is not None:
+                owd_row = max(0, min(int(bwd / max_rtt * (height - 1)), height - 1))
+                r = height - 1 - owd_row
+                if grid[r][col] not in _protected and grid[r][col] != '\u25c6':
+                    grid[r][col] = '\u25c7'
+
     # Render
     for row in range(height):
         rate_val = max_rate * (height - 1 - row) / (height - 1)
@@ -1121,12 +1247,14 @@ def print_ascii_chart(baseline_ts, stress_ts, width=80, height=20, owd_results=N
         label_line += f"{first_ts}{' ' * max(1, gap1)}{mid_ts}{' ' * max(1, gap2)}{last_ts}"
     print(label_line)
 
+    legend = "\n  Legend: \u2593 DL Mbps   \u2591 UL Mbps   \u25cb Base RTT   \u25cf Stress RTT"
     if has_owd:
-        print("\n  Legend: \u2593 DL Mbps   \u2591 UL Mbps   \u25cb Base RTT   \u25cf Stress RTT"
-              "   \u25b2 FwdOWD\u2020(UL)   \u25bd BwdOWD\u2020(DL)   x |FwdIPDV|(UL jitter)"
-              "   X dropped probe (queue full)")
-    else:
-        print("\n  Legend: \u2593 DL Mbps   \u2591 UL Mbps   \u25cb Baseline RTT (ms)   \u25cf Stress RTT (ms)")
+        legend += "   \u25b2 FwdOWD\u2020(UL)   \u25bd BwdOWD\u2020(DL)   x |FwdIPDV|   X OWD-timeout"
+    if has_twamp:
+        legend += "   \u25c6 FwdOWD\u2021(UL)   \u25c7 BwdOWD\u2021(DL)   T TWAMP-timeout"
+    if not has_owd and not has_twamp:
+        legend = "\n  Legend: \u2593 DL Mbps   \u2591 UL Mbps   \u25cb Baseline RTT (ms)   \u25cf Stress RTT (ms)"
+    print(legend)
 
 
 def print_throughput_summary(stress_ts):
@@ -1199,7 +1327,7 @@ def print_traffic_summary(traffic_log_file):
 
 
 def save_results_csv(output_file, baseline_stats, stress_stats, segments,
-                     baseline_ts, stress_ts):
+                     baseline_ts, stress_ts, twamp_results=None):
     """Save detailed results to CSV."""
     try:
         with open(output_file, 'w', newline='', encoding='utf-8') as f:
@@ -1241,6 +1369,25 @@ def save_results_csv(output_file, baseline_stats, stress_stats, segments,
                     f"{e['ul_rate_mbps']:.2f}",
                     e['dl_bytes'], e['ul_bytes'],
                 ])
+
+            # Section 3: TWAMP probe data (optional)
+            if twamp_results:
+                writer.writerow([])
+                writer.writerow(['# TWAMP-LIGHT PROBES'])
+                writer.writerow(['probe', 'phase', 'seq', 'rtt_ms', 'fwd_owd_ms',
+                                 'bwd_owd_ms', 'fwd_ipdv_ms', 'bwd_ipdv_ms', 'timed_out'])
+                for r in twamp_results:
+                    writer.writerow([
+                        r.get('probe', ''),
+                        r.get('phase', ''),
+                        r.get('seq', ''),
+                        f"{r['rtt_ms']:.3f}"       if r.get('rtt_ms')       is not None else '',
+                        f"{r['fwd_owd_ms']:.3f}"   if r.get('fwd_owd_ms')   is not None else '',
+                        f"{r['bwd_owd_ms']:.3f}"   if r.get('bwd_owd_ms')   is not None else '',
+                        f"{r['fwd_ipdv_ms']:.3f}"  if r.get('fwd_ipdv_ms')  is not None else '',
+                        f"{r['bwd_ipdv_ms']:.3f}"  if r.get('bwd_ipdv_ms')  is not None else '',
+                        int(r.get('timed_out', False)),
+                    ])
 
         print(f"\nResults saved to: {output_file}")
     except OSError as exc:
@@ -1331,6 +1478,76 @@ def print_owd_section(tcp_owd, owd_results, owd_attempt_stats=None):
     # print_phase_summary computes FwdJitter/BwdJitter from fwd_ipdv_ms/bwd_ipdv_ms
     # ranges internally — no override needed.
     tcp_owd.print_phase_summary(owd_results, phase_loss=phase_loss)
+
+
+# ---------------------------------------------------------------------------
+# TWAMP-Light helpers — twamp_owd.py integration
+# ---------------------------------------------------------------------------
+
+def _load_twamp_owd():
+    """Import twamp_owd from the same directory. Returns the module or None."""
+    try:
+        import importlib.util
+        _path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'twamp_owd.py')
+        _spec = importlib.util.spec_from_file_location('twamp_owd', _path)
+        _mod  = importlib.util.module_from_spec(_spec)
+        _spec.loader.exec_module(_mod)
+        return _mod
+    except Exception as exc:
+        print(f"[WARN] Could not load twamp_owd.py: {exc}", file=sys.stderr)
+        return None
+
+
+def _twamp_worker(twamp_mod, server, port, phase, duration_secs, interval,
+                  results_list, timeout, padding, attempt_stats=None,
+                  backend='native'):
+    """Background thread: run TWAMP-Light UDP probes for duration_secs, tag with phase."""
+    if backend == 'nokia':
+        phase_results = twamp_mod.run_twamp_probes_nokia(
+            server, port,
+            duration_secs=duration_secs, interval=interval,
+            phase=phase, timeout=timeout, padding=padding, verbose=False,
+        )
+        if phase_results is None:
+            print(
+                f"[ERROR] --twamp-backend nokia: Nokia twampy is not installed.\n"
+                f"        Install it with:  pip install twampy\n"
+                f"        Or use the built-in backend: --twamp-backend native",
+                file=sys.stderr,
+            )
+            phase_results = []
+    else:
+        phase_results = twamp_mod.run_twamp_probes(
+            server, port,
+            count=0, interval=interval,
+            phase=phase, duration_secs=duration_secs,
+            timeout=timeout, padding=padding, verbose=False,
+        )
+    results_list.extend(phase_results)
+    if attempt_stats is not None:
+        attempt_stats[phase] = {
+            'total': len(phase_results),
+            'valid': sum(1 for r in phase_results if not r.get('timed_out')),
+        }
+
+
+def print_twamp_section(twamp_mod, twamp_results, twamp_attempt_stats=None):
+    """Print the TWAMP BASELINE vs STRESS comparison table."""
+    print(f"\n{'='*72}")
+    print(f"{'ONE-WAY DELAY ANALYSIS (TWAMP-Light UDP‡)':^72}")
+    print(f"{'='*72}")
+    print(f"  Note: OWD is end-to-end only (UDP probes to TWAMP reflector).")
+    print(f"        FwdOWD‡/BwdOWD‡ are accurate only with NTP-synced clocks;")
+    print(f"        without sync they equal RTT/2. IPDV/jitter is always accurate.")
+
+    def _loss_pct(phase_tag):
+        if not twamp_attempt_stats:
+            return 0.0
+        s = twamp_attempt_stats.get(phase_tag, {})
+        return (1 - s['valid'] / s['total']) * 100 if s.get('total') else 0.0
+
+    phase_loss = {'BASELINE': _loss_pct('BASELINE'), 'STRESS': _loss_pct('STRESS')}
+    twamp_mod.print_phase_summary(twamp_results, phase_loss=phase_loss)
 
 
 # ---------------------------------------------------------------------------
@@ -1444,6 +1661,30 @@ def parse_args():
     owd.add_argument('--owd-timeout', type=float, default=DEFAULT_OWD_TIMEOUT, metavar='SECS',
                      help=f'Per-probe reply timeout for OWD keepalives (default: {DEFAULT_OWD_TIMEOUT}). '
                           'Increase if probes time out under heavy bufferbloat.')
+
+    twamp = p.add_argument_group(
+        'TWAMP-Light OWD measurement',
+        'UDP TWAMP-Light (RFC 5357) probes to a reflector. No root required. '
+        'Reports per-direction FwdOWD‡/BwdOWD‡ BASELINE vs STRESS comparison. '
+        f'Default server: {DEFAULT_TWAMP_SERVER}:{DEFAULT_TWAMP_PORT}.')
+    twamp.add_argument('--twamp', action='store_true',
+                       help='Enable TWAMP-Light OWD measurement alongside traceroute')
+    twamp.add_argument('--twamp-server', type=str, default=DEFAULT_TWAMP_SERVER, metavar='HOST',
+                       help=f'TWAMP reflector IP or hostname (default: {DEFAULT_TWAMP_SERVER})')
+    twamp.add_argument('--twamp-port', type=int, default=DEFAULT_TWAMP_PORT, metavar='PORT',
+                       help=f'TWAMP reflector UDP port (default: {DEFAULT_TWAMP_PORT})')
+    twamp.add_argument('--twamp-interval', type=float, default=DEFAULT_TWAMP_INTERVAL, metavar='SECS',
+                       help=f'Seconds between TWAMP probe packets (default: {DEFAULT_TWAMP_INTERVAL})')
+    twamp.add_argument('--twamp-timeout', type=float, default=DEFAULT_TWAMP_TIMEOUT, metavar='SECS',
+                       help=f'Per-probe receive timeout for TWAMP (default: {DEFAULT_TWAMP_TIMEOUT})')
+    twamp.add_argument('--twamp-padding', type=int, default=DEFAULT_TWAMP_PADDING, metavar='BYTES',
+                       help=f'Padding bytes appended to each sender packet (default: {DEFAULT_TWAMP_PADDING})')
+    twamp.add_argument('--twamp-backend', type=str, default=DEFAULT_TWAMP_BACKEND,
+                       choices=['native', 'nokia'],
+                       help="TWAMP sender backend: 'native' uses built-in RFC 5357 UDP client "
+                            "(per-probe data, full chart overlay); 'nokia' uses Nokia twampy "
+                            "subprocess (requires pip install twampy, summary stats only). "
+                            f"Default: {DEFAULT_TWAMP_BACKEND}")
     return p.parse_args()
 
 
@@ -1552,6 +1793,9 @@ def main():
     if args.owd:
         print(f"  OWD          : enabled (port={args.owd_port}  interval={args.owd_interval}s  "
               f"timeout={args.owd_timeout}s)")
+    if args.twamp:
+        print(f"  TWAMP        : enabled (server={args.twamp_server}:{args.twamp_port}  "
+              f"interval={args.twamp_interval}s  padding={args.twamp_padding}B)")
     print("=" * 72)
 
     # Discover route depth before baseline — used to filter shallow probes in BOTH phases
@@ -1587,6 +1831,23 @@ def main():
 
     owd_attempt_stats = {}
 
+    # --- TWAMP setup ---
+    twamp_mod      = None
+    twamp_enabled  = False
+    twamp_results  = []
+
+    if args.twamp:
+        twamp_mod = _load_twamp_owd()
+        if twamp_mod is not None:
+            twamp_enabled = True
+            print(f"[TWAMP] Reflector: {args.twamp_server}:{args.twamp_port}  "
+                  f"interval={args.twamp_interval}s  padding={args.twamp_padding}B")
+        else:
+            print("[WARN] --twamp requested but twamp_owd.py could not be loaded; TWAMP disabled.",
+                  file=sys.stderr)
+
+    twamp_attempt_stats = {}
+
     # --- Phase 1: Baseline ---
     if owd_enabled:
         _owd_t = threading.Thread(
@@ -1597,6 +1858,18 @@ def main():
             daemon=True,
         )
         _owd_t.start()
+
+    if twamp_enabled:
+        _twamp_t = threading.Thread(
+            target=_twamp_worker,
+            args=(twamp_mod, args.twamp_server, args.twamp_port,
+                  'BASELINE', args.baseline, args.twamp_interval,
+                  twamp_results, args.twamp_timeout, args.twamp_padding,
+                  twamp_attempt_stats),
+            kwargs={'backend': args.twamp_backend},
+            daemon=True,
+        )
+        _twamp_t.start()
 
     baseline_data, baseline_probes, baseline_lost, baseline_ts = \
         collect_latency_samples(
@@ -1611,6 +1884,8 @@ def main():
 
     if owd_enabled:
         _owd_t.join()
+    if twamp_enabled:
+        _twamp_t.join()
 
     # --- Phase 2: Stress ---
     traffic_proc = start_traffic_gen(
@@ -1635,6 +1910,18 @@ def main():
         )
         _owd_t.start()
 
+    if twamp_enabled:
+        _twamp_t = threading.Thread(
+            target=_twamp_worker,
+            args=(twamp_mod, args.twamp_server, args.twamp_port,
+                  'STRESS', args.stress, args.twamp_interval,
+                  twamp_results, args.twamp_timeout, args.twamp_padding,
+                  twamp_attempt_stats),
+            kwargs={'backend': args.twamp_backend},
+            daemon=True,
+        )
+        _twamp_t.start()
+
     try:
         stress_data, stress_probes, stress_lost, stress_ts = \
             collect_latency_samples(
@@ -1653,6 +1940,8 @@ def main():
         stop_traffic_gen(traffic_proc)
         if owd_enabled:
             _owd_t.join()
+        if twamp_enabled:
+            _twamp_t.join()
 
     # --- OWD post-processing ---
     if owd_enabled:
@@ -1662,6 +1951,10 @@ def main():
             owd_conn['sock'].close()
         except Exception:
             pass
+
+    # --- TWAMP post-processing ---
+    if twamp_enabled and twamp_results:
+        twamp_mod.compute_twamp_owd(twamp_results)
 
     # --- Analysis ---
     baseline_stats = compute_hop_stats(baseline_data)
@@ -1676,21 +1969,28 @@ def main():
                           owd_results=owd_results if owd_enabled else None,
                           target=args.target,
                           owd_attempt_stats=owd_attempt_stats if owd_enabled else None,
-                          h2_results=h2_results if owd_enabled and h2_results else None)
+                          h2_results=h2_results if owd_enabled and h2_results else None,
+                          twamp_results=twamp_results if twamp_enabled else None,
+                          twamp_attempt_stats=twamp_attempt_stats if twamp_enabled else None)
     if owd_enabled and owd_results:
         print_owd_section(tcp_owd, owd_results,
                           owd_attempt_stats=owd_attempt_stats if owd_enabled else None)
+    if twamp_enabled and twamp_results:
+        print_twamp_section(twamp_mod, twamp_results,
+                            twamp_attempt_stats=twamp_attempt_stats if twamp_enabled else None)
     print_throughput_summary(stress_ts)
     print_time_series_table(baseline_ts, stress_ts)
     print_ascii_chart(baseline_ts, stress_ts,
                       width=args.chart_width, height=args.chart_height,
-                      owd_results=owd_results if owd_enabled else None)
+                      owd_results=owd_results if owd_enabled else None,
+                      twamp_results=twamp_results if twamp_enabled else None)
     print_traffic_summary(traffic_log)
 
     # --- Save results ---
     if args.output:
         save_results_csv(args.output, baseline_stats, stress_stats, segments,
-                         baseline_ts, stress_ts)
+                         baseline_ts, stress_ts,
+                         twamp_results=twamp_results if twamp_enabled else None)
 
     # Cleanup temp stats file
     for f in (stats_file, stats_file + ".tmp", stats_file + ".log"):
