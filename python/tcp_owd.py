@@ -45,11 +45,13 @@ Usage:
 
 import argparse
 import atexit
+import collections
 import csv
 import logging
 import os
 import random
 import signal
+import socket as _socket_mod
 import statistics
 import subprocess
 import sys
@@ -603,6 +605,264 @@ def run_probes_async(target, port, conn, count, interval, verbose,
 
 
 # ---------------------------------------------------------------------------
+# Kernel-socket HTTP HEAD probes (M1/M2) — survive upload saturation
+# ---------------------------------------------------------------------------
+
+def connect_kernel_http(target, port, verbose=False):
+    """Establish a kernel TCP connection to target:port for HTTP HEAD probes.
+
+    Unlike tcp_handshake() (Scapy raw), this uses the kernel TCP stack so that
+    dropped segments are retransmitted automatically during upload saturation.
+
+    A brief Scapy sniffer captures the server TSval from the SYN-ACK for use
+    as the compute_owd() anchor.  If the sniffer misses the SYN-ACK (rare race),
+    srv_tsval_at_handshake=None and compute_owd()'s cal_shift backstop corrects it.
+
+    Returns a conn dict compatible with compute_owd() and run_probes_kernel_http().
+    The caller is responsible for closing conn['sock'] when done.
+    """
+    from scapy.all import sniff, TCP as ScapyTCP, conf as scapy_conf
+    scapy_conf.verb = 0
+
+    synack     = {}   # populated by sniffer callback
+    sniff_done = threading.Event()
+
+    def _cb(pkt):
+        if not pkt.haslayer(ScapyTCP):
+            return
+        tcp = pkt[ScapyTCP]
+        # SYN-ACK: SYN + ACK flags (0x12)
+        if (int(tcp.flags) & 0x12) == 0x12 and 'tsval' not in synack:
+            tsval, _ = _extract_ts(tcp)
+            if tsval is not None:
+                synack['tsval'] = tsval
+                synack['t_ns']  = time.monotonic_ns()
+
+    sniffer_t = threading.Thread(
+        target=lambda: sniff(
+            filter=f"tcp and src host {target} and src port {port}",
+            prn=_cb, store=False,
+            stop_filter=lambda _: sniff_done.is_set(),
+            timeout=5.0,
+        ),
+        daemon=True,
+    )
+    sniffer_t.start()
+    time.sleep(0.15)   # let pcap socket open before we send SYN
+
+    t_syn    = time.monotonic_ns()
+    sock     = _socket_mod.create_connection((target, port), timeout=10.0)
+    t_synack = time.monotonic_ns()
+    sport    = sock.getsockname()[1]
+    sniff_done.set()
+    sniffer_t.join(timeout=1.0)
+
+    sock.setsockopt(_socket_mod.IPPROTO_TCP, _socket_mod.TCP_NODELAY, 1)
+    rtt_hs = (t_synack - t_syn) / 1e6
+
+    if verbose:
+        tsval_s = str(synack.get('tsval')) if 'tsval' in synack else 'not captured'
+        print(f"  OWD probe connection established  RTT={rtt_hs:.1f} ms  srv_tsval={tsval_s}")
+
+    return {
+        'sock':                   sock,
+        'sport':                  sport,
+        'rtt_hs_ms':              rtt_hs,
+        't_synack_ns':            synack.get('t_ns', t_synack),
+        'srv_tsval_at_handshake': synack.get('tsval'),   # None → first-probe fallback in compute_owd
+    }
+
+
+def run_probes_kernel_http(target, port, conn, count, interval, verbose,
+                           phase=None, duration_secs=None, drain_timeout=5.0):
+    """Send HTTP HEAD probes via kernel TCP socket — survives upload saturation.
+
+    Unlike run_probes_async() which uses Scapy raw send() with no retransmission,
+    this function uses the kernel TCP stack so dropped segments are automatically
+    retransmitted.  Under upload saturation probes arrive late (high RTT) rather
+    than being lost entirely, matching the behaviour of M3 H2 PING.
+
+    conn: dict returned by connect_kernel_http().  The persistent socket is reused
+    across BASELINE and STRESS phases — do not close it between calls.
+
+    Response matching: HTTP/1.1 keep-alive on a single socket guarantees responses
+    arrive in the same order as requests (FIFO deque).
+
+    Returns list of result dicts compatible with compute_owd().
+    """
+    from scapy.all import sniff, TCP as ScapyTCP, conf as scapy_conf
+    scapy_conf.verb = 0
+
+    sock  = conn['sock']
+    sport = conn['sport']
+
+    HEAD_REQ = (
+        f"HEAD / HTTP/1.1\r\nHost: {target}\r\n"
+        f"Connection: keep-alive\r\n\r\n"
+    ).encode()
+
+    pending_queue   = collections.deque()  # probe entries in send order
+    incoming_tsvals = []                   # [(t_ns, tsval), ...]  server→client
+    results         = []
+    lock            = threading.Lock()
+
+    def _nearest_tsval(t_recv_ns, window_ns=10_000_000):   # 10 ms window
+        best, best_d = None, window_ns
+        for t_cap, tsval in incoming_tsvals:
+            d = abs(t_cap - t_recv_ns)
+            if d < best_d:
+                best, best_d = tsval, d
+        return best
+
+    # ── Thread B: Scapy sniffer — read-only, captures server TSval ──────────
+    _sniff_done  = threading.Event()
+    _max_sniff_t = (duration_secs or count * interval) + drain_timeout + 2.0
+
+    def _sniffer_cb(pkt):
+        if not pkt.haslayer(ScapyTCP):
+            return
+        tcp = pkt[ScapyTCP]
+        if tcp.sport != port or tcp.dport != sport:
+            return
+        tsval, _ = _extract_ts(tcp)
+        if tsval is None:
+            return
+        with lock:
+            incoming_tsvals.append((time.monotonic_ns(), tsval))
+
+    sniffer_t = threading.Thread(
+        target=lambda: sniff(
+            filter=f"tcp and src host {target} and src port {port} and dst port {sport}",
+            prn=_sniffer_cb, store=False,
+            stop_filter=lambda _: _sniff_done.is_set(),
+            timeout=_max_sniff_t,
+        ),
+        daemon=True,
+    )
+    sniffer_t.start()
+    time.sleep(0.15)
+
+    # ── Thread A: recv loop — read HTTP HEAD responses ───────────────────────
+    _recv_done = threading.Event()
+
+    def _recv_loop():
+        buf = b''
+        while not _recv_done.is_set():
+            try:
+                sock.settimeout(0.5)
+                chunk = sock.recv(4096)
+            except _socket_mod.timeout:
+                continue
+            except OSError:
+                break
+            if not chunk:
+                break
+            buf += chunk
+            t_recv = time.monotonic_ns()
+            # HTTP HEAD response has no body; ends at the first \r\n\r\n.
+            while b'\r\n\r\n' in buf:
+                end = buf.index(b'\r\n\r\n') + 4
+                buf = buf[end:]
+                with lock:
+                    if not pending_queue:
+                        continue
+                    info      = pending_queue.popleft()
+                    srv_tsval = _nearest_tsval(t_recv)
+                rtt_ms  = (t_recv - info['t_send_ns']) / 1e6
+                sgap_ms = ((info['t_send_ns'] - info['prev_t_send_ns']) / 1e6
+                           if info['prev_t_send_ns'] is not None else None)
+                rec = {
+                    'probe':         info['probe'],
+                    'phase':         phase,
+                    't_send_ns':     info['t_send_ns'],
+                    't_recv_ns':     t_recv,
+                    'rtt_ms':        rtt_ms,
+                    'fwd_owd_ms':    rtt_ms / 2,
+                    'bwd_owd_ms':    rtt_ms / 2,
+                    'srv_tsval':     srv_tsval,
+                    'srv_tsecr':     None,
+                    'send_gap_ms':   sgap_ms,
+                    'server_gap_ms': None,
+                    'fwd_ipdv_ms':   None,
+                    'bwd_ipdv_ms':   None,
+                }
+                with lock:
+                    results.append(rec)
+                if verbose:
+                    gap = f"{sgap_ms:.1f}" if sgap_ms is not None else '--'
+                    ph  = f'[{phase}] ' if phase else ''
+                    print(f"  {ph}probe {info['probe']:>3}: RTT={rtt_ms:7.2f} ms  "
+                          f"srv_tsval={srv_tsval}  send_gap={gap} ms")
+
+    recv_t = threading.Thread(target=_recv_loop, daemon=True)
+    recv_t.start()
+
+    # ── Thread C: send loop ─────────────────────────────────────────────────
+    prev_t   = None
+    probe_n  = 0
+    deadline = (time.monotonic() + duration_secs) if duration_secs else None
+
+    while True:
+        if deadline and time.monotonic() >= deadline:
+            break
+        if not deadline and probe_n >= count:
+            break
+        probe_n += 1
+        entry = {
+            'probe':          probe_n,
+            't_send_ns':      time.monotonic_ns(),
+            'prev_t_send_ns': prev_t,
+        }
+        with lock:
+            pending_queue.append(entry)
+        try:
+            sock.sendall(HEAD_REQ)
+        except OSError:
+            with lock:
+                if pending_queue and pending_queue[-1]['probe'] == probe_n:
+                    pending_queue.pop()
+            break
+        prev_t = entry['t_send_ns']
+        time.sleep(max(0.0, interval - (time.monotonic_ns() - entry['t_send_ns']) / 1e9))
+
+    # ── Drain window ────────────────────────────────────────────────────────
+    drain_end = time.monotonic() + drain_timeout
+    while time.monotonic() < drain_end:
+        with lock:
+            if not pending_queue:
+                break
+        time.sleep(0.05)
+
+    _recv_done.set()
+    recv_t.join(timeout=2.0)
+    _sniff_done.set()
+    sniffer_t.join(timeout=2.0)
+
+    with lock:
+        dropped     = list(pending_queue)
+        all_results = list(results)
+
+    for info in dropped:
+        if verbose:
+            ph = f'[{phase}] ' if phase else ''
+            print(f"  {ph}probe {info['probe']:>3}: DROPPED (no response in {drain_timeout:.0f}s)")
+        all_results.append({
+            'probe':       info['probe'],
+            'phase':       phase,
+            't_send_ns':   info['t_send_ns'],
+            'rtt_ms':      None,
+            'timed_out':   True,
+            'fwd_owd_ms':  None,
+            'bwd_owd_ms':  None,
+            'fwd_ipdv_ms': None,
+            'bwd_ipdv_ms': None,
+        })
+
+    all_results.sort(key=lambda r: r['probe'])
+    return all_results
+
+
+# ---------------------------------------------------------------------------
 # H2 PING probes — HTTP/2 PING frames over TLS (port 443)
 # ---------------------------------------------------------------------------
 
@@ -925,7 +1185,7 @@ def compute_owd(results, conn):
         bwd_owd_ms    = (t_recv_ns_i − T_server_tx_i) / 1e6  ← download (server→client)
         fwd_owd_ms    = rtt_ms_i − bwd_owd_ms               ← upload   (client→server)
 
-    Pass 1 — Hz estimation from first HZ_ESTIMATE_N valid probe pairs.
+    Pass 1 — Hz via OLS regression over all BASELINE probes (or all if no phase data).
     Pass 2 — direct per-probe OWD via TSval clock (independent per probe).
     Pass 3 — per-pair IPDV for verbose diagnostics (upload/download deltas).
 
@@ -938,30 +1198,31 @@ def compute_owd(results, conn):
     if len(valid) < 2:
         return
 
-    # Pass 1: Hz estimation — prefer ALL BASELINE pairs (clean network, no congestion).
-    # Hz error grows linearly with time from anchor; more BASELINE pairs → better median.
-    hz_samples = []
-    for i in range(1, len(valid)):
-        # only use BASELINE-phase pairs when phase info is present
-        if (valid[i].get('phase') and valid[i-1].get('phase')
-                and valid[i]['phase'] != 'BASELINE'):
-            continue
-        srv_delta = _ts_delta(valid[i]['srv_tsval'], valid[i-1]['srv_tsval'])
-        client_dt = (valid[i]['t_send_ns'] - valid[i-1]['t_send_ns']) / 1e9
-        if client_dt > 0 and srv_delta > 0:
-            hz_samples.append(srv_delta / client_dt)
-    if not hz_samples:
-        # standalone (no phases): fall back to first HZ_ESTIMATE_N pairs
-        for i in range(1, min(HZ_ESTIMATE_N + 1, len(valid))):
-            srv_delta = _ts_delta(valid[i]['srv_tsval'], valid[i-1]['srv_tsval'])
-            client_dt = (valid[i]['t_send_ns'] - valid[i-1]['t_send_ns']) / 1e9
-            if client_dt > 0 and srv_delta > 0:
-                hz_samples.append(srv_delta / client_dt)
-    if not hz_samples:
+    # Pass 1: Hz via OLS regression through origin over all BASELINE probes (or all if no
+    # phase data).  Each probe contributes one point: (elapsed_time_s, tsval_ticks_elapsed)
+    # anchored at the first valid probe.  Using the full probe span (seconds, not the 100ms
+    # of consecutive pairs) gives ~60× better Hz precision and eliminates systematic drift.
+    hz_probes = [r for r in valid
+                 if not r.get('phase') or r.get('phase') == 'BASELINE']
+    if len(hz_probes) < 2:
+        hz_probes = valid   # fallback: use all probes
+
+    t0_ns  = hz_probes[0]['t_send_ns']
+    S0_hz  = hz_probes[0]['srv_tsval']
+    pts = []
+    for r in hz_probes:
+        t_s = (r['t_send_ns'] - t0_ns) / 1e9
+        tv  = _ts_delta(r['srv_tsval'], S0_hz)
+        if t_s > 0 and tv > 0:
+            pts.append((t_s, tv))
+    if not pts:
         return
-    est_hz = statistics.median(hz_samples)
-    hz_sample_count = len(hz_samples)
-    if est_hz <= 0:
+    # OLS through origin: minimise sum((tv - Hz*t)^2) → Hz = sum(t*tv) / sum(t*t)
+    sum_t2  = sum(t * t  for t, tv in pts)
+    sum_ttv = sum(t * tv for t, tv in pts)
+    est_hz  = sum_ttv / sum_t2 if sum_t2 > 0 else None
+    hz_sample_count = len(pts)
+    if not est_hz or est_hz <= 0:
         return
 
     # Handshake anchor: server sent SYN-ACK with this TSval at this client time
@@ -1171,10 +1432,13 @@ def _print_method_comparison(http_results, h2_results=None):
         avg_h2    = statistics.mean(rtts_h2)
         n_h2      = len(valid_h2)
         tot_h2    = len(h2_results)
+        tsval_h2  = sum(1 for r in valid_h2 if r.get('srv_tsval') is not None)
         fwd_h2    = statistics.mean(fwds_h2) if fwds_h2 else avg_h2 / 2
         bwd_h2    = statistics.mean(bwds_h2) if bwds_h2 else avg_h2 / 2
         print(f"  {'M3: H2 PING (TLS port 443)':<22}  {'443':>4}  {avg_h2:>7.2f}ms  "
               f"{fwd_h2:>9.2f}ms  {bwd_h2:>9.2f}ms  {n_h2:>4}/{tot_h2}")
+        if tsval_h2 < n_h2:
+            print(f"  {'':22}  {'':4}  {'':8}  (OWD split from {tsval_h2}/{n_h2} TSval-valid probes)")
     else:
         print(f"  {'M3: H2 PING (TLS port 443)':<22}  {'443':>4}  "
               f"{'N/A':>8}  {'N/A':>10}  {'N/A':>10}  {'N/A':>8}")
@@ -1231,7 +1495,7 @@ def print_summary(results, rtt_hs_ms, h2_results=None):
     hz_n       = valid[0].get('hz_sample_count', 0) if valid else 0
     cal_shift  = max((r.get('cal_shift_ms', 0.0) for r in valid), default=0.0)
     if est_hz_val:
-        hz_line = f"  TSval clock : {est_hz_val} Hz  ({hz_n} pairs)"
+        hz_line = f"  TSval clock : {est_hz_val} Hz  ({hz_n} probes, OLS fit)"
         if cal_shift > 0:
             hz_line += f"  |  cal.shift +{cal_shift:.2f}ms"
             if cal_shift > 5:
@@ -1384,7 +1648,7 @@ def print_phase_summary(results, phase_loss=None, phase_jitter_override=None):
     print("    Fwd = upload (client\u2192server)  |  Bwd = download (server\u2192client)")
     print("  + = latency increased (worse);  \u2212 = latency decreased (better).")
     if est_hz_val:
-        hz_line = f"    TSval clock: {est_hz_val} Hz  ({hz_n} pairs used for Hz estimate)"
+        hz_line = f"    TSval clock: {est_hz_val} Hz  ({hz_n} probes, OLS fit)"
         if cal_shift > 0:
             hz_line += f"  |  calibration shift applied: +{cal_shift:.2f}ms"
             if cal_shift > 5:
@@ -1490,15 +1754,11 @@ def main():
     args = parse_args()
 
     if os.geteuid() != 0:
-        print("Error: tcp_owd.py requires root (raw socket + iptables).", file=sys.stderr)
+        print("Error: tcp_owd.py requires root (CAP_NET_RAW for Scapy sniffer).", file=sys.stderr)
         print("  sudo python3 tcp_owd.py --target ...", file=sys.stderr)
         sys.exit(1)
 
     two_phase = args.baseline > 0 or args.stress > 0
-
-    atexit.register(_remove_rst)
-    signal.signal(signal.SIGINT,  _sig_handler)
-    signal.signal(signal.SIGTERM, _sig_handler)
 
     print(f"\nTCP Timestamp OWD Estimator")
     print(f"  Target   : {args.target}:{args.port}")
@@ -1510,24 +1770,11 @@ def main():
     print(f"  Timeout  : {args.timeout}s per probe")
     print()
 
-    print("Installing iptables RST suppression ...")
-    try:
-        _install_rst(args.target)
-    except subprocess.CalledProcessError as exc:
-        print(f"Error: iptables failed: {exc}", file=sys.stderr)
-        sys.exit(1)
-
     conn    = None
     results = []
     tg_proc = None
     try:
-        print(f"Connecting to {args.target}:{args.port} ...")
-        conn = tcp_handshake(args.target, args.port, args.timeout, args.verbose)
-        print(f"  Handshake RTT : {conn['rtt_hs_ms']:.2f} ms")
-
-        print("Bootstrapping connection with HTTP HEAD request ...")
-        http_bootstrap(args.target, args.port, conn, args.timeout, args.verbose)
-        print("  Bootstrap OK.")
+        conn = connect_kernel_http(args.target, args.port, verbose=True)
         print()
 
         _drain = max(args.timeout * 2, 5.0)
@@ -1537,7 +1784,7 @@ def main():
 
             if args.baseline > 0:
                 print(f"Phase 1 — BASELINE ({args.baseline:.0f}s, network idle) ...")
-                baseline_results = run_probes_async(
+                baseline_results = run_probes_kernel_http(
                     args.target, args.port, conn,
                     count=0, interval=args.interval, verbose=args.verbose,
                     phase='BASELINE', duration_secs=args.baseline,
@@ -1557,7 +1804,7 @@ def main():
                 print()
 
                 print(f"Phase 2 — STRESS ({args.stress:.0f}s, network under load) ...")
-                stress_results = run_probes_async(
+                stress_results = run_probes_kernel_http(
                     args.target, args.port, conn,
                     count=0, interval=args.interval, verbose=args.verbose,
                     phase='STRESS', duration_secs=args.stress,
@@ -1576,7 +1823,7 @@ def main():
 
         else:
             print(f"Sending {args.count} HTTP HEAD probes ...")
-            results = run_probes_async(
+            results = run_probes_kernel_http(
                 args.target, args.port, conn,
                 count=args.count, interval=args.interval, verbose=args.verbose,
                 drain_timeout=_drain,
@@ -1584,15 +1831,16 @@ def main():
 
         compute_owd(results, conn)
 
-    except RuntimeError as exc:
+    except (RuntimeError, OSError) as exc:
         print(f"\nError: {exc}", file=sys.stderr)
     finally:
         if tg_proc is not None:
             stop_traffic_gen(tg_proc)
-        if conn:
-            tcp_teardown(args.target, args.port, conn)
-        _remove_rst()
-        print("\niptables rule removed.")
+        if conn and conn.get('sock'):
+            try:
+                conn['sock'].close()
+            except Exception:
+                pass
 
     if not results:
         sys.exit(1)

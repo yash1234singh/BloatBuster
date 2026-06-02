@@ -1277,7 +1277,7 @@ def _owd_worker(tcp_owd, target, port, conn, phase, duration_secs, interval,
     h2_buf = []
 
     def _run_http():
-        phase_results = tcp_owd.run_probes_async(
+        phase_results = tcp_owd.run_probes_kernel_http(
             target, port, conn,
             count=0, interval=interval, verbose=False,
             phase=phase, duration_secs=duration_secs,
@@ -1572,23 +1572,17 @@ def main():
 
     if args.owd:
         if os.geteuid() != 0:
-            print("[WARN] --owd requires root (raw socket + iptables); OWD disabled.",
+            print("[WARN] --owd requires root (CAP_NET_RAW for Scapy sniffer); OWD disabled.",
                   file=sys.stderr)
         else:
             tcp_owd = _load_tcp_owd()
             if tcp_owd is not None:
                 try:
-                    tcp_owd._install_rst(args.target)
-                    owd_conn = tcp_owd.tcp_handshake(
-                        args.target, args.owd_port, 2.0, False)
-                    tcp_owd.http_bootstrap(
-                        args.target, args.owd_port, owd_conn, 2.0, False)
+                    owd_conn = tcp_owd.connect_kernel_http(
+                        args.target, args.owd_port, verbose=True)
                     owd_enabled = True
-                    print(f"  OWD probe connection established  "
-                          f"RTT={owd_conn['rtt_hs_ms']:.1f} ms")
                 except Exception as exc:
                     print(f"[WARN] OWD setup failed: {exc}; OWD disabled.", file=sys.stderr)
-                    tcp_owd._remove_rst()
                     owd_conn = None
 
     owd_attempt_stats = {}
@@ -1664,8 +1658,10 @@ def main():
     if owd_enabled:
         tcp_owd.compute_owd(owd_results, owd_conn)   # HTTP HEAD (port 80) OWD
         # H2 PING OWD already computed per-phase inside _owd_worker
-        tcp_owd.tcp_teardown(args.target, args.owd_port, owd_conn)
-        tcp_owd._remove_rst()
+        try:
+            owd_conn['sock'].close()
+        except Exception:
+            pass
 
     # --- Analysis ---
     baseline_stats = compute_hop_stats(baseline_data)
