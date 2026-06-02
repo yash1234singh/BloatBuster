@@ -70,19 +70,20 @@ Discovery (1 traceroute):
 Phase 1: BASELINE (30s)
   ├─ Traceroute every 1s to all hops → record per-hop latency (no load)
   │  Probes reaching < min_probe_depth hops → counted as SHALLOW (lost)
-  └─ [--owd] OWD thread: fire-and-forget HTTP HEAD probes via send(); a daemon
-     thread runs sniff() to capture server ACKs; responses matched by TSecr (server
-     echoes our TSval back, RFC 7323). In-window data → exact TSecr match → correct RTT.
-     → FwdOWD†/BwdOWD†
+  └─ [--owd] OWD thread: HTTP HEAD probes over a persistent kernel TCP socket
+     (connect_kernel_http). Three sub-threads: recv loop matches responses via FIFO
+     deque; Scapy read-only sniffer captures server TSval; send loop paces probes at
+     --owd-interval. Kernel TCP retransmits dropped segments under upload saturation
+     → probes survive at high RTT instead of being lost. → FwdOWD†/BwdOWD†
 
 Phase 2: STRESS (60s default)
   ├─ Launch traffic-gen.py (30 DL + 50 UL threads browsing real websites)
   ├─ Traceroute every 1s to all hops → record per-hop latency (under load)
   │  Probes reaching < min_probe_depth hops → counted as SHALLOW (lost)
-  └─ [--owd] OWD thread: async HTTP HEAD probes on the SAME TCP connection
-     Bufferbloat probes (queued): return with real high RTT → large jitter
-     Drop-tail probes (discarded): timed_out=True, rtt_ms=None → high Loss%
-     100% probe loss under severe upload congestion = drop-tail signal
+  └─ [--owd] OWD thread: kernel-socket HTTP HEAD probes on the SAME TCP connection
+     Bufferbloat probes (queued, kernel retransmits): return with real high RTT → jitter
+     Drop-tail probes (ISP drops AND retransmit limit exceeded): timed_out=True → Loss%
+     Kernel retransmission means high RTT (not 100% loss) under upload saturation
 ```
 
 > **Shallow probe detection**: Under heavy congestion, routers drop ICMP TTL-exceeded packets to save CPU. Traceroute may only hear from local hops (e.g. hop 1 at 0.1 ms) rather than the full path. Without filtering, this 0.1 ms would corrupt baseline and stress RTT statistics. Probes that don't reach `min_probe_depth` hops are discarded and shown as `SHALLOW (N/M hops)` in the console output.
@@ -356,7 +357,7 @@ upload          187.52  463.39  139.85   13.61  391.88      20
 - `curl` (with HTTP/3/QUIC support optional)
 - `dd` (for upload data generation)
 - `traceroute` (`apt install traceroute`)
-- `scapy` + root (`pip install scapy`) — required only for `--owd`
+- `scapy` + root (`pip install scapy`) — required only for `--owd` (read-only sniffer for server TSval capture; no raw packet injection)
 
 ---
 
@@ -428,12 +429,16 @@ Supports two modes:
 #### How It Works
 
 **Connection setup:**
-1. Establishes a raw TCP connection (Scapy + iptables) to any open port on the target.
-2. Sends a real HTTP `HEAD` request to bootstrap the session so CDN infrastructure
-   (Cloudflare, Google, etc.) does not rate-limit subsequent probes.
-3. Sends HTTP HEAD probes (`seq = our_seq`, `flags=PA`) on the **same** connection.
-   The server echoes our exact `TSval` in the ACK `TSecr` field (RFC 7323), enabling
-   unambiguous probe matching and correct round-trip RTT measurement.
+1. Establishes a kernel TCP connection (`connect_kernel_http`) to any open HTTP port on
+   the target. A brief Scapy sniffer captures the SYN-ACK TSval as the OWD anchor.
+   No iptables RST suppression needed — the kernel manages the connection.
+2. Runs HTTP HEAD probes via `run_probes_kernel_http` using a 3-thread design:
+   - **Thread A (recv):** reads responses from the socket; FIFO `deque` matches each
+     response to its pending probe (HTTP/1.1 keep-alive guarantees request order).
+   - **Thread B (sniffer):** Scapy read-only capture of server TSval from incoming packets.
+   - **Thread C (send):** paces HEAD requests at `--interval` spacing.
+   Kernel TCP retransmits segments dropped by the ISP queue during upload saturation,
+   so probes arrive late (high RTT) rather than being lost — matching M3 H2 PING behavior.
 
 **Why a single established connection matters:**
 Modern hosts implement RFC 7323 §5.4 — each *new* TCP connection receives a unique
@@ -488,48 +493,36 @@ queue as bulk data.  This is essential — marking probes DSCP EF would let them
 the congested upload queue, showing propagation-only RTT (~30 ms) instead of the true
 bufferbloat RTT (~600 ms).
 
-**Async probing (fire-and-forget) — `run_probes_async()`:**
+**Kernel-socket probing — `run_probes_kernel_http()`:**
 
-When called from `userbufferTest.py`, all probes are sent without blocking (`send()`).
-A background **daemon thread** running `sniff()` captures server ACKs; each response is
-matched to its originating probe via `TSecr` (the server echoes our `TSval` back in every
-ACK). The response filter accepts **only pure ACK packets** (`flags == 0x10`) — this
-rejects TCP FIN/ACK frames that CDN edge servers (e.g. Cloudflare) send when an idle
-connection times out, which would otherwise be mistaken for probe responses. After all
-probes are sent, the drain window (`--owd-timeout`, default 2 s) collects late-arriving
-responses before declaring remaining probes dropped.
+Probes are sent over a persistent kernel TCP socket rather than Scapy raw sockets.
+The kernel's TCP stack automatically retransmits segments dropped by the ISP upload
+queue — probes survive congestion at higher RTT rather than being lost entirely.
+
+Three threads run concurrently:
 
 ```
-Main thread:                         sniff() daemon thread:
-  send probe 1 → pending[TSval1]       pkt (flags=ACK): TSecr=TSval1
-  send probe 2 → pending[TSval2]         → exact match → pop pending[TSval1]
-  send probe 3 → pending[TSval3]         → RTT = t_recv - t_send → results
-  ...                                  pkt (flags=ACK): TSecr=TSval3 (late, 1.8 s) → match
-  wait drain window (2 s)              pkt (flags=FIN|ACK): → rejected (flags≠0x10)
-  probe 2 still in pending → timed_out=True, rtt_ms=None (truly dropped)
+Thread C (send):    HEAD / HTTP/1.1 → kernel socket → (kernel retransmits if dropped)
+                      ↓ enqueue probe metadata → pending deque
+Thread A (recv):    socket.recv() → parse \r\n\r\n boundary → deque.popleft() → RTT
+                      ↕ nearest-TSval lookup from Thread B's captures
+Thread B (sniffer): Scapy read-only sniff → capture (t_ns, tsval) per incoming packet
 ```
+
+HTTP/1.1 keep-alive guarantees responses arrive in request order → FIFO `deque.popleft()`
+is an exact, unambiguous match (no TSval/TSecr lookup needed for response matching).
+
+After all probes are sent, the drain window (`--owd-timeout`, default 5 s) collects
+late-arriving responses (delayed by kernel retransmission) before declaring remaining
+probes dropped. Truly dropped probes are those the server never received even after
+retransmission — which indicates severe drop-tail beyond the kernel retransmit limit.
 
 Result:
-- **Bufferbloat** (probe queued, eventually responds): arrives at real high RTT (e.g. 800 ms) → `rtt_ms=800` → included in jitter naturally
-- **Drop-tail** (probe discarded, no response): `timed_out=True, rtt_ms=None` → counted as Loss%; jitter computed from surviving probes only
-**Probe format — HTTP HEAD requests (in-window data):**  The async prober
-(`run_probes_async`) sends `HEAD / HTTP/1.1` requests as probes.  These are *in-window* data
-segments (`seq=our_seq`, `flags=PA`): the server echoes our exact probe `TSval` in the ACK
-(`TSecr`), enabling **unambiguous one-to-one TSecr matching** and correct RTT measurement.
-The sniffer ACKs the server's HTTP response automatically to keep the TCP window clear.
-
-Keep-alives (`seq=our_seq-1`, *out-of-window*) are not used: RFC 7323 §3.4 prohibits servers
-from updating `TSecr` from out-of-window segments, so CDNs (Cloudflare, etc.) would echo the
-bootstrap `TSval` instead of the probe `TSval`, requiring an unreliable LIFO fallback.
-
-**TCP flag filtering in the response sniffer:**  The response handler explicitly filters:
-- **RST (0x04):** Connection reset — silently discarded; pending probe times out at drain window.
-- **FIN / FIN+ACK (0x01):** Server closing connection — discarded to prevent a FIN from being
-  matched as a probe response (the FIN's `TSecr` is the last valid TSval sent, not a probe key).
-- **Pure ACK (0x10) and PSH+ACK (0x18):** Accepted and matched via exact TSecr lookup.
+- **Bufferbloat** (kernel retransmits, probe arrives late): `rtt_ms` = real high RTT → jitter
+- **Severe drop-tail** (retransmit limit exceeded): `timed_out=True, rtt_ms=None` → Loss%
 
 **Known limitation (M2 probe method):** HTTP HEAD responses include variable server-side
-processing time (~0–50ms for CDN edge nodes). This adds noise to probe RTT (~±25ms) and
+processing time (~0–50 ms for CDN edge nodes). This adds noise to probe RTT (~±25 ms) and
 FwdIPDV measurements compared to a pure network echo. Phase *deltas* (BASELINE→STRESS change)
 remain reliable; absolute OWD values are estimates.
 
@@ -635,8 +628,9 @@ during STRESS is the primary indicator of upload path congestion.
   the minimum baseline FwdOWD, so both directions are non-negative.  The exact split
   between upload and download OWD is an estimate (no clock sync with the server), but
   **trends and phase deltas are accurate** — sufficient for bufferbloat diagnosis.
-- **Hz accuracy.** The server TSval clock rate is estimated from the first 10 probe pairs.
-  A 1% Hz error introduces ~1.2 ms drift over a 2-minute test — negligible in practice.
+- **Hz accuracy.** The server TSval clock rate is estimated via OLS regression over all
+  BASELINE probes (full probe span gives ~60× precision improvement over consecutive-pair
+  median). A residual Hz error introduces sub-millisecond OWD drift over a 2-minute test.
 - True directional OWD (as measured by TWAMP/RFC 5357) requires NTP/PTP-synchronized
   clocks on both ends.  This tool provides the closest achievable approximation without
   any clock infrastructure or remote software.
@@ -644,13 +638,13 @@ during STRESS is the primary indicator of upload path congestion.
   to 5 s for late responses before declaring drops. On a 60 s STRESS phase this adds ~5 s
   of wait time. On satellite or very high-latency links, increase the drain timeout to
   match the expected maximum queue delay.
-- **OWD probe loss under heavy upload congestion.** HTTP HEAD probes compete for the same
-  upload buffer as real traffic.  Under severe upload bufferbloat (drop-tail), probes queue
-  behind megabytes of pending data and either time out or are dropped entirely.
-  **100% probe loss during STRESS = confirmed drop-tail congestion** — a diagnostic signal,
-  not a measurement failure.  The **per-hop bloat table** (from traceroute) remains the
-  reliable magnitude signal; OWD probe loss % indicates whether the bottleneck queue is
-  drop-tail or AQM-managed.
+- **Kernel retransmission under upload congestion.** HTTP HEAD probes use a kernel TCP
+  socket (`run_probes_kernel_http`). The kernel retransmits segments dropped by the ISP
+  queue, so probes typically arrive with high RTT rather than being lost — matching M3
+  (H2 PING) behavior. Under extremely severe drop-tail (ISP queue full AND retransmit
+  limit exceeded), some probes may still be lost and appear as Loss%. The **per-hop bloat
+  table** (from traceroute) remains the most reliable magnitude signal; OWD probe loss %
+  indicates whether the bottleneck queue is drop-tail or AQM-managed.
 - **M2 probe RTT includes server processing time.** HTTP HEAD responses from CDN edge nodes
   include variable processing time (~0–50ms for Cloudflare).  Probe RTT range at idle is
   typically ~±25ms wider than traceroute ICMP RTT range.  Use M3 (H2 PING) for a cleaner
@@ -660,9 +654,9 @@ during STRESS is the primary indicator of upload path congestion.
   TLS or HTTP/2 (ALPN `h2` negotiation fails), M3 is skipped and only M1/M2 are reported.
   M3 also uses a separate TLS connection; its RTT includes TLS handshake overhead on the
   *first* probe only — subsequent probes are purely network + kernel ACK latency.
-- Linux only (requires `iptables` to suppress kernel-generated RST packets on the raw
-  Scapy connection for M1/M2).  Requires root or `CAP_NET_RAW`.  M3 (H2 PING) does not
-  need iptables suppression as it uses a normal kernel TCP connection.
+- Linux only. Requires root or `CAP_NET_RAW` (for the Scapy read-only sniffer that
+  captures server TSval). No iptables RST suppression needed — M1/M2 now use a kernel
+  TCP socket (same as M3); the kernel manages the connection state internally.
 
 #### CLI Options
 
@@ -744,13 +738,13 @@ jitter from the segment bloat table is the most trustworthy congestion magnitude
 
 ### Bufferbloat vs drop-tail congestion: different signals
 
-The async probing architecture (`run_probes_async` + `sniff()` daemon thread) correctly
+The kernel-socket probing architecture (`run_probes_kernel_http`) correctly
 distinguishes the two types of congestion:
 
 | Congestion type | OWD jitter (RTT range) | Loss% | Primary signal |
 |---|---|---|---|
-| **Bufferbloat** (queue building, packets delayed) | **Large** — queued probes return with real high RTT (e.g. 2500 ms) | Low | Jitter — large spread in received RTTs |
-| **Drop-tail** (queue full, packets discarded) | **Small** — only drain-gap survivors; `rtt_ms=None` for drops | **High (>50%)** | Loss% — probes are truly gone |
+| **Bufferbloat** (queue building, packets delayed) | **Large** — kernel retransmits; probes return with real high RTT (e.g. 2500 ms) | Low | Jitter — large spread in received RTTs |
+| **Severe drop-tail** (retransmit limit exceeded) | **Small** — drain-gap survivors; `rtt_ms=None` for drops | Higher — but less common (kernel retransmits most drops) | Loss% — probes truly gone |
 
 Under drop-tail, the surviving probes all hit queue-drain gaps and show similar low RTT
 (~25 ms), producing small jitter that understates congestion severity. Loss% is the correct
