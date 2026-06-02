@@ -1672,6 +1672,214 @@ def print_phase_summary(results, phase_loss=None, phase_jitter_override=None, rt
 
 
 # ---------------------------------------------------------------------------
+# Grand Summary — unified multi-method BASELINE vs STRESS table
+# ---------------------------------------------------------------------------
+
+_GSEP = '═' * 82
+
+
+def print_grand_summary(http_results, h2_results=None,
+                        rtt_hs_ms=0.0, phase_loss=None,
+                        throughput=None, http_port=80, h2_port=443,
+                        config=None):
+    """Print a unified BASELINE vs STRESS grand summary table.
+
+    Rows:
+      RTT  (HTTP :80)   avg  p95  loss%  |  avg  p95  loss%  |  Δavg  Δp95
+        ↑ Fwd [upload]  avg  p95    --   |  avg  p95    --   |  Δavg  Δp95
+        ↓ Bwd [dload]   avg  p95    --   |  avg  p95    --   |  Δavg  Δp95
+      H2 PING (:443)    avg  p95  loss%  |  avg  p95  loss%  |  Δavg  Δp95
+        ↑ Fwd [upload]  ...
+        ↓ Bwd [dload]   ...
+      ---separator---
+      Throughput DL     avg   --    --   |  avg   --    --   |  Δavg    --
+      Throughput UL     ...
+
+    Args:
+        http_results : M1/M2 HTTP HEAD probe list (with phase, rtt_ms, fwd_owd_ms, bwd_owd_ms)
+        h2_results   : M3 H2 PING probe list (same fields); None if not available
+        rtt_hs_ms    : handshake RTT for CDN detection
+        phase_loss   : {'BASELINE': pct, 'STRESS': pct} for HTTP probes; computed if None
+        throughput   : {'BASELINE': {'dl': Mbps, 'ul': Mbps}, 'STRESS': {...}}; None = omit
+        config       : optional dict with test params:
+                         target, baseline_secs, stress_secs, interval
+                       If None, values are derived from the result records.
+    """
+    def _phase_probes(results, phase):
+        return [r for r in results if r.get('phase') == phase and not r.get('timed_out')]
+
+    def _loss_pct(results, phase):
+        total = sum(1 for r in results if r.get('phase') == phase)
+        valid = sum(1 for r in results if r.get('phase') == phase and not r.get('timed_out'))
+        return (1 - valid / total) * 100 if total else 0.0
+
+    # Need at least BASELINE and STRESS phases in http_results
+    http_base  = _phase_probes(http_results, 'BASELINE')
+    http_stress = _phase_probes(http_results, 'STRESS')
+    if not http_base or not http_stress:
+        return
+
+    # CDN detection note
+    all_rtts = [r['rtt_ms'] for r in http_results if not r.get('timed_out')]
+    if rtt_hs_ms > 0 and rtt_hs_ms < 20 and all_rtts and statistics.mean(all_rtts) > rtt_hs_ms * 5:
+        avg_all = statistics.mean(all_rtts)
+        print(f"\n  \u26a0 CDN note: HTTP RTT ({avg_all:.0f}ms) >> handshake RTT ({rtt_hs_ms:.1f}ms).")
+        print(f"    Absolute OWD reflects CDN proxy path; IPDV and phase deltas remain valid.")
+
+    print(f"\n{_GSEP}")
+    print(f" GRAND SUMMARY — BASELINE vs STRESS")
+    print(_GSEP)
+
+    # Config / test-parameters block
+    cfg = config or {}
+
+    def _phase_duration(recs):
+        ts = [r['t_send_ns'] for r in recs if r.get('t_send_ns')]
+        return (max(ts) - min(ts)) / 1e9 if len(ts) > 1 else None
+
+    def _probe_interval(recs):
+        gaps = [r['send_gap_ms'] for r in recs if r.get('send_gap_ms')]
+        return statistics.median(gaps) / 1000 if gaps else None
+
+    all_base   = [r for r in http_results if r.get('phase') == 'BASELINE']
+    all_stress = [r for r in http_results if r.get('phase') == 'STRESS']
+
+    base_dur  = cfg.get('baseline_secs') or _phase_duration(all_base)
+    stress_dur = cfg.get('stress_secs')  or _phase_duration(all_stress)
+    interval  = cfg.get('interval')      or _probe_interval(all_base + all_stress)
+    target    = cfg.get('target', '')
+
+    n_base   = len(all_base)
+    n_stress = len(all_stress)
+    total_dur = (base_dur or 0) + (stress_dur or 0)
+
+    h2_port_str = f"   H2 PING :{h2_port}" if h2_results else ""
+    hs_str = f"   Handshake RTT: {rtt_hs_ms:.1f}ms" if rtt_hs_ms > 0 else ""
+    if target:
+        print(f"  Target  : {target}    HTTP :{http_port}{h2_port_str}{hs_str}")
+
+    base_str   = f"{base_dur:.0f}s ({n_base} probes)"   if base_dur   else f"({n_base} probes)"
+    stress_str = f"{stress_dur:.0f}s ({n_stress} probes)" if stress_dur else f"({n_stress} probes)"
+    total_str  = f"{total_dur:.0f}s" if total_dur else "—"
+    print(f"  Timing  : Baseline {base_str}  |  Stress {stress_str}  |  Total {total_str}")
+
+    if interval:
+        rate = 1.0 / interval
+        print(f"  Probing : interval {interval:.3g}s  (~{rate:.1f} probes/s per method)")
+
+    print('  ' + '─' * (len(_GSEP) - 2))
+
+    # Column widths
+    w = 8   # avg/p95 value width
+    lw = 6  # loss% column width
+    label_w = 26
+
+    hdr1 = (f"  {'':>{label_w}}  {'─── BASELINE ──────────':^{2*w+lw+4}}"
+            f"  {'─── STRESS ─────────────':^{2*w+lw+4}}"
+            f"  {'─── ΔCHANGE ────':^{2*w+2}}")
+    hdr2 = (f"  {'Metric':<{label_w}}  {'avg':>{w}}  {'p95':>{w}}  {'loss%':>{lw}}"
+            f"  {'avg':>{w}}  {'p95':>{w}}  {'loss%':>{lw}}"
+            f"  {'Δavg':>{w}}  {'Δp95':>{w}}")
+    sep  = '  ' + '─' * (len(hdr2) - 2)
+
+    print(hdr1)
+    print(hdr2)
+    print(sep)
+
+    def _row(label, base_vals, stress_vals, loss_b=None, loss_s=None, show_loss=True):
+        """Format one data row. Returns the formatted string."""
+        def _fmt(vals, pct):
+            if not vals:
+                return f"{'—':>{w}}", f"{'—':>{w}}"
+            return f"{statistics.mean(vals):>{w}.1f}", f"{_percentile(vals, pct):>{w}.1f}"
+        avg_b, p95_b = _fmt(base_vals, PERCENTILE_P95)
+        avg_s, p95_s = _fmt(stress_vals, PERCENTILE_P95)
+
+        if show_loss:
+            lb = f"{loss_b:>{lw}.1f}" if loss_b is not None else f"{'—':>{lw}}"
+            ls = f"{loss_s:>{lw}.1f}" if loss_s is not None else f"{'—':>{lw}}"
+        else:
+            lb = ls = f"{'—':>{lw}}"
+
+        if base_vals and stress_vals:
+            d_avg = statistics.mean(stress_vals) - statistics.mean(base_vals)
+            d_p95 = _percentile(stress_vals, PERCENTILE_P95) - _percentile(base_vals, PERCENTILE_P95)
+            da = f"{d_avg:>+{w}.1f}"
+            dp = f"{d_p95:>+{w}.1f}"
+        else:
+            da = dp = f"{'—':>{w}}"
+
+        return f"  {label:<{label_w}}  {avg_b}  {p95_b}  {lb}  {avg_s}  {p95_s}  {ls}  {da}  {dp}"
+
+    def _print_method_rows(label, results, loss_b, loss_s, port):
+        """Print RTT row + optional Fwd/Bwd OWD sub-rows for one method."""
+        base_v   = _phase_probes(results, 'BASELINE')
+        stress_v = _phase_probes(results, 'STRESS')
+        rtt_b  = [r['rtt_ms'] for r in base_v]
+        rtt_s  = [r['rtt_ms'] for r in stress_v]
+        print(_row(f"{label}  (:{port})", rtt_b, rtt_s, loss_b, loss_s, show_loss=True))
+
+        # Only show directional OWD split if compute_owd() was called (est_hz present)
+        owd_computed = any(r.get('est_hz') for r in base_v + stress_v)
+        if owd_computed:
+            fwd_b = [r['fwd_owd_ms'] for r in base_v   if r.get('fwd_owd_ms') is not None]
+            fwd_s = [r['fwd_owd_ms'] for r in stress_v if r.get('fwd_owd_ms') is not None]
+            bwd_b = [r['bwd_owd_ms'] for r in base_v   if r.get('bwd_owd_ms') is not None]
+            bwd_s = [r['bwd_owd_ms'] for r in stress_v if r.get('bwd_owd_ms') is not None]
+            print(_row('  \u2191 Fwd  [upload]', fwd_b, fwd_s, show_loss=False))
+            print(_row('  \u2193 Bwd  [dload]',  bwd_b, bwd_s, show_loss=False))
+
+    # HTTP HEAD (M1/M2)
+    lb_http = phase_loss.get('BASELINE') if phase_loss else _loss_pct(http_results, 'BASELINE')
+    ls_http = phase_loss.get('STRESS')   if phase_loss else _loss_pct(http_results, 'STRESS')
+    _print_method_rows('RTT  (HTTP)',  http_results, lb_http, ls_http, http_port)
+
+    # H2 PING (M3) — optional
+    if h2_results and (any(r.get('phase') == 'BASELINE' for r in h2_results) or
+                       any(r.get('phase') == 'STRESS'   for r in h2_results)):
+        lb_h2 = _loss_pct(h2_results, 'BASELINE')
+        ls_h2 = _loss_pct(h2_results, 'STRESS')
+        _print_method_rows('H2 PING', h2_results, lb_h2, ls_h2, h2_port)
+
+    # Throughput rows — optional
+    if throughput:
+        print(sep)
+        for direction, key in [('Throughput DL', 'dl'), ('Throughput UL', 'ul')]:
+            b_val = (throughput.get('BASELINE') or {}).get(key)
+            s_val = (throughput.get('STRESS')   or {}).get(key)
+            b_str = f"{b_val:>{w}.1f}" if b_val is not None else f"{'—':>{w}}"
+            s_str = f"{s_val:>{w}.1f}" if s_val is not None else f"{'—':>{w}}"
+            dash  = f"{'—':>{w}}"
+            dash_l = f"{'—':>{lw}}"
+            if b_val is not None and s_val is not None:
+                d_str = f"{s_val - b_val:>+{w}.1f}"
+            else:
+                d_str = dash
+            print(f"  {direction+' (Mbps)':<{label_w}}  {b_str}  {dash}  {dash_l}"
+                  f"  {s_str}  {dash}  {dash_l}  {d_str}  {dash}")
+
+    print(_GSEP)
+
+    # Diagnosis based on HTTP FwdOWD/BwdOWD — only when compute_owd() ran (est_hz present)
+    if any(r.get('est_hz') for r in http_base + http_stress):
+        def _ph_stats(recs):
+            fwds = [r['fwd_owd_ms'] for r in recs if r.get('fwd_owd_ms') is not None]
+            bwds = [r['bwd_owd_ms'] for r in recs if r.get('bwd_owd_ms') is not None]
+            return {
+                'fwd_avg': statistics.mean(fwds) if fwds else 0.0,
+                'bwd_avg': statistics.mean(bwds) if bwds else 0.0,
+                'fwd_p95': _percentile(fwds, PERCENTILE_P95),
+                'bwd_p95': _percentile(bwds, PERCENTILE_P95),
+            }
+        print(_owd_diagnosis(_ph_stats(http_base), _ph_stats(http_stress)))
+        print(_GSEP)
+    print("  \u2020 RTT = full round-trip.  Fwd = upload (client\u2192server)."
+          "  Bwd = download (server\u2192client).")
+    print("    loss% = probe timeouts.  \u0394 = STRESS \u2212 BASELINE (+ = worse).")
+    print(_GSEP)
+
+
+# ---------------------------------------------------------------------------
 # CSV export
 # ---------------------------------------------------------------------------
 
@@ -1933,9 +2141,15 @@ def main():
         print("\n  H2 PING: not available (port 443 closed or HTTP/2 not supported).")
 
     if two_phase:
-        print_phase_summary(results, rtt_hs_ms=conn['rtt_hs_ms'] if conn else 0.0)
-        if h2_results:
-            _print_method_comparison(results, h2_results)
+        print_grand_summary(results, h2_results or None,
+                            rtt_hs_ms=conn['rtt_hs_ms'] if conn else 0.0,
+                            http_port=args.port,
+                            config={
+                                'target':        args.target,
+                                'baseline_secs': args.baseline,
+                                'stress_secs':   args.stress,
+                                'interval':      args.interval,
+                            })
     else:
         print_summary(results, conn['rtt_hs_ms'] if conn else 0.0,
                       h2_results=h2_results)

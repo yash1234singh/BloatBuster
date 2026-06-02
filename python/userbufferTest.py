@@ -1462,7 +1462,21 @@ def _owd_worker(tcp_owd, target, port, conn, phase, duration_secs, interval,
         h2_results_list.extend(h2_buf)
 
 
-def print_owd_section(tcp_owd, owd_results, owd_attempt_stats=None):
+def _phase_throughput(baseline_ts, stress_ts):
+    """Compute per-phase average DL/UL throughput from time-series snapshots."""
+    def _avg(ts, key):
+        vals = [e[key] for e in ts if e.get(key, 0) > 0]
+        return sum(vals) / len(vals) if vals else None
+    return {
+        'BASELINE': {'dl': _avg(baseline_ts, 'dl_rate_mbps'),
+                     'ul': _avg(baseline_ts, 'ul_rate_mbps')},
+        'STRESS':   {'dl': _avg(stress_ts,   'dl_rate_mbps'),
+                     'ul': _avg(stress_ts,   'ul_rate_mbps')},
+    }
+
+
+def print_owd_section(tcp_owd, owd_results, owd_attempt_stats=None,
+                      h2_results=None, throughput=None, config=None):
     """Print the OWD BASELINE vs STRESS comparison table."""
     print(f"\n{'='*72}")
     print(f"{'ONE-WAY DELAY ANALYSIS (TCP Timestamp OWD†)':^72}")
@@ -1478,6 +1492,9 @@ def print_owd_section(tcp_owd, owd_results, owd_attempt_stats=None):
     # print_phase_summary computes FwdJitter/BwdJitter from fwd_ipdv_ms/bwd_ipdv_ms
     # ranges internally — no override needed.
     tcp_owd.print_phase_summary(owd_results, phase_loss=phase_loss)
+    tcp_owd.print_grand_summary(owd_results, h2_results=h2_results,
+                                phase_loss=phase_loss, throughput=throughput,
+                                config=config)
 
 
 # ---------------------------------------------------------------------------
@@ -1974,7 +1991,15 @@ def main():
                           twamp_attempt_stats=twamp_attempt_stats if twamp_enabled else None)
     if owd_enabled and owd_results:
         print_owd_section(tcp_owd, owd_results,
-                          owd_attempt_stats=owd_attempt_stats if owd_enabled else None)
+                          owd_attempt_stats=owd_attempt_stats if owd_enabled else None,
+                          h2_results=h2_results if owd_enabled and h2_results else None,
+                          throughput=_phase_throughput(baseline_ts, stress_ts),
+                          config={
+                              'target':        args.target,
+                              'baseline_secs': args.baseline,
+                              'stress_secs':   args.stress,
+                              'interval':      args.owd_interval,
+                          })
     if twamp_enabled and twamp_results:
         print_twamp_section(twamp_mod, twamp_results,
                             twamp_attempt_stats=twamp_attempt_stats if twamp_enabled else None)
