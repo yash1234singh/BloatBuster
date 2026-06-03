@@ -1540,6 +1540,18 @@ def _owd_diagnosis(b, s):
     fwd_d_p95 = s['fwd_p95'] - b['fwd_p95']
     bwd_d_p95 = s['bwd_p95'] - b['bwd_p95']
 
+    # RELIABILITY GUARD — When FwdOWD decreased significantly during stress,
+    # the baseline was elevated by CDN noise or measurement artifacts.
+    # Any directional verdict would be misleading; suppress it.
+    if fwd_d_avg < -OWD_DIAGNOSIS_THRESHOLD:
+        return (
+            f"  Diagnosis  : \u26a0 OWD verdict suppressed \u2014 FwdOWD was higher in BASELINE than STRESS\n"
+            f"               (\u0394avg={fwd_d_avg:+.0f}ms). Baseline dominated by CDN noise or measurement\n"
+            f"               artifacts. IPDV jitter asymmetry (above) is the reliable indicator.\n"
+            f"               FwdOWD\u2020 (upload)   \u0394avg={fwd_d_avg:>+7.1f}ms  \u0394p95={fwd_d_p95:>+7.1f}ms\n"
+            f"               BwdOWD\u2020 (download) \u0394avg={bwd_d_avg:>+7.1f}ms  \u0394p95={bwd_d_p95:>+7.1f}ms"
+        )
+
     fwd_worse = fwd_d_avg > OWD_DIAGNOSIS_THRESHOLD
     bwd_worse = bwd_d_avg > OWD_DIAGNOSIS_THRESHOLD
 
@@ -1805,10 +1817,10 @@ def print_grand_summary(http_results, h2_results=None,
 
     print('  ' + '─' * (len(_GSEP) - 2))
 
-    # Column widths
+    # Column widths — label_w=30 to fit "TWAMP  Bwd  (built-in :4200)"
     w = 8   # avg/p95 value width
     lw = 6  # loss% column width
-    label_w = 26
+    label_w = 30
 
     hdr1 = (f"  {'':>{label_w}}  {'─── BASELINE ──────────':^{2*w+lw+4}}"
             f"  {'─── STRESS ─────────────':^{2*w+lw+4}}"
@@ -1849,15 +1861,20 @@ def print_grand_summary(http_results, h2_results=None,
 
         return f"  {label:<{label_w}}  {avg_b}  {p95_b}  {lb}  {avg_s}  {p95_s}  {ls}  {da}  {dp}"
 
-    def _print_method_rows(label, results, loss_b, loss_s, port, always_owd=False):
-        """Print RTT row + optional Fwd/Bwd OWD sub-rows for one method."""
+    def _twamp_backend_label(backend):
+        return 'Nokia' if backend == 'nokia' else 'built-in'
+
+    def _print_method_rows(method_tag, results, loss_b, loss_s, port_str,
+                           always_owd=False):
+        """Print RTT row + Fwd/Bwd rows as equal-level full-width rows (loss% on all)."""
         base_v   = _phase_probes(results, 'BASELINE')
         stress_v = _phase_probes(results, 'STRESS')
-        rtt_b  = [r['rtt_ms'] for r in base_v]
-        rtt_s  = [r['rtt_ms'] for r in stress_v]
-        print(_row(f"{label}  (:{port})", rtt_b, rtt_s, loss_b, loss_s, show_loss=True))
+        rtt_b    = [r['rtt_ms'] for r in base_v]
+        rtt_s    = [r['rtt_ms'] for r in stress_v]
+        print(_row(f'{method_tag}  RTT  ({port_str})', rtt_b, rtt_s,
+                   loss_b, loss_s, show_loss=True))
 
-        # Show directional OWD split if compute_owd() was called (est_hz) or always_owd=True
+        # Show directional OWD if compute_owd() was called (est_hz) or always_owd=True
         owd_computed = always_owd or any(r.get('est_hz') for r in base_v + stress_v)
         if owd_computed:
             fwd_b = [r['fwd_owd_ms'] for r in base_v   if r.get('fwd_owd_ms') is not None]
@@ -1865,9 +1882,11 @@ def print_grand_summary(http_results, h2_results=None,
             bwd_b = [r['bwd_owd_ms'] for r in base_v   if r.get('bwd_owd_ms') is not None]
             bwd_s = [r['bwd_owd_ms'] for r in stress_v if r.get('bwd_owd_ms') is not None]
             if fwd_b or fwd_s:
-                print(_row('  \u2191 Fwd  [upload]', fwd_b, fwd_s, show_loss=False))
+                print(_row(f'{method_tag}  Fwd  ({port_str})', fwd_b, fwd_s,
+                           loss_b, loss_s, show_loss=True))
             if bwd_b or bwd_s:
-                print(_row('  \u2193 Bwd  [dload]',  bwd_b, bwd_s, show_loss=False))
+                print(_row(f'{method_tag}  Bwd  ({port_str})', bwd_b, bwd_s,
+                           loss_b, loss_s, show_loss=True))
 
     # ICMP Traceroute row — optional, shown first with a separator below
     if icmp_stats and icmp_stats.get('BASELINE') and icmp_stats.get('STRESS'):
@@ -1877,28 +1896,29 @@ def print_grand_summary(http_results, h2_results=None,
                    loss_b=ib.get('loss', 0.0), loss_s=is_.get('loss', 0.0)))
         print(sep)
 
-    # HTTP HEAD (M1/M2)
+    # HTTP HEAD — M1 RTT summary + M2 Fwd/Bwd OWD rows
     lb_http = phase_loss.get('BASELINE') if phase_loss else _loss_pct(http_results, 'BASELINE')
     ls_http = phase_loss.get('STRESS')   if phase_loss else _loss_pct(http_results, 'STRESS')
-    _print_method_rows('RTT  (HTTP)',  http_results, lb_http, ls_http, http_port)
+    _print_method_rows('TCP OWD', http_results, lb_http, ls_http,
+                       f'HTTP :{http_port}')
 
-    # H2 PING (M3) — optional
+    # H2 PING — M2 Fwd/Bwd OWD rows (always uses TSval OWD for H2)
     if h2_results and (any(r.get('phase') == 'BASELINE' for r in h2_results) or
                        any(r.get('phase') == 'STRESS'   for r in h2_results)):
         lb_h2 = _loss_pct(h2_results, 'BASELINE')
         ls_h2 = _loss_pct(h2_results, 'STRESS')
-        _print_method_rows('H2 PING', h2_results, lb_h2, ls_h2, h2_port)
+        _print_method_rows('H2 PING', h2_results, lb_h2, ls_h2, f':{h2_port}')
 
-    # TWAMP UDP — optional
+    # TWAMP UDP — M3 rows; backend label always explicit (built-in / Nokia)
     has_twamp = twamp_results and (any(r.get('phase') == 'BASELINE' for r in twamp_results) or
                                    any(r.get('phase') == 'STRESS'   for r in twamp_results))
     if has_twamp:
-        backend_label = f' ({twamp_backend})' if twamp_backend else ''
         lb_tw = _loss_pct(twamp_results, 'BASELINE')
         ls_tw = _loss_pct(twamp_results, 'STRESS')
         twamp_port = cfg.get('twamp_port', '?')
-        _print_method_rows(f'TWAMP UDP{backend_label}', twamp_results,
-                           lb_tw, ls_tw, twamp_port, always_owd=True)
+        backend_str = _twamp_backend_label(twamp_backend)
+        _print_method_rows('TWAMP', twamp_results, lb_tw, ls_tw,
+                           f'{backend_str} :{twamp_port}', always_owd=True)
 
     # Throughput rows — optional
     if throughput:
