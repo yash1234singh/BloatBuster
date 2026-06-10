@@ -60,6 +60,7 @@ import csv
 import math
 import os
 import re
+import shutil
 import signal
 import statistics
 import subprocess
@@ -1719,6 +1720,21 @@ def parse_args():
                             "(per-probe data, full chart overlay); 'nokia' uses Nokia twampy "
                             "subprocess (requires pip install twampy, summary stats only). "
                             f"Default: {DEFAULT_TWAMP_BACKEND}")
+
+    # --- Net Monitor integration ---
+    netmon = p.add_argument_group(
+        'System Infrastructure Telemetry (net_monitor)',
+        'Runs kernel-level subsystem monitoring (TC qdisc, IP link, softnet, '
+        'vmstat, iostat, mpstat) during the stress phase. Reports statistical '
+        'summary and burst analysis alongside bufferbloat results.')
+    netmon.add_argument('--netmon', action='store_true',
+                        help='Enable system infrastructure telemetry during stress phase')
+    netmon.add_argument('--netmon-interface', type=str, nargs='+', default=None, metavar='IFACE',
+                        help='Interface(s) for TC/IP_Link monitoring (space-separated; defaults to -I interface)')
+    netmon.add_argument('--netmon-prefix', type=str, default='', metavar='PREFIX',
+                        help='Command prefix for namespace/container execution '
+                             '(e.g. "denter atg4g" or "ip netns exec ns1")')
+
     return p.parse_args()
 
 
@@ -1731,6 +1747,689 @@ def check_traceroute():
         print("[ERROR] 'traceroute' not found. Install it: apt install traceroute",
               file=sys.stderr)
         sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# Net Monitor Integration
+# ---------------------------------------------------------------------------
+
+def _load_net_monitor():
+    """Import net_monitor module from the same directory."""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    if script_dir not in sys.path:
+        sys.path.insert(0, script_dir)
+    try:
+        import net_monitor
+        return net_monitor
+    except ImportError as e:
+        print(f"[WARN] Could not import net_monitor: {e}", file=sys.stderr)
+        return None
+
+
+def netmon_start(net_monitor_mod, interface, cmd_prefix=''):
+    """Start net_monitor polling threads for one interface. Returns context dict."""
+    nm = net_monitor_mod
+
+    # Set command prefix (for namespace/container execution)
+    prefix = cmd_prefix.strip()
+    pfx = (prefix + ' ') if prefix else ''
+    nm.CMD_PREFIX = pfx
+
+    # Reset module-level state for pre-flight
+    nm.working_tools.clear()
+    nm.stop_event.clear()
+    nm.metrics_buffer.update({m: 0.0 for tool in nm.TOOL_METRICS for m in nm.TOOL_METRICS[tool]})
+
+    # Run pre-flight checks
+    nm.pre_flight_checks(interface)
+    if not nm.working_tools:
+        print(f"[WARN] net_monitor ({interface}): no tools available, skipping.", file=sys.stderr)
+        return None
+
+    # Snapshot working_tools (module-level gets cleared on next interface call)
+    instance_tools = dict(nm.working_tools)
+
+    # Per-interface output directory
+    nm_out = f"net_out_{interface}"
+    if os.path.exists(nm_out):
+        shutil.rmtree(nm_out)
+    os.makedirs(nm_out)
+
+    # Per-instance buffer and lock (avoids conflicts with multiple interfaces)
+    inst_buffer = {m: 0.0 for tool in nm.TOOL_METRICS for m in nm.TOOL_METRICS[tool]}
+    inst_lock = threading.Lock()
+    inst_stop = threading.Event()
+
+    # Open CSV files
+    csv_files = {}
+    csv_writers = {}
+    for tool in instance_tools.keys():
+        path = os.path.join(nm_out, f"{tool.lower()}_metrics.csv")
+        f = open(path, 'w', newline='', encoding='utf-8')
+        writer = csv.writer(f)
+        writer.writerow(["Timestamp"] + nm.TOOL_METRICS[tool])
+        csv_files[tool] = f
+        csv_writers[tool] = writer
+
+    # Per-instance worker
+    def _inst_worker(tool_name, iface, prefix_str):
+        while not inst_stop.is_set():
+            t0 = time.time()
+            try:
+                if tool_name == "TC":
+                    cmd = f"{prefix_str}tc -s qdisc show dev {iface}".split()
+                    res = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL)
+                    sent_bytes = sum(map(float, re.findall(r"Sent\s+(\d+)\s+bytes", res)))
+                    sent_pkts = sum(map(float, re.findall(r"bytes\s+(\d+)\s+pkt", res)))
+                    dropped = sum(map(float, re.findall(r"dropped\s+(\d+)", res)))
+                    overlimits = sum(map(float, re.findall(r"overlimits\s+(\d+)", res)))
+                    requeues = sum(map(float, re.findall(r"requeues\s+(\d+)", res)))
+                    backlog_b = sum(map(float, re.findall(r"backlog\s+(\d+)b", res)))
+                    backlog_p = sum(map(float, re.findall(r"backlog\s+\S+\s+(\d+)p", res)))
+                    with inst_lock:
+                        inst_buffer["tc_total_sent_bytes"] = sent_bytes
+                        inst_buffer["tc_total_sent_pkts"] = sent_pkts
+                        inst_buffer["tc_total_dropped"] = dropped
+                        inst_buffer["tc_total_overlimits"] = overlimits
+                        inst_buffer["tc_total_requeues"] = requeues
+                        inst_buffer["tc_max_backlog_bytes"] = backlog_b
+                        inst_buffer["tc_max_backlog_pkts"] = backlog_p
+                elif tool_name == "IP_Link":
+                    cmd = f"{prefix_str}ip -s link show dev {iface}".split()
+                    res = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL)
+                    lines = [l.strip() for l in res.splitlines()]
+                    rx_bytes = rx_pkts = rx_err = rx_drp = rx_ovr = 0
+                    tx_bytes = tx_pkts = tx_err = tx_drp = tx_col = 0
+                    for i, l in enumerate(lines):
+                        if l.startswith("RX:") and i + 1 < len(lines):
+                            vals = lines[i+1].split()
+                            if len(vals) >= 5:
+                                rx_bytes, rx_pkts, rx_err, rx_drp, rx_ovr = map(float, vals[:5])
+                        elif l.startswith("TX:") and i + 1 < len(lines):
+                            vals = lines[i+1].split()
+                            if len(vals) >= 5:
+                                tx_bytes, tx_pkts, tx_err, tx_drp, tx_col = map(float, vals[:5])
+                    with inst_lock:
+                        inst_buffer["ip_rx_bytes"] = rx_bytes
+                        inst_buffer["ip_rx_pkts"] = rx_pkts
+                        inst_buffer["ip_rx_errors"] = rx_err
+                        inst_buffer["ip_rx_dropped"] = rx_drp
+                        inst_buffer["ip_rx_overrun"] = rx_ovr
+                        inst_buffer["ip_tx_bytes"] = tx_bytes
+                        inst_buffer["ip_tx_pkts"] = tx_pkts
+                        inst_buffer["ip_tx_errors"] = tx_err
+                        inst_buffer["ip_tx_dropped"] = tx_drp
+                        inst_buffer["ip_tx_colls"] = tx_col
+                elif tool_name == "Softnet":
+                    if prefix_str:
+                        cmd = f"{prefix_str}cat /proc/net/softnet_stat".split()
+                        text = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL)
+                        sn_lines = text.splitlines()
+                    else:
+                        with open("/proc/net/softnet_stat", "r") as sf:
+                            sn_lines = sf.readlines()
+                    rcv = drp = sqz = 0
+                    for sl in sn_lines:
+                        parts = sl.split()
+                        if len(parts) >= 3:
+                            rcv += int(parts[0], 16)
+                            drp += int(parts[1], 16)
+                            sqz += int(parts[2], 16)
+                    with inst_lock:
+                        inst_buffer["softnet_received"] = float(rcv)
+                        inst_buffer["softnet_dropped"] = float(drp)
+                        inst_buffer["softnet_squeezed"] = float(sqz)
+                elif tool_name == "VMstat":
+                    cmd = f"{prefix_str}vmstat 1 2".split()
+                    res = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL).splitlines()[-1].split()
+                    with inst_lock:
+                        inst_buffer["vm_r"] = float(res[0])
+                        inst_buffer["vm_b"] = float(res[1])
+                        inst_buffer["vm_si"] = float(res[6])
+                        inst_buffer["vm_so"] = float(res[7])
+                elif tool_name == "IOstat":
+                    cmd = f"{prefix_str}iostat 1 2".split()
+                    res = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL).splitlines()
+                    for row in reversed(res):
+                        if row.strip() and not any(row.startswith(x) for x in ["Linux", "avg-cpu", "Device"]):
+                            parts = row.split()
+                            if len(parts) >= 4:
+                                with inst_lock:
+                                    inst_buffer["io_tps"] = float(parts[1])
+                                    inst_buffer["io_read_kb"] = float(parts[2])
+                                    inst_buffer["io_wrtn_kb"] = float(parts[3])
+                                break
+                elif tool_name == "MPstat":
+                    cmd = f"{prefix_str}mpstat 1 1".split()
+                    res = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL).splitlines()[-1].split()
+                    with inst_lock:
+                        inst_buffer["cpu_user"] = float(res[2])
+                        inst_buffer["cpu_system"] = float(res[4])
+                        inst_buffer["cpu_iowait"] = float(res[5])
+                        inst_buffer["cpu_softirq"] = float(res[7])
+                        inst_buffer["cpu_idle"] = float(res[11])
+            except Exception:
+                pass
+            dt = time.time() - t0
+            time.sleep(max(0.05, nm.INTERVAL - dt))
+
+    # Start polling threads
+    threads = []
+    for tool in instance_tools.keys():
+        t = threading.Thread(target=_inst_worker, args=(tool, interface, pfx), daemon=True)
+        threads.append(t)
+        t.start()
+
+    # Start CSV logging thread
+    log_stop = threading.Event()
+
+    def _csv_logger():
+        while not log_stop.is_set():
+            time.sleep(nm.INTERVAL)
+            t_stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            with inst_lock:
+                snapshot = inst_buffer.copy()
+            for tool, writer in csv_writers.items():
+                row = [t_stamp] + [snapshot[m] for m in nm.TOOL_METRICS[tool]]
+                writer.writerow(row)
+                csv_files[tool].flush()
+
+    log_t = threading.Thread(target=_csv_logger, daemon=True)
+    log_t.start()
+
+    return {
+        'module': nm,
+        'csv_files': csv_files,
+        'csv_writers': csv_writers,
+        'threads': threads,
+        'log_thread': log_t,
+        'log_stop': log_stop,
+        'inst_stop': inst_stop,
+        'interface': interface,
+        'output_dir': nm_out,
+        'instance_tools': instance_tools,
+    }
+
+
+def netmon_stop(ctx):
+    """Stop net_monitor and return aggregated data."""
+    if ctx is None:
+        return None
+
+    nm = ctx['module']
+    # Signal per-instance workers to stop
+    ctx['inst_stop'].set()
+    ctx['log_stop'].set()
+    # Wait for logger thread to finish its current write before closing files
+    ctx['log_thread'].join(timeout=3)
+
+    for f in ctx['csv_files'].values():
+        f.close()
+
+    # Parse CSVs from per-instance output directory
+    nm_out = ctx['output_dir']
+    instance_tools = ctx['instance_tools']
+    aggregated_data = {}
+    for tool in instance_tools.keys():
+        csv_path = os.path.join(nm_out, f"{tool.lower()}_metrics.csv")
+        if not os.path.exists(csv_path):
+            continue
+        timestamps = []
+        metrics_lists = {m: [] for m in nm.TOOL_METRICS[tool]}
+        with open(csv_path, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                timestamps.append(datetime.strptime(row["Timestamp"], "%Y-%m-%d %H:%M:%S"))
+                for m in nm.TOOL_METRICS[tool]:
+                    metrics_lists[m].append(float(row[m]))
+        if timestamps:
+            aggregated_data[tool] = {"times": timestamps, "data": metrics_lists}
+
+    return aggregated_data
+
+
+def netmon_print_report(nm, aggregated_data, interface):
+    """Print the net_monitor report section."""
+    if not aggregated_data:
+        return
+
+    duration = 0
+    for tool, pkg in aggregated_data.items():
+        if len(pkg["times"]) > 1:
+            duration = (pkg["times"][-1] - pkg["times"][0]).total_seconds()
+            break
+
+    print(f"\n{'='*95}")
+    print(f" SYSTEM INFRASTRUCTURE TELEMETRY (stress phase: {duration:.0f}s on {interface})")
+    print("=" * 95)
+
+    # Statistical tables
+    print(f"\n\033[1m[A] STATISTICAL DATA SUMMARY PER SUBSYSTEM\033[0m")
+    print("-" * 95)
+    print("  \033[90m(Cumulative counters shown as session delta \u0394)\033[0m")
+    for tool, package in aggregated_data.items():
+        samples = len(package["times"])
+        dur = (package["times"][-1] - package["times"][0]).total_seconds() if samples > 1 else 0
+        print(f"\n  \033[1mSubsystem: [{tool}]\033[0m  |  Samples: {samples}  |  Duration: {dur:.0f}s")
+        cumul_keys = nm.CUMULATIVE_METRICS.get(tool, [])
+        metrics_data = {m: package["data"][m] for m in nm.TOOL_METRICS[tool]}
+        nm.print_stats_table(tool, metrics_data, cumul_keys)
+
+    # Burst analysis
+    print(f"\n\033[1m[B] BURST ANALYSIS\033[0m")
+    print("-" * 95)
+    is_bursting = False
+
+    if "IP_Link" in aggregated_data:
+        rx_b = aggregated_data["IP_Link"]["data"]["ip_rx_bytes"]
+        tx_b = aggregated_data["IP_Link"]["data"]["ip_tx_bytes"]
+        rx_session = nm._baseline_subtract(rx_b)
+        tx_session = nm._baseline_subtract(tx_b)
+        rx_deltas = nm._compute_deltas(rx_b)
+        tx_deltas = nm._compute_deltas(tx_b)
+        max_rx = (max(rx_deltas) / 1024 / 1024) if rx_deltas else 0
+        max_tx = (max(tx_deltas) / 1024 / 1024) if tx_deltas else 0
+        total_rx = (rx_session[-1] / 1024 / 1024) if rx_session else 0
+        total_tx = (tx_session[-1] / 1024 / 1024) if tx_session else 0
+        print(f"  Session Transfer: Inbound: {total_rx:.2f} MB | Outbound: {total_tx:.2f} MB")
+        print(f"  Peak Burst Rate:  Inbound: {max_rx:.2f} MB/s | Outbound: {max_tx:.2f} MB/s")
+        if max_rx > 15 or max_tx > 15:
+            print("  --> \033[93mMICROBURST DETECTED\033[0m")
+            is_bursting = True
+
+    if "Softnet" in aggregated_data:
+        sf_drp = nm._baseline_subtract(aggregated_data["Softnet"]["data"]["softnet_dropped"])[-1]
+        sf_sqz = nm._baseline_subtract(aggregated_data["Softnet"]["data"]["softnet_squeezed"])[-1]
+        if sf_drp > 0 or sf_sqz > 0:
+            print(f"  Softnet: Drops: +{sf_drp:.0f} | Squeezed: +{sf_sqz:.0f} during test")
+            print("  --> CPU cores stalling on ring buffer drain")
+            is_bursting = True
+
+    if "TC" in aggregated_data:
+        tc_drp = nm._baseline_subtract(aggregated_data["TC"]["data"]["tc_total_dropped"])[-1]
+        if tc_drp > 0:
+            print(f"  TC Qdisc Drops: +{tc_drp:.0f} during test")
+            is_bursting = True
+
+    if not is_bursting:
+        print("  [+] No kernel-level burst anomalies during test window.")
+
+    # Sysctl snapshot
+    nm.collect_and_report_sysctl_queue_params()
+    print("=" * 95)
+
+
+# ---------------------------------------------------------------------------
+# Matplotlib Graphical Report
+# ---------------------------------------------------------------------------
+
+def generate_full_plot(baseline_ts, stress_ts, owd_results=None, twamp_results=None,
+                       netmon_data=None, netmon_mod=None, output_path=None):
+    """Generate comprehensive matplotlib figure with all test data + stats."""
+    try:
+        import matplotlib
+        matplotlib.use('Agg')  # Headless-safe backend (no X11/DISPLAY needed)
+        import matplotlib.pyplot as plt
+        from matplotlib.gridspec import GridSpec
+    except ImportError:
+        print("[WARN] matplotlib not installed, skipping graphical output.", file=sys.stderr)
+        return
+
+    if output_path is None:
+        output_path = "bufferbloat_analysis.png"
+
+    # Collect all time-series datasets
+    panels = []  # list of (title, plot_func) — each draws into an axes
+
+    # --- Panel 1: RTT over time ---
+    # Collect elapsed + timestamps for dual x-axis labeling
+    _baseline_elapsed = [e['elapsed'] for e in baseline_ts if e['e2e_rtt'] is not None]
+    _baseline_ts_labels = [e['ts'] for e in baseline_ts if e['e2e_rtt'] is not None]
+    _baseline_rtt_vals = [e['e2e_rtt'] for e in baseline_ts if e['e2e_rtt'] is not None]
+    _stress_elapsed = [e['elapsed'] for e in stress_ts if e['e2e_rtt'] is not None]
+    _stress_ts_labels = [e['ts'] for e in stress_ts if e['e2e_rtt'] is not None]
+    _stress_rtt_vals = [e['e2e_rtt'] for e in stress_ts if e['e2e_rtt'] is not None]
+
+    def _plot_rtt(ax):
+        all_elapsed = _baseline_elapsed + _stress_elapsed
+        all_labels = _baseline_ts_labels + _stress_ts_labels
+        if _baseline_rtt_vals:
+            ax.plot(_baseline_elapsed, _baseline_rtt_vals, 'g-', lw=1.2, alpha=0.7, label='Baseline RTT')
+        if _stress_rtt_vals:
+            ax.plot(_stress_elapsed, _stress_rtt_vals, 'r-', lw=1.5, label='Stress RTT')
+        # Dual x-axis: elapsed seconds + timestamps every ~5s
+        if all_elapsed:
+            step = max(1, len(all_elapsed) // 10)
+            tick_idx = [i for i in range(len(all_elapsed)) if i % step == 0]
+            if len(all_elapsed) - 1 not in tick_idx:
+                tick_idx.append(len(all_elapsed) - 1)
+            ax.set_xticks([all_elapsed[i] for i in tick_idx])
+            ax.set_xticklabels(
+                [f"{all_elapsed[i]:.0f}s\n{all_labels[i]}" for i in tick_idx],
+                rotation=0, ha='center', fontsize=7)
+        ax.set_xlabel("Elapsed (s) / Time")
+        ax.set_ylabel("RTT (ms)")
+        ax.legend(loc='upper right', fontsize=8)
+        # Stats annotation
+        if _stress_rtt_vals:
+            s = _quick_stats(_stress_rtt_vals)
+            ax.text(0.02, 0.95, _stats_annotation("Stress RTT", s, "ms"),
+                    transform=ax.transAxes, fontsize=7, fontfamily='monospace',
+                    va='top', bbox=dict(facecolor='white', alpha=0.8))
+
+    panels.append(("End-to-End RTT", _plot_rtt))
+
+    # --- Panel 2: Throughput over time ---
+    _stress_tp_elapsed = [e['elapsed'] for e in stress_ts]
+    _stress_tp_labels = [e['ts'] for e in stress_ts]
+    _stress_dl_vals = [e['dl_rate_mbps'] for e in stress_ts]
+    _stress_ul_vals = [e['ul_rate_mbps'] for e in stress_ts]
+
+    def _plot_throughput(ax):
+        if _stress_dl_vals:
+            ax.fill_between(_stress_tp_elapsed, _stress_dl_vals, alpha=0.3, color='blue', label='DL')
+            ax.plot(_stress_tp_elapsed, _stress_dl_vals, 'b-', lw=1.2)
+        if _stress_ul_vals:
+            ax.fill_between(_stress_tp_elapsed, _stress_ul_vals, alpha=0.2, color='orange', label='UL')
+            ax.plot(_stress_tp_elapsed, _stress_ul_vals, color='orange', lw=1.2)
+        ax.set_ylabel("Throughput (Mbps)")
+        ax.legend(loc='upper right', fontsize=8)
+        # Dual x-axis labels
+        if _stress_tp_elapsed:
+            step = max(1, len(_stress_tp_elapsed) // 10)
+            tick_idx = [i for i in range(len(_stress_tp_elapsed)) if i % step == 0]
+            if len(_stress_tp_elapsed) - 1 not in tick_idx:
+                tick_idx.append(len(_stress_tp_elapsed) - 1)
+            ax.set_xticks([_stress_tp_elapsed[i] for i in tick_idx])
+            ax.set_xticklabels(
+                [f"{_stress_tp_elapsed[i]:.0f}s\n{_stress_tp_labels[i]}" for i in tick_idx],
+                rotation=0, ha='center', fontsize=7)
+        ax.set_xlabel("Elapsed (s) / Time")
+        # Stats
+        dl_vals = [v for v in _stress_dl_vals if v > 0]
+        ul_vals = [v for v in _stress_ul_vals if v > 0]
+        txt = ""
+        if dl_vals:
+            txt += _stats_annotation("DL", _quick_stats(dl_vals), "Mbps") + "\n"
+        if ul_vals:
+            txt += _stats_annotation("UL", _quick_stats(ul_vals), "Mbps")
+        if txt:
+            ax.text(0.02, 0.95, txt.strip(), transform=ax.transAxes, fontsize=7,
+                    fontfamily='monospace', va='top',
+                    bbox=dict(facecolor='white', alpha=0.8))
+
+    panels.append(("Throughput (Stress Phase)", _plot_throughput))
+
+    # --- Panel 3: OWD if available ---
+    if owd_results:
+        # OWD probes use t_send_ns (nanoseconds) — compute elapsed seconds per phase
+        _owd_base = [r for r in owd_results if r.get('phase') == 'BASELINE']
+        _owd_stress = [r for r in owd_results if r.get('phase') == 'STRESS']
+        _owd_base_t0 = min((r['t_send_ns'] for r in _owd_base), default=0) / 1e9
+        _owd_stress_t0 = min((r['t_send_ns'] for r in _owd_stress), default=0) / 1e9
+        baseline_owd = [(r['t_send_ns'] / 1e9 - _owd_base_t0, r.get('fwd_owd_ms'), r.get('bwd_owd_ms'))
+                        for r in _owd_base]
+        stress_owd = [(r['t_send_ns'] / 1e9 - _owd_stress_t0, r.get('fwd_owd_ms'), r.get('bwd_owd_ms'))
+                      for r in _owd_stress]
+
+        def _plot_owd(ax):
+            for data, phase, ls in [(baseline_owd, 'Base', '--'), (stress_owd, 'Stress', '-')]:
+                fwd = [(t, f) for t, f, b in data if f is not None]
+                bwd = [(t, b) for t, f, b in data if b is not None]
+                if fwd:
+                    x, y = zip(*fwd)
+                    ax.plot(x, y, ls, color='red', lw=1.2, alpha=0.8, label=f'Fwd {phase}')
+                if bwd:
+                    x, y = zip(*bwd)
+                    ax.plot(x, y, ls, color='blue', lw=1.2, alpha=0.8, label=f'Bwd {phase}')
+            ax.set_ylabel("OWD (ms)")
+            ax.legend(loc='upper right', fontsize=7)
+            # Stats for stress phase
+            fwd_vals = [f for _, f, _ in stress_owd if f is not None]
+            bwd_vals = [b for _, _, b in stress_owd if b is not None]
+            txt = ""
+            if fwd_vals:
+                txt += _stats_annotation("Fwd", _quick_stats(fwd_vals), "ms") + "\n"
+            if bwd_vals:
+                txt += _stats_annotation("Bwd", _quick_stats(bwd_vals), "ms")
+            if txt:
+                ax.text(0.02, 0.95, txt.strip(), transform=ax.transAxes, fontsize=7,
+                        fontfamily='monospace', va='top',
+                        bbox=dict(facecolor='white', alpha=0.8))
+
+        panels.append(("TCP One-Way Delay (OWD)", _plot_owd))
+
+    # --- Panel 4: TWAMP if available ---
+    if twamp_results:
+        # TWAMP probes use t1_posix (float seconds) — compute elapsed per phase
+        _tw_base = [r for r in twamp_results if r.get('phase') == 'BASELINE' and r.get('t1_posix')]
+        _tw_stress = [r for r in twamp_results if r.get('phase') == 'STRESS' and r.get('t1_posix')]
+        _tw_base_t0 = min((r['t1_posix'] for r in _tw_base), default=0)
+        _tw_stress_t0 = min((r['t1_posix'] for r in _tw_stress), default=0)
+        baseline_twamp = [(r['t1_posix'] - _tw_base_t0, r.get('fwd_owd_ms'), r.get('bwd_owd_ms'))
+                          for r in _tw_base]
+        stress_twamp = [(r['t1_posix'] - _tw_stress_t0, r.get('fwd_owd_ms'), r.get('bwd_owd_ms'))
+                        for r in _tw_stress]
+
+        def _plot_twamp(ax):
+            for data, phase, ls in [(baseline_twamp, 'Base', '--'), (stress_twamp, 'Stress', '-')]:
+                fwd = [(t, f) for t, f, b in data if f is not None]
+                bwd = [(t, b) for t, f, b in data if b is not None]
+                if fwd:
+                    x, y = zip(*fwd)
+                    ax.plot(x, y, ls, color='darkred', lw=1.2, label=f'Fwd {phase}')
+                if bwd:
+                    x, y = zip(*bwd)
+                    ax.plot(x, y, ls, color='darkblue', lw=1.2, label=f'Bwd {phase}')
+            ax.set_ylabel("TWAMP OWD (ms)")
+            ax.legend(loc='upper right', fontsize=7)
+            fwd_vals = [f for _, f, _ in stress_twamp if f is not None]
+            bwd_vals = [b for _, _, b in stress_twamp if b is not None]
+            txt = ""
+            if fwd_vals:
+                txt += _stats_annotation("Fwd", _quick_stats(fwd_vals), "ms") + "\n"
+            if bwd_vals:
+                txt += _stats_annotation("Bwd", _quick_stats(bwd_vals), "ms")
+            if txt:
+                ax.text(0.02, 0.95, txt.strip(), transform=ax.transAxes, fontsize=7,
+                        fontfamily='monospace', va='top',
+                        bbox=dict(facecolor='white', alpha=0.8))
+
+        panels.append(("TWAMP-Light OWD", _plot_twamp))
+
+    # --- Panel 5+: Net Monitor panels ---
+    if netmon_data and netmon_mod:
+        nm = netmon_mod
+        for panel_key, package in netmon_data.items():
+            base_tool = package.get("tool_name", panel_key)
+            panel_label = package.get("panel_label", panel_key)
+            times = package["times"]
+            t0 = times[0]
+            elapsed = [(t - t0).total_seconds() for t in times]
+
+            def _make_netmon_plot(base_tool=base_tool, panel_label=panel_label, package=package, elapsed=elapsed, times=times):
+                def _plot(ax):
+                    cumul_keys = nm.CUMULATIVE_METRICS.get(base_tool, [])
+
+                    if base_tool == "TC":
+                        # TC: check if backlog has any non-zero values
+                        backlog_metrics = [m for m in nm.TOOL_METRICS[base_tool]
+                                           if 'backlog' in m]
+                        rate_metrics = [m for m in nm.TOOL_METRICS[base_tool]
+                                        if m not in backlog_metrics]
+
+                        has_backlog = any(
+                            any(v != 0 for v in package["data"][m])
+                            for m in backlog_metrics if m in package["data"]
+                        )
+
+                        if has_backlog:
+                            # Primary = backlog gauge; Secondary = rates
+                            for m in backlog_metrics:
+                                raw = package["data"][m]
+                                lbl = m.replace("tc_", "").replace("_", " ").title()
+                                ax.plot(elapsed, raw, lw=1.8, label=lbl)
+                            ax.set_ylabel("Queue Backlog")
+                            if rate_metrics:
+                                ax2 = ax.twinx()
+                                for m in rate_metrics:
+                                    raw = package["data"][m]
+                                    deltas = nm._compute_deltas(raw) if m in cumul_keys else raw
+                                    lbl = m.replace("tc_", "").replace("_", " ").title()
+                                    ax2.plot(elapsed, deltas, '--', lw=1, alpha=0.7, label=f"{lbl}/s")
+                                ax2.set_ylabel("Rate/s", color='tab:red', fontsize=8)
+                                ax2.tick_params(axis='y', labelcolor='tab:red')
+                                h1, l1 = ax.get_legend_handles_labels()
+                                h2, l2 = ax2.get_legend_handles_labels()
+                                ax.legend(h1 + h2, l1 + l2, loc='upper right', fontsize=7, ncol=2)
+                            else:
+                                ax.legend(loc='upper right', fontsize=7, ncol=2)
+                        else:
+                            # No backlog — show ALL metrics as rates on single axis
+                            for m in nm.TOOL_METRICS[base_tool]:
+                                raw = package["data"][m]
+                                deltas = nm._compute_deltas(raw) if m in cumul_keys else raw
+                                lbl = m.replace("tc_", "").replace("_", " ").title()
+                                ax.plot(elapsed, deltas, lw=1.5, label=f"{lbl}/s")
+                            ax.set_ylabel("TC Rate/s")
+                            ax.legend(loc='upper right', fontsize=7, ncol=2)
+
+                    elif base_tool in nm.THROUGHPUT_METRICS:
+                        # IP_Link / Softnet: throughput on primary, events on secondary
+                        for m in nm.THROUGHPUT_METRICS[base_tool]:
+                            raw = package["data"][m]
+                            deltas = nm._compute_deltas(raw) if m in cumul_keys else raw
+                            lbl = m.replace("ip_", "").replace("softnet_", "").replace("_", " ").title()
+                            ax.plot(elapsed, deltas, lw=1.5, label=f"{lbl}/s")
+                        ax.set_ylabel("Rate/s")
+                        if base_tool in nm.EVENT_METRICS:
+                            ax2 = ax.twinx()
+                            for m in nm.EVENT_METRICS[base_tool]:
+                                raw = package["data"][m]
+                                deltas = nm._compute_deltas(raw) if m in cumul_keys else raw
+                                lbl = m.replace("ip_", "").replace("softnet_", "").replace("_", " ").title()
+                                ax2.plot(elapsed, deltas, '--', lw=1, alpha=0.7, label=f"{lbl}/s")
+                            ax2.set_ylabel("Events/s", color='tab:red', fontsize=8)
+                            ax2.tick_params(axis='y', labelcolor='tab:red')
+                            h1, l1 = ax.get_legend_handles_labels()
+                            h2, l2 = ax2.get_legend_handles_labels()
+                            ax.legend(h1 + h2, l1 + l2, loc='upper right', fontsize=7, ncol=2)
+                        else:
+                            ax.legend(loc='upper right', fontsize=7, ncol=2)
+                    else:
+                        # VMstat/IOstat/MPstat: instantaneous gauge values
+                        for m in nm.TOOL_METRICS[base_tool]:
+                            lbl = m.replace("vm_", "").replace("io_", "").replace("cpu_", "").replace("_", " ").title()
+                            ax.plot(elapsed, package["data"][m], lw=1.5, label=lbl)
+                        ax.set_ylabel("Value")
+                        ax.legend(loc='upper right', fontsize=7, ncol=2)
+                    # Dual x-axis: elapsed seconds + system timestamps
+                    tick_idx = [i for i in range(len(elapsed)) if i % 5 == 0 or i == len(elapsed) - 1]
+                    ax.set_xticks([elapsed[i] for i in tick_idx])
+                    ax.set_xticklabels(
+                        [f"{elapsed[i]:.0f}s\n{times[i].strftime('%H:%M:%S')}" for i in tick_idx],
+                        rotation=0, ha='center', fontsize=7)
+                    ax.set_xlabel("Elapsed (s) / Time")
+
+                    # Stats annotation for key metrics
+                    stats_lines = []
+                    for m in list(package["data"].keys())[:4]:  # top 4 metrics
+                        raw = package["data"][m]
+                        if m in cumul_keys:
+                            vals = nm._compute_deltas(raw)
+                        else:
+                            vals = raw
+                        if vals and any(v != 0 for v in vals):
+                            s = _quick_stats(vals)
+                            short_name = m.replace("tc_", "").replace("ip_", "").replace("softnet_", "") \
+                                          .replace("vm_", "").replace("io_", "").replace("cpu_", "") \
+                                          .replace("_", " ").title()
+                            if m in cumul_keys:
+                                short_name += "/s"
+                            stats_lines.append(
+                                f"{short_name}: min={s['min']:.1f} max={s['max']:.1f} "
+                                f"avg={s['mean']:.1f} p95={s['p95']:.1f}")
+                    if stats_lines:
+                        ax.text(0.02, 0.95, "\n".join(stats_lines),
+                                transform=ax.transAxes, fontsize=7, fontfamily='monospace',
+                                va='top', bbox=dict(facecolor='white', alpha=0.8))
+
+                return _plot
+            panels.append((f"Net Monitor: {panel_label}", _make_netmon_plot()))
+
+    # --- Build figure ---
+    n_panels = len(panels)
+    fig, axes = plt.subplots(n_panels, 1, figsize=(14, 3.8 * n_panels), sharex=False)
+    if n_panels == 1:
+        axes = [axes]
+
+    fig.suptitle("Bufferbloat & System Infrastructure Analysis", fontsize=14, fontweight='bold')
+
+    for idx, (title, plot_func) in enumerate(panels):
+        ax = axes[idx]
+        try:
+            plot_func(ax)
+            ax.set_title(title, fontsize=10, fontweight='semibold', loc='left')
+            ax.grid(True, linestyle=':', alpha=0.4)
+        except Exception as exc:
+            ax.text(0.02, 0.5, f"Plot failed: {exc}", transform=ax.transAxes,
+                    fontsize=9, fontfamily='monospace', va='center')
+            ax.set_title(f"{title} [FAILED]", fontsize=10, fontweight='semibold', loc='left')
+            ax.grid(True, linestyle=':', alpha=0.2)
+            print(f"[WARN] matplotlib panel failed for '{title}': {exc}", file=sys.stderr)
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=180, bbox_inches='tight')
+    plt.close(fig)
+    print(f"\n[+] Graphical report saved to: {output_path}")
+
+
+def _quick_stats(values):
+    """Compute quick stats dict for plot annotations."""
+    if not values:
+        return {}
+    n = len(values)
+    sorted_v = sorted(values)
+    return {
+        'n': n,
+        'min': sorted_v[0],
+        'max': sorted_v[-1],
+        'mean': sum(values) / n,
+        'median': statistics.median(values),
+        'stdev': statistics.stdev(values) if n > 1 else 0,
+        'p95': sorted_v[int(n * 0.95)] if n > 1 else sorted_v[0],
+    }
+
+
+def _stats_annotation(label, s, unit):
+    """Format a compact stats string for plot annotation."""
+    if not s:
+        return ""
+    return (f"{label}: n={s['n']} min={s['min']:.1f} max={s['max']:.1f} "
+            f"avg={s['mean']:.1f} med={s['median']:.1f} "
+            f"std={s['stdev']:.1f} p95={s['p95']:.1f} {unit}")
+
+
+class _Tee:
+    """Write to both terminal and a log file simultaneously."""
+    def __init__(self, stream, log_file):
+        self._stream = stream
+        self._log = log_file
+
+    def write(self, data):
+        self._stream.write(data)
+        self._log.write(data)
+        self._log.flush()
+
+    def flush(self):
+        self._stream.flush()
+        self._log.flush()
+
+    def fileno(self):
+        return self._stream.fileno()
+
+    def isatty(self):
+        return self._stream.isatty()
 
 
 def main():
@@ -1812,6 +2511,44 @@ def main():
     traffic_log = f"traffic_gen_{timestamp}.csv"
     stats_file = f".traffic_stats_{timestamp}.dat"
 
+    # Clean up stale files from previous runs
+    import glob
+    for old in glob.glob(".traffic_stats_*.dat"):
+        try:
+            os.remove(old)
+        except OSError:
+            pass
+    for old in glob.glob(".traffic_stats_*.dat.*"):
+        try:
+            os.remove(old)
+        except OSError:
+            pass
+    for old in glob.glob("traffic_gen_*.csv"):
+        try:
+            os.remove(old)
+        except OSError:
+            pass
+    for old in glob.glob("net_out_*"):
+        try:
+            shutil.rmtree(old)
+        except OSError:
+            pass
+    if os.path.exists("net_out"):
+        try:
+            shutil.rmtree("net_out")
+        except OSError:
+            pass
+    for old in ("bufferbloat_analysis.png", "out.log"):
+        try:
+            os.remove(old)
+        except OSError:
+            pass
+
+    # Start console tee to out.log (AFTER cleanup removes old out.log)
+    _log_fh = open("out.log", "w", encoding="utf-8")
+    sys.stdout = _Tee(sys.__stdout__, _log_fh)
+    sys.stderr = _Tee(sys.__stderr__, _log_fh)
+
     print("=" * 72)
     print(f"{'USER BROWSING BUFFERBLOAT TEST':^72}")
     print("=" * 72)
@@ -1830,6 +2567,10 @@ def main():
     if args.twamp:
         print(f"  TWAMP        : enabled (server={args.twamp_server}:{args.twamp_port}  "
               f"interval={args.twamp_interval}s  padding={args.twamp_padding}B)")
+    if args.netmon:
+        _nm_ifaces = args.netmon_interface or [interface or 'eth0']
+        _nm_pfx = f"  prefix='{args.netmon_prefix}'" if args.netmon_prefix else ''
+        print(f"  Net Monitor  : enabled (interface={','.join(_nm_ifaces)}{_nm_pfx})")
     print("=" * 72)
 
     # Discover route depth before baseline — used to filter shallow probes in BOTH phases
@@ -1934,6 +2675,20 @@ def main():
     print(f"  Waiting {TRAFFIC_GEN_RAMP_SECS}s for traffic to ramp up...")
     time.sleep(TRAFFIC_GEN_RAMP_SECS)
 
+    # --- Net Monitor start (if enabled) ---
+    netmon_ctxs = []  # list of (interface, ctx) tuples
+    netmon_mod = None
+    netmon_all_aggregated = {}  # {interface: aggregated_data}
+    if args.netmon:
+        netmon_mod = _load_net_monitor()
+        if netmon_mod:
+            ifaces = args.netmon_interface or [interface or 'eth0']
+            prefix = args.netmon_prefix or ''
+            for nm_iface in ifaces:
+                ctx = netmon_start(netmon_mod, nm_iface, cmd_prefix=prefix)
+                if ctx:
+                    netmon_ctxs.append((nm_iface, ctx))
+
     if owd_enabled:
         _owd_t = threading.Thread(
             target=_owd_worker,
@@ -1972,6 +2727,11 @@ def main():
             )
     finally:
         stop_traffic_gen(traffic_proc)
+        # --- Net Monitor stop (all interfaces) ---
+        for nm_iface, ctx in netmon_ctxs:
+            agg = netmon_stop(ctx)
+            if agg:
+                netmon_all_aggregated[nm_iface] = agg
         if owd_enabled:
             _owd_t.join()
         if twamp_enabled:
@@ -2042,9 +2802,48 @@ def main():
         except OSError:
             pass
 
+    # --- Net Monitor report (if collected) ---
+    if netmon_all_aggregated and netmon_mod:
+        for nm_iface, agg_data in netmon_all_aggregated.items():
+            netmon_print_report(netmon_mod, agg_data, nm_iface)
+
+    # --- Auto-generate matplotlib plot (silent fail if not installed) ---
+    # Merge all interface netmon data into combined dict for plotting (prefix keys with iface)
+    combined_netmon = None
+    if netmon_all_aggregated:
+        combined_netmon = {}
+        for nm_iface, agg_data in netmon_all_aggregated.items():
+            for tool, pkg in agg_data.items():
+                panel_label = f"{tool} [{nm_iface}]" if len(netmon_all_aggregated) > 1 else tool
+                combined_netmon[panel_label] = {
+                    "tool_name": tool,
+                    "panel_label": panel_label,
+                    "times": pkg["times"],
+                    "data": pkg["data"],
+                }
+    try:
+        generate_full_plot(
+            baseline_ts, stress_ts,
+            owd_results=owd_results if owd_enabled else None,
+            twamp_results=twamp_results if twamp_enabled else None,
+            netmon_data=combined_netmon,
+            netmon_mod=netmon_mod,
+            output_path="bufferbloat_analysis.png",
+        )
+    except ImportError:
+        pass  # matplotlib not installed
+    except Exception as e:
+        print(f"[WARN] matplotlib chart generation failed: {e}", file=sys.stderr)
+
     print(f"\n{'='*72}")
     print(f"{'TEST COMPLETE':^72}")
     print(f"{'='*72}")
+
+    # Close log tee
+    sys.stdout = sys.__stdout__
+    sys.stderr = sys.__stderr__
+    _log_fh.close()
+    print(f"[+] Full console log saved to: out.log")
 
 
 if __name__ == "__main__":

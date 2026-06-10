@@ -15,6 +15,7 @@ per-direction one-way delay (OWD) using TCP Timestamps or TWAMP-Light UDP probes
 | `traffic-gen.py` | HTTP/HTTPS/HTTP2 traffic stress generator (spawned automatically) |
 | `tcp_owd.py` | TCP Timestamp OWD module — used by `--owd` (requires root + Scapy) |
 | `twamp_owd.py` | TWAMP-Light UDP OWD module — used by `--twamp` (no root needed) |
+| `net_monitor.py` | System infrastructure telemetry — TC/IP/Softnet/CPU/IO monitoring |
 
 ---
 
@@ -25,11 +26,13 @@ per-direction one-way delay (OWD) using TCP Timestamps or TWAMP-Light UDP probes
 | Core test | Python 3.8+, `traceroute` binary (`apt install traceroute`) |
 | `--owd` | root or `CAP_NET_RAW`, `pip install scapy` |
 | `--twamp` | No root required, no extra packages (stdlib `socket`/`struct` only) |
+| `--netmon` | root (for `tc`, `/proc/net/softnet_stat`); `vmstat`, `iostat`, `mpstat` binaries |
+| Matplotlib charts | `pip install matplotlib` (auto-generated if available, skipped silently if not) |
 | `traffic-gen.py` | `pip install requests h2` |
 
 Install all Python dependencies at once:
 ```bash
-pip install scapy requests h2
+pip install scapy requests h2 matplotlib
 ```
 
 ---
@@ -45,6 +48,71 @@ python3 userbufferTest.py -T 8.8.8.8 --twamp
 
 # Add TCP-TSval OWD measurement (requires root + scapy)
 sudo python3 userbufferTest.py -T 8.8.8.8 --owd
+
+# Add system telemetry (TC qdisc, NIC stats, softnet, CPU) during stress
+sudo python3 userbufferTest.py -T 8.8.8.8 --netmon --netmon-interface eth3
+
+# Kitchen sink — all measurements + auto matplotlib chart
+sudo python3 userbufferTest.py -T 8.8.8.8 --owd --twamp --netmon -b 30 -s 120
+
+sudo python3 userbufferTest.py -T 1.1.1.1 --owd --twamp --twamp-server 34.209.241.130 --netmon --netmon-interface eth3 -b 10 -s 30
+
+
+```
+
+
+### Explained Examples
+
+```bash
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │ EXAMPLE 1: Quick sanity check                                           │
+# │ What: 10s baseline + 10s stress. Fastest possible run.                  │
+# │ When: Verifying connectivity before a longer test.                      │
+# └─────────────────────────────────────────────────────────────────────────┘
+python3 userbufferTest.py -T 8.8.8.8 -b 10 -s 10
+
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │ EXAMPLE 2: Cellular/LTE bufferbloat diagnosis                           │
+# │ What: Longer stress (3 min) to capture slow-start and steady state.     │
+# │       TWAMP gives upload/download OWD split without root.               │
+# │       Wider chart (120 cols) to see fine-grained patterns.              │
+# └─────────────────────────────────────────────────────────────────────────┘
+python3 userbufferTest.py -T 8.8.8.8 -b 30 -s 180 -W 120 --twamp
+
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │ EXAMPLE 3: Full kernel-level diagnosis on a Linux router                │
+# │ What: Identifies if packets queue in TC qdisc, NIC ring buffer, or      │
+# │       CPU softIRQ backlog. Reports sysctl tuning recommendations.       │
+# │       Auto-generates matplotlib PNG with all data + stats tables.       │
+# │ Requires: root, matplotlib installed, sysstat (iostat/mpstat).          │
+# └─────────────────────────────────────────────────────────────────────────┘
+sudo python3 userbufferTest.py -T 8.8.8.8 --netmon --netmon-interface eth3 \
+    --twamp -b 30 -s 120
+
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │ EXAMPLE 4: Per-direction OWD with TCP timestamps (most accurate)        │
+# │ What: Decomposes RTT into upload vs download delay. Shows which         │
+# │       direction suffers bufferbloat. Requires target to echo TCP TSval.  │
+# │       Port 443 works for most CDN/cloud targets.                        │
+# └─────────────────────────────────────────────────────────────────────────┘
+sudo python3 userbufferTest.py -T 1.1.1.1 --owd --owd-port 443
+
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │ EXAMPLE 5: Wire-level throughput + all OWD methods + results saved      │
+# │ What: Reads actual NIC byte counters (not just curl app-level).         │
+# │       Both TCP-TSval and TWAMP OWD active. Everything saved to CSV.     │
+# └─────────────────────────────────────────────────────────────────────────┘
+sudo python3 userbufferTest.py -T 8.8.8.8 --owd --twamp \
+    -m procnetdev -I eth0 -b 30 -s 120 -o results.csv
+
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │ EXAMPLE 6: Net monitor standalone (without bufferbloat test)            │
+# │ What: Run net_monitor.py directly to watch kernel queuing in real-time. │
+# │       Ctrl+C to stop and get stats report + PNG chart.                  │
+# │       Optional second arg: command prefix for namespace/container.      │
+# └─────────────────────────────────────────────────────────────────────────┘
+sudo python3 net_monitor.py eth3
+sudo python3 net_monitor.py eth0 "denter atg4g"
 ```
 
 ---
@@ -130,6 +198,72 @@ Metrics produced: `RTT`, `FwdOWD‡` (upload), `BwdOWD‡` (download), `FwdIPDV`
 > due to network jitter and load — this is normal, not a bug. Both `native` and `nokia`
 > backends measure the same physical quantities; small differences between runs are expected.
 
+### System Infrastructure Telemetry (`--netmon`)
+
+Runs kernel-level subsystem monitoring during the stress phase to correlate
+bufferbloat with packet queuing, CPU stalls, and I/O contention.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--netmon` | off | Enable system telemetry during stress phase |
+| `--netmon-interface` | auto | Interface(s) for TC qdisc / IP link stats (space-separated; defaults to `-I` interface) |
+| `--netmon-prefix` | *(empty)* | Command prefix for namespace/container execution (e.g. `denter atg4g` or `ip netns exec ns1`) |
+
+**Multiple interfaces:** Pass more than one interface to monitor all of them
+simultaneously (each gets its own report section and chart panels):
+```bash
+sudo python3 userbufferTest.py -T 8.8.8.8 --netmon --netmon-interface eth0 eth3
+```
+
+**Command prefix (namespace/container):** Use `--netmon-prefix` to run all
+monitoring commands inside a different namespace or container:
+```bash
+# Monitor inside network namespace "atg4g"
+sudo python3 userbufferTest.py -T 8.8.8.8 --netmon --netmon-interface eth0 \
+    --netmon-prefix "denter atg4g"
+
+# Monitor inside ip netns
+sudo python3 userbufferTest.py -T 8.8.8.8 --netmon --netmon-interface veth0 \
+    --netmon-prefix "ip netns exec myns"
+
+# Multi-interface + prefix + all OWD methods
+sudo python3 userbufferTest.py -T 1.1.1.1 --owd --twamp --twamp-server x.x.x.x \
+    --netmon --netmon-interface eth1 eth3 --netmon-prefix "denter atg4g" -b 10 -s 30
+```
+
+**Subsystems monitored:**
+
+| Subsystem | What it reveals |
+|-----------|----------------|
+| TC (qdisc) | HTB/pfifo queue depth, drops, overlimits, requeues |
+| IP Link | NIC-level RX/TX bytes, drops, errors, overruns |
+| Softnet | Per-CPU backlog drops & softIRQ squeeze events |
+| VMstat | Run-queue, blocked procs, swap |
+| IOstat | Disk TPS, read/write throughput |
+| MPstat | CPU user/system/iowait/softirq/idle |
+
+**Report includes:**
+- Per-subsystem statistical table (min/max/mean/median/stdev/P95)
+- Burst analysis (peak rates, squeeze detection)
+- Live `sysctl` queue/burst parameter snapshot with tuning explanations
+
+### Matplotlib Graphical Output
+
+If `matplotlib` is installed (`pip install matplotlib`), a multi-panel PNG chart
+is **automatically generated** at the end of every test run. No flag needed.
+
+**Output file:** `bufferbloat_analysis.png` (saved in the working directory)
+
+**Panels included:**
+1. RTT over time (baseline vs stress) with statistical annotation
+2. Throughput over time (DL/UL fill chart) with stats
+3. TCP OWD (if `--owd` used) — baseline vs stress, fwd/bwd
+4. TWAMP OWD (if `--twamp` used)
+5. Net Monitor rate charts (if `--netmon` used) — one panel per subsystem
+
+If matplotlib is not installed, the chart is silently skipped — all terminal
+output remains unaffected.
+
 ---
 
 ## Output Sections Explained
@@ -148,6 +282,8 @@ Each run produces these sections in order:
 | 7 | Time-Series Table | Per-second RTT + throughput snapshots |
 | 8 | ASCII Chart | Dual-axis: throughput bars + RTT/OWD dots (see legend below) |
 | 9 | Traffic Summary | Per-client success/fail/socket stats |
+| 10 | System Telemetry | `--netmon` stats tables + burst analysis + sysctl snapshot |
+| — | Matplotlib PNG | Auto-saved `bufferbloat_analysis.png` (if matplotlib installed) |
 
 ### ASCII Chart Legend
 
@@ -204,6 +340,30 @@ python3 userbufferTest.py -T 8.8.8.8 --twamp --twamp-backend native
 
 sudo python3 userbufferTest.py -T 8.8.8.8 --owd --twamp -b 30 -s 120 -o full_results.csv
 sudo python3 userbufferTest.py -T 1.1.1.1 --owd --twamp --twamp-backend nokia --twamp-server 34.209.241.130 --twamp-port 4200 -b 30 -s 60
+
+# ── System Infrastructure Telemetry (--netmon) ───────────────────────────────
+
+# Monitor TC/IP/Softnet/CPU during stress — identifies kernel queuing points
+sudo python3 userbufferTest.py -T 8.8.8.8 --netmon --netmon-interface eth3
+
+# Combine with TWAMP for full picture (queue diagnosis + OWD split)
+sudo python3 userbufferTest.py -T 8.8.8.8 --netmon --netmon-interface eth3 --twamp -b 30 -s 120
+
+# All measurements combined — maximum diagnostic coverage
+sudo python3 userbufferTest.py -T 8.8.8.8 --owd --twamp --netmon --netmon-interface eth3 \
+    -m procnetdev -I eth3 -b 30 -s 120 -o full_diag.csv
+
+# Multiple interfaces simultaneously
+sudo python3 userbufferTest.py -T 8.8.8.8 --netmon --netmon-interface eth0 eth3 --twamp -b 30 -s 120
+
+# With command prefix (namespace/container)
+sudo python3 userbufferTest.py -T 8.8.8.8 --netmon --netmon-interface eth0 \
+    --netmon-prefix "denter atg4g" --twamp -b 30 -s 120
+
+# Multi-interface + prefix
+sudo python3 userbufferTest.py -T 8.8.8.8 --netmon --netmon-interface eth1 eth3 \
+    --netmon-prefix "ip netns exec myns" --owd --twamp -b 30 -s 300
+
 # ── Specialised scenarios ────────────────────────────────────────────────────
 
 # LTE/cellular: longer phases, wider chart
@@ -216,7 +376,7 @@ python3 userbufferTest.py -T 8.8.8.8 -d 10 -u 10 -b 20 -s 60
 python3 userbufferTest.py -T 8.8.8.8 -b 10 -s 10
 
 # Full run with all metrics, saved
-sudo python3 userbufferTest.py -T 8.8.8.8 --owd --twamp -b 30 -s 120 \
+sudo python3 userbufferTest.py -T 8.8.8.8 --owd --twamp --netmon --netmon-interface eth0 \
     -m procnetdev -W 120 -H 25 -o $(date +%Y%m%d_%H%M)_results.csv
 ```
 
