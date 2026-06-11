@@ -15,7 +15,7 @@ per-direction one-way delay (OWD) using TCP Timestamps or TWAMP-Light UDP probes
 | `traffic-gen.py` | HTTP/HTTPS/HTTP2 traffic stress generator (spawned automatically) |
 | `tcp_owd.py` | TCP Timestamp OWD module — used by `--owd` (requires root + Scapy) |
 | `twamp_owd.py` | TWAMP-Light UDP OWD module — used by `--twamp` (no root needed) |
-| `net_monitor.py` | System infrastructure telemetry — TC/IP/Softnet/CPU/IO monitoring |
+| `net_monitor.py` | System infrastructure telemetry — TC/IP/Softnet/CPU/IO/Netstat/SS monitoring |
 
 ---
 
@@ -26,7 +26,7 @@ per-direction one-way delay (OWD) using TCP Timestamps or TWAMP-Light UDP probes
 | Core test | Python 3.8+, `traceroute` binary (`apt install traceroute`) |
 | `--owd` | root or `CAP_NET_RAW`, `pip install scapy` |
 | `--twamp` | No root required, no extra packages (stdlib `socket`/`struct` only) |
-| `--netmon` | root (for `tc`, `/proc/net/softnet_stat`); `vmstat`, `iostat`, `mpstat` binaries |
+| `--netmon` | root (for `tc`, `/proc/net/softnet_stat`); `vmstat`, `iostat`, `mpstat`, `netstat`, `ss` binaries |
 | Matplotlib charts | `pip install matplotlib` (auto-generated if available, skipped silently if not) |
 | `traffic-gen.py` | `pip install requests h2` |
 
@@ -208,6 +208,7 @@ bufferbloat with packet queuing, CPU stalls, and I/O contention.
 | `--netmon` | off | Enable system telemetry during stress phase |
 | `--netmon-interface` | auto | Interface(s) for TC qdisc / IP link stats (space-separated; defaults to `-I` interface) |
 | `--netmon-prefix` | *(empty)* | Command prefix for namespace/container execution (e.g. `denter atg4g` or `ip netns exec ns1`) |
+| `--netstat-prefix` | *(same as --netmon-prefix)* | Independent prefix(es) for netstat monitoring (repeatable, space-separated). Runs `netstat -s -t`, `netstat -s -u`, `netstat -anu` per prefix. Omit for local. |
 
 **Multiple interfaces:** Pass more than one interface to monitor all of them
 simultaneously (each gets its own report section and chart panels):
@@ -231,6 +232,23 @@ sudo python3 userbufferTest.py -T 1.1.1.1 --owd --twamp --twamp-server x.x.x.x \
     --netmon --netmon-interface eth1 eth3 --netmon-prefix "denter atg4g" -b 10 -s 30
 ```
 
+**Netstat prefix (independent namespace monitoring):** Use `--netstat-prefix` to
+run netstat in one or more namespaces independently from the main `--netmon-prefix`.
+Useful when you want TCP/UDP protocol stats from multiple containers:
+```bash
+# Netstat in a specific namespace (TC/IP use the main prefix)
+sudo python3 userbufferTest.py -T 8.8.8.8 --netmon --netmon-interface eth1 \
+    --netmon-prefix "denter atg4g" --netstat-prefix "denter atg4g"
+
+# Netstat in multiple namespaces simultaneously
+sudo python3 userbufferTest.py -T 8.8.8.8 --netmon --netmon-interface eth1 \
+    --netmon-prefix "denter atg4g" --netstat-prefix "denter atg4g" "denter ns2"
+
+# Local netstat (no prefix) + remote TC/IP monitoring
+sudo python3 userbufferTest.py -T 8.8.8.8 --netmon --netmon-interface eth1 \
+    --netmon-prefix "denter atg4g" --netstat-prefix ""
+```
+
 **Subsystems monitored:**
 
 | Subsystem | What it reveals |
@@ -241,6 +259,12 @@ sudo python3 userbufferTest.py -T 1.1.1.1 --owd --twamp --twamp-server x.x.x.x \
 | VMstat | Run-queue, blocked procs, swap |
 | IOstat | Disk TPS, read/write throughput |
 | MPstat | CPU user/system/iowait/softirq/idle |
+| Netstat TCP | Active/passive opens, segments in/out, retransmits, resets |
+| Netstat UDP | Datagrams in/out, port unreachable, rcvbuf/sndbuf errors |
+| Netstat Sockets | Active UDP socket count, aggregate Recv-Q/Send-Q depths |
+| SS Info | TCP internal state: cwnd, ssthresh, RTT, retransmits, pacing/delivery rate, buffer-limited time |
+| SS Queues | Per-socket Send-Q/Recv-Q depths for TCP and UDP (kernel buffer pressure) |
+| SS Summary | Socket state counts: TCP estab/closed/orphaned/timewait, UDP total |
 
 **Report includes:**
 - Per-subsystem statistical table (min/max/mean/median/stdev/P95)
@@ -259,7 +283,42 @@ is **automatically generated** at the end of every test run. No flag needed.
 2. Throughput over time (DL/UL fill chart) with stats
 3. TCP OWD (if `--owd` used) — baseline vs stress, fwd/bwd
 4. TWAMP OWD (if `--twamp` used)
-5. Net Monitor rate charts (if `--netmon` used) — one panel per subsystem
+5. Net Monitor rate charts (if `--netmon` used) — one panel per subsystem per interface
+6. Netstat TCP/UDP stats — segment/datagram rates + error events
+7. Netstat UDP Sockets — socket count and queue depths
+8. SS Info — cwnd/pacing/delivery rates + retransmit/buffer-limited events
+9. SS Queues — TCP/UDP kernel socket buffer depths (Send-Q/Recv-Q)
+10. SS Summary — connection state counts (estab, orphaned, timewait)
+
+**Panel labeling convention:**
+- **Per-interface** panels (TC, IP_Link, Softnet, VMstat, IOstat, MPstat):
+  labeled `Tool [interface @ prefix]` — runs inside the namespace on specific NICs
+- **Per-prefix** panels (Netstat_TCP, Netstat_UDP, Netstat_Sockets, SS_Info, SS_Queues, SS_Summary):
+  labeled `Netstat: Tool [prefix]` — runs namespace-wide using `--netstat-prefix`, independent of interface
+
+**Report section labeling:**
+- `SYSTEM INFRASTRUCTURE TELEMETRY [interface: eth1 @ denter atg4g]` → per-interface tools
+- `NETSTAT / SS PROTOCOL STATISTICS [prefix: denter atg4g]` → per-prefix tools
+
+This makes it immediately clear from both the chart and the out.log which tools are
+tied to a specific NIC and which are namespace-wide protocol statistics.
+
+**Long test handling (`PLOT_SPLIT_SECS`):**
+
+For tests exceeding `PLOT_SPLIT_SECS` (default: 3600s = 1 hour), plots are
+automatically split into per-hour chunks to avoid matplotlib memory exhaustion:
+- `bufferbloat_analysis_h0-h1.png` — first hour
+- `bufferbloat_analysis_h1-h2.png` — second hour
+- ...
+- `bufferbloat_analysis.png` — combined (downsampled to `PLOT_MAX_POINTS`)
+
+Configure in `userbufferTest.py`:
+```python
+PLOT_SPLIT_SECS = 3600   # seconds per chunk (0 = disable splitting)
+PLOT_MAX_POINTS = 1800   # max points in combined plot (0 = no limit)
+```
+
+Short tests (duration < `PLOT_SPLIT_SECS`) produce a single plot as before.
 
 If matplotlib is not installed, the chart is silently skipped — all terminal
 output remains unaffected.
@@ -378,6 +437,93 @@ python3 userbufferTest.py -T 8.8.8.8 -b 10 -s 10
 # Full run with all metrics, saved
 sudo python3 userbufferTest.py -T 8.8.8.8 --owd --twamp --netmon --netmon-interface eth0 \
     -m procnetdev -W 120 -H 25 -o $(date +%Y%m%d_%H%M)_results.csv
+```
+
+---
+
+## Manual Verification: Test Each Monitoring Command
+
+Run these commands manually (with your prefix) to verify all tools work before
+launching a full test. Replace `<PREFIX>` with your namespace/container command
+(e.g. `denter atg4g `, `ip netns exec myns `) or leave empty for local.
+
+```bash
+# ── Per-interface tools (replace eth3 with your interface) ───────────────────
+
+# TC qdisc stats — shows queue discipline, backlog, drops
+<PREFIX>tc -s qdisc show dev eth3
+
+# IP Link stats — NIC-level byte counters, errors, drops
+<PREFIX>ip -s link show dev eth3
+
+# Softnet — per-CPU backlog (only works locally or with prefix that has /proc access)
+<PREFIX>cat /proc/net/softnet_stat
+
+# ── System-wide tools ────────────────────────────────────────────────────────
+
+# VMstat — CPU run-queue, blocked procs, swap activity
+<PREFIX>vmstat 1 1
+
+# IOstat — disk I/O throughput and transactions
+<PREFIX>iostat 1 1
+
+# MPstat — per-CPU breakdown (user/system/iowait/softirq/idle)
+<PREFIX>mpstat 1 1
+
+# ── Netstat protocol stats (namespace-wide) ──────────────────────────────────
+
+# TCP protocol counters — segments, retransmits, resets
+<PREFIX>netstat -s -t
+
+# UDP protocol counters — datagrams, errors, buffer overflows
+<PREFIX>netstat -s -u
+
+# Active UDP sockets — queue depths (Recv-Q / Send-Q)
+<PREFIX>netstat -anu
+
+# ── SS socket statistics (namespace-wide) ────────────────────────────────────
+
+# TCP internal info — cwnd, ssthresh, RTT, retransmits, pacing/delivery rate
+<PREFIX>ss -tin
+
+# TCP socket queues — per-connection Send-Q/Recv-Q with process info
+<PREFIX>ss -tnp
+
+# UDP socket queues — per-socket Send-Q/Recv-Q with process info
+<PREFIX>ss -unp
+
+# Socket summary — connection state counts (estab, orphaned, timewait)
+<PREFIX>ss -s
+```
+
+### Quick copy-paste test with a real prefix
+
+```bash
+# Example: test all commands inside namespace "atg4g"
+PREFIX="denter atg4g "
+
+${PREFIX}tc -s qdisc show dev eth1
+${PREFIX}ip -s link show dev eth1
+${PREFIX}cat /proc/net/softnet_stat
+${PREFIX}vmstat 1 1
+${PREFIX}iostat 1 1
+${PREFIX}mpstat 1 1
+${PREFIX}netstat -s -t
+${PREFIX}netstat -s -u
+${PREFIX}netstat -anu
+${PREFIX}ss -tin
+${PREFIX}ss -tnp
+${PREFIX}ss -unp
+${PREFIX}ss -s
+```
+
+If any command fails (e.g. `command not found`), install the missing package:
+```bash
+# RHEL/CentOS
+yum install -y iproute2 net-tools sysstat procps-ng
+
+# Debian/Ubuntu
+apt install -y iproute2 net-tools sysstat procps
 ```
 
 ---

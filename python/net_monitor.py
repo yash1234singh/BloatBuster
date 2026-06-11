@@ -142,7 +142,36 @@ TOOL_METRICS = {
     "Softnet": ["softnet_dropped", "softnet_squeezed", "softnet_received"],
     "VMstat": ["vm_r", "vm_b", "vm_si", "vm_so"],
     "IOstat": ["io_tps", "io_read_kb", "io_wrtn_kb"],
-    "MPstat": ["cpu_user", "cpu_system", "cpu_iowait", "cpu_softirq", "cpu_idle"]
+    "MPstat": ["cpu_user", "cpu_system", "cpu_iowait", "cpu_softirq", "cpu_idle"],
+    "Netstat_UDP": [
+        "ns_udp_in_datagrams", "ns_udp_no_ports", "ns_udp_in_errors",
+        "ns_udp_out_datagrams", "ns_udp_rcvbuf_errors", "ns_udp_sndbuf_errors",
+        "ns_udp_in_csum_errors"
+    ],
+    "Netstat_TCP": [
+        "ns_tcp_active_opens", "ns_tcp_passive_opens", "ns_tcp_in_segs",
+        "ns_tcp_out_segs", "ns_tcp_retrans_segs", "ns_tcp_in_errs", "ns_tcp_out_rsts"
+    ],
+    "Netstat_Sockets": [
+        "ns_sock_udp_count", "ns_sock_udp_recv_q_total", "ns_sock_udp_recv_q_max",
+        "ns_sock_udp_send_q_total", "ns_sock_udp_send_q_max"
+    ],
+    "SS_Info": [
+        "ss_cwnd_avg", "ss_cwnd_min", "ss_ssthresh_avg", "ss_rtt_avg",
+        "ss_retrans_total", "ss_pacing_rate_avg", "ss_delivery_rate_avg",
+        "ss_busy_ms_total", "ss_rwnd_limited_ms_total", "ss_sndbuf_limited_ms_total",
+        "ss_conn_count"
+    ],
+    "SS_Queues": [
+        "ss_tcp_count", "ss_tcp_send_q_total", "ss_tcp_send_q_max",
+        "ss_tcp_recv_q_total", "ss_tcp_recv_q_max",
+        "ss_udp_count", "ss_udp_send_q_total", "ss_udp_send_q_max",
+        "ss_udp_recv_q_total", "ss_udp_recv_q_max"
+    ],
+    "SS_Summary": [
+        "ss_tcp_total", "ss_tcp_estab", "ss_tcp_closed",
+        "ss_tcp_orphaned", "ss_tcp_timewait", "ss_udp_total"
+    ],
 }
 
 # Realtime Data Buffer Map
@@ -201,7 +230,7 @@ def pre_flight_checks(interface):
         "Softnet": "cat /proc/net/softnet_stat",
         "VMstat": "vmstat 1 1",
         "IOstat": "iostat 1 1",
-        "MPstat": "mpstat 1 1"
+        "MPstat": "mpstat 1 1",
     }
     
     for tool, cmd in checks.items():
@@ -353,6 +382,280 @@ def poll_mpstat():
             metrics_buffer["cpu_idle"] = float(res[11])
     except Exception: pass
 
+# Netstat prefix list — independent from CMD_PREFIX; defaults to local
+NETSTAT_PREFIXES = [""]
+
+def poll_netstat_udp(prefix=""):
+    """Parse 'netstat -s -u' for UDP protocol statistics."""
+    try:
+        pfx = prefix if prefix else CMD_PREFIX
+        cmd = f"{pfx}netstat -s -u".split()
+        res = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL)
+
+        # Pattern: "    <number> <description>" lines under Udp: section
+        mapping = {
+            r"(\d+)\s+packets\s+received": "ns_udp_in_datagrams",
+            r"(\d+)\s+packets\s+to\s+unknown\s+port": "ns_udp_no_ports",
+            r"(\d+)\s+packet\s+receive\s+errors": "ns_udp_in_errors",
+            r"(\d+)\s+packets\s+sent": "ns_udp_out_datagrams",
+            r"(\d+)\s+receive\s+buffer\s+errors": "ns_udp_rcvbuf_errors",
+            r"(\d+)\s+send\s+buffer\s+errors": "ns_udp_sndbuf_errors",
+            r"(\d+)\s+(?:InCsumErrors|checksum\s+errors)": "ns_udp_in_csum_errors",
+        }
+
+        with buffer_lock:
+            for pattern, metric in mapping.items():
+                m = re.search(pattern, res, re.IGNORECASE)
+                if m:
+                    metrics_buffer[metric] = float(m.group(1))
+    except Exception: pass
+
+def poll_netstat_tcp(prefix=""):
+    """Parse 'netstat -s -t' for TCP protocol statistics."""
+    try:
+        pfx = prefix if prefix else CMD_PREFIX
+        cmd = f"{pfx}netstat -s -t".split()
+        res = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL)
+
+        mapping = {
+            r"(\d+)\s+active\s+connection(?:s)?\s+opening": "ns_tcp_active_opens",
+            r"(\d+)\s+passive\s+connection(?:s)?\s+opening": "ns_tcp_passive_opens",
+            r"(\d+)\s+segments\s+received": "ns_tcp_in_segs",
+            r"(\d+)\s+segments\s+send\s+out": "ns_tcp_out_segs",
+            r"(\d+)\s+segments\s+retransmit": "ns_tcp_retrans_segs",
+            r"(\d+)\s+bad\s+segments\s+received": "ns_tcp_in_errs",
+            r"(\d+)\s+resets\s+sent": "ns_tcp_out_rsts",
+        }
+
+        with buffer_lock:
+            for pattern, metric in mapping.items():
+                m = re.search(pattern, res, re.IGNORECASE)
+                if m:
+                    metrics_buffer[metric] = float(m.group(1))
+    except Exception: pass
+
+def poll_netstat_sockets(prefix=""):
+    """Parse 'netstat -anu' for active UDP socket count and queue depths."""
+    try:
+        pfx = prefix if prefix else CMD_PREFIX
+        cmd = f"{pfx}netstat -anu".split()
+        res = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL)
+
+        udp_count = 0
+        recv_q_total = 0
+        recv_q_max = 0
+        send_q_total = 0
+        send_q_max = 0
+
+        for line in res.splitlines():
+            parts = line.split()
+            # Format: Proto Recv-Q Send-Q Local-Address Foreign-Address State
+            # UDP lines: udp/udp6  <recv-q> <send-q> ...
+            if len(parts) >= 4 and parts[0] in ("udp", "udp6"):
+                udp_count += 1
+                rq = int(parts[1])
+                sq = int(parts[2])
+                recv_q_total += rq
+                send_q_total += sq
+                recv_q_max = max(recv_q_max, rq)
+                send_q_max = max(send_q_max, sq)
+
+        with buffer_lock:
+            metrics_buffer["ns_sock_udp_count"] = float(udp_count)
+            metrics_buffer["ns_sock_udp_recv_q_total"] = float(recv_q_total)
+            metrics_buffer["ns_sock_udp_recv_q_max"] = float(recv_q_max)
+            metrics_buffer["ns_sock_udp_send_q_total"] = float(send_q_total)
+            metrics_buffer["ns_sock_udp_send_q_max"] = float(send_q_max)
+    except Exception: pass
+
+
+def _parse_ss_rate(rate_str):
+    """Parse ss rate string like '500Mbps', '1.5Gbps', '1200Kbps' into bits/sec."""
+    m = re.match(r'([\d.]+)(\w+)', rate_str)
+    if not m:
+        return 0.0
+    val = float(m.group(1))
+    unit = m.group(2).lower()
+    multipliers = {'bps': 1, 'kbps': 1e3, 'mbps': 1e6, 'gbps': 1e9}
+    return val * multipliers.get(unit, 1)
+
+
+def poll_ss_info(prefix=""):
+    """Parse 'ss -tin' for TCP internal connection metrics (cwnd, retrans, pacing)."""
+    try:
+        pfx = prefix if prefix else CMD_PREFIX
+        cmd = f"{pfx}ss -tin".split()
+        res = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL)
+
+        cwnd_list = []
+        ssthresh_list = []
+        rtt_list = []
+        retrans_total = 0
+        pacing_list = []
+        delivery_list = []
+        busy_total = 0.0
+        rwnd_limited_total = 0.0
+        sndbuf_limited_total = 0.0
+        conn_count = 0
+
+        # ss -tin outputs connection header lines followed by indented info lines
+        for line in res.splitlines():
+            # cwnd:10
+            cw = re.search(r'\bcwnd:(\d+)', line)
+            if cw:
+                cwnd_list.append(int(cw.group(1)))
+                conn_count += 1
+
+            ss_m = re.search(r'\bssthresh:(\d+)', line)
+            if ss_m:
+                ssthresh_list.append(int(ss_m.group(1)))
+
+            # rtt:1.5/0.75
+            rtt_m = re.search(r'\brtt:([\d.]+)/', line)
+            if rtt_m:
+                rtt_list.append(float(rtt_m.group(1)))
+
+            # retrans:0/5 — second number is total retransmits
+            ret_m = re.search(r'\bretrans:\d+/(\d+)', line)
+            if ret_m:
+                retrans_total += int(ret_m.group(1))
+
+            # pacing_rate 500Mbps
+            pace_m = re.search(r'pacing_rate\s+([\d.]+\w+)', line)
+            if pace_m:
+                pacing_list.append(_parse_ss_rate(pace_m.group(1)))
+
+            # delivery_rate 480Mbps
+            del_m = re.search(r'delivery_rate\s+([\d.]+\w+)', line)
+            if del_m:
+                delivery_list.append(_parse_ss_rate(del_m.group(1)))
+
+            # busy:1200ms
+            busy_m = re.search(r'\bbusy:([\d.]+)ms', line)
+            if busy_m:
+                busy_total += float(busy_m.group(1))
+
+            # rwnd_limited:50ms
+            rwnd_m = re.search(r'\brwnd_limited:([\d.]+)ms', line)
+            if rwnd_m:
+                rwnd_limited_total += float(rwnd_m.group(1))
+
+            # sndbuf_limited:0ms
+            sndbuf_m = re.search(r'\bsndbuf_limited:([\d.]+)ms', line)
+            if sndbuf_m:
+                sndbuf_limited_total += float(sndbuf_m.group(1))
+
+        with buffer_lock:
+            metrics_buffer["ss_cwnd_avg"] = sum(cwnd_list) / len(cwnd_list) if cwnd_list else 0.0
+            metrics_buffer["ss_cwnd_min"] = min(cwnd_list) if cwnd_list else 0.0
+            metrics_buffer["ss_ssthresh_avg"] = sum(ssthresh_list) / len(ssthresh_list) if ssthresh_list else 0.0
+            metrics_buffer["ss_rtt_avg"] = sum(rtt_list) / len(rtt_list) if rtt_list else 0.0
+            metrics_buffer["ss_retrans_total"] = float(retrans_total)
+            metrics_buffer["ss_pacing_rate_avg"] = sum(pacing_list) / len(pacing_list) if pacing_list else 0.0
+            metrics_buffer["ss_delivery_rate_avg"] = sum(delivery_list) / len(delivery_list) if delivery_list else 0.0
+            metrics_buffer["ss_busy_ms_total"] = busy_total
+            metrics_buffer["ss_rwnd_limited_ms_total"] = rwnd_limited_total
+            metrics_buffer["ss_sndbuf_limited_ms_total"] = sndbuf_limited_total
+            metrics_buffer["ss_conn_count"] = float(conn_count)
+    except Exception:
+        pass
+
+
+def poll_ss_queues(prefix=""):
+    """Parse 'ss -tnp' and 'ss -unp' for TCP/UDP socket queue depths."""
+    try:
+        pfx = prefix if prefix else CMD_PREFIX
+
+        tcp_count = tcp_sq_total = tcp_sq_max = tcp_rq_total = tcp_rq_max = 0
+        udp_count = udp_sq_total = udp_sq_max = udp_rq_total = udp_rq_max = 0
+
+        # TCP queues
+        cmd_tcp = f"{pfx}ss -tnp".split()
+        res_tcp = subprocess.check_output(cmd_tcp, text=True, stderr=subprocess.DEVNULL)
+        for line in res_tcp.splitlines():
+            parts = line.split()
+            # State Recv-Q Send-Q Local:port Peer:port ...
+            if len(parts) >= 5 and parts[0] in ("ESTAB", "CLOSE-WAIT", "FIN-WAIT-1",
+                                                  "FIN-WAIT-2", "TIME-WAIT", "SYN-SENT"):
+                tcp_count += 1
+                rq, sq = int(parts[1]), int(parts[2])
+                tcp_rq_total += rq
+                tcp_sq_total += sq
+                tcp_rq_max = max(tcp_rq_max, rq)
+                tcp_sq_max = max(tcp_sq_max, sq)
+
+        # UDP queues
+        cmd_udp = f"{pfx}ss -unp".split()
+        res_udp = subprocess.check_output(cmd_udp, text=True, stderr=subprocess.DEVNULL)
+        for line in res_udp.splitlines():
+            parts = line.split()
+            if len(parts) >= 5 and parts[0] in ("UNCONN", "ESTAB"):
+                udp_count += 1
+                rq, sq = int(parts[1]), int(parts[2])
+                udp_rq_total += rq
+                udp_sq_total += sq
+                udp_rq_max = max(udp_rq_max, rq)
+                udp_sq_max = max(udp_sq_max, sq)
+
+        with buffer_lock:
+            metrics_buffer["ss_tcp_count"] = float(tcp_count)
+            metrics_buffer["ss_tcp_send_q_total"] = float(tcp_sq_total)
+            metrics_buffer["ss_tcp_send_q_max"] = float(tcp_sq_max)
+            metrics_buffer["ss_tcp_recv_q_total"] = float(tcp_rq_total)
+            metrics_buffer["ss_tcp_recv_q_max"] = float(tcp_rq_max)
+            metrics_buffer["ss_udp_count"] = float(udp_count)
+            metrics_buffer["ss_udp_send_q_total"] = float(udp_sq_total)
+            metrics_buffer["ss_udp_send_q_max"] = float(udp_sq_max)
+            metrics_buffer["ss_udp_recv_q_total"] = float(udp_rq_total)
+            metrics_buffer["ss_udp_recv_q_max"] = float(udp_rq_max)
+    except Exception:
+        pass
+
+
+def poll_ss_summary(prefix=""):
+    """Parse 'ss -s' for socket state summary counts."""
+    try:
+        pfx = prefix if prefix else CMD_PREFIX
+        cmd = f"{pfx}ss -s".split()
+        res = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL)
+
+        tcp_total = tcp_estab = tcp_closed = tcp_orphaned = tcp_timewait = 0
+        udp_total = 0
+
+        # TCP:   42 (estab 35, closed 2, orphaned 0, timewait 3, ...)
+        tcp_line = re.search(r'TCP:\s+(\d+)\s+\((.+?)\)', res)
+        if tcp_line:
+            tcp_total = int(tcp_line.group(1))
+            detail = tcp_line.group(2)
+            em = re.search(r'estab\s+(\d+)', detail)
+            if em:
+                tcp_estab = int(em.group(1))
+            cm = re.search(r'closed\s+(\d+)', detail)
+            if cm:
+                tcp_closed = int(cm.group(1))
+            om = re.search(r'orphaned\s+(\d+)', detail)
+            if om:
+                tcp_orphaned = int(om.group(1))
+            tw = re.search(r'timewait\s+(\d+)', detail)
+            if tw:
+                tcp_timewait = int(tw.group(1))
+
+        # UDP:   8
+        udp_line = re.search(r'UDP:\s+(\d+)', res)
+        if udp_line:
+            udp_total = int(udp_line.group(1))
+
+        with buffer_lock:
+            metrics_buffer["ss_tcp_total"] = float(tcp_total)
+            metrics_buffer["ss_tcp_estab"] = float(tcp_estab)
+            metrics_buffer["ss_tcp_closed"] = float(tcp_closed)
+            metrics_buffer["ss_tcp_orphaned"] = float(tcp_orphaned)
+            metrics_buffer["ss_tcp_timewait"] = float(tcp_timewait)
+            metrics_buffer["ss_udp_total"] = float(udp_total)
+    except Exception:
+        pass
+
+
 # --- CRON SCHEDULER ENGINE ---
 def worker(tool_name, interface):
     while not stop_event.is_set():
@@ -363,6 +666,12 @@ def worker(tool_name, interface):
         elif tool_name == "VMstat": poll_vmstat()
         elif tool_name == "IOstat": poll_iostat()
         elif tool_name == "MPstat": poll_mpstat()
+        elif tool_name == "Netstat_UDP": poll_netstat_udp()
+        elif tool_name == "Netstat_TCP": poll_netstat_tcp()
+        elif tool_name == "Netstat_Sockets": poll_netstat_sockets()
+        elif tool_name == "SS_Info": poll_ss_info()
+        elif tool_name == "SS_Queues": poll_ss_queues()
+        elif tool_name == "SS_Summary": poll_ss_summary()
         dt = time.time() - t0
         time.sleep(max(0.05, INTERVAL - dt))
 
@@ -446,6 +755,13 @@ CUMULATIVE_METRICS = {
     "IP_Link": ["ip_rx_bytes", "ip_rx_pkts", "ip_rx_dropped", "ip_rx_overrun", "ip_rx_errors",
                 "ip_tx_bytes", "ip_tx_pkts", "ip_tx_dropped", "ip_tx_errors", "ip_tx_colls"],
     "Softnet": ["softnet_dropped", "softnet_squeezed", "softnet_received"],
+    "Netstat_UDP": ["ns_udp_in_datagrams", "ns_udp_no_ports", "ns_udp_in_errors",
+                    "ns_udp_out_datagrams", "ns_udp_rcvbuf_errors", "ns_udp_sndbuf_errors",
+                    "ns_udp_in_csum_errors"],
+    "Netstat_TCP": ["ns_tcp_active_opens", "ns_tcp_passive_opens", "ns_tcp_in_segs",
+                    "ns_tcp_out_segs", "ns_tcp_retrans_segs", "ns_tcp_in_errs", "ns_tcp_out_rsts"],
+    "SS_Info": ["ss_retrans_total", "ss_busy_ms_total", "ss_rwnd_limited_ms_total",
+               "ss_sndbuf_limited_ms_total"],
 }
 
 # High-magnitude throughput metrics (plotted on primary Y-axis as rates)
@@ -453,6 +769,9 @@ THROUGHPUT_METRICS = {
     "TC": ["tc_total_sent_bytes", "tc_total_sent_pkts"],
     "IP_Link": ["ip_rx_bytes", "ip_rx_pkts", "ip_tx_bytes", "ip_tx_pkts"],
     "Softnet": ["softnet_received"],
+    "Netstat_UDP": ["ns_udp_in_datagrams", "ns_udp_out_datagrams"],
+    "Netstat_TCP": ["ns_tcp_in_segs", "ns_tcp_out_segs"],
+    "SS_Info": ["ss_pacing_rate_avg", "ss_delivery_rate_avg"],
 }
 
 # Low-magnitude event/error metrics (plotted on secondary Y-axis as rates)
@@ -462,6 +781,10 @@ EVENT_METRICS = {
     "IP_Link": ["ip_rx_dropped", "ip_rx_overrun", "ip_rx_errors",
                 "ip_tx_dropped", "ip_tx_errors", "ip_tx_colls"],
     "Softnet": ["softnet_dropped", "softnet_squeezed"],
+    "Netstat_UDP": ["ns_udp_no_ports", "ns_udp_in_errors", "ns_udp_rcvbuf_errors",
+                    "ns_udp_sndbuf_errors", "ns_udp_in_csum_errors"],
+    "Netstat_TCP": ["ns_tcp_retrans_segs", "ns_tcp_in_errs", "ns_tcp_out_rsts"],
+    "SS_Info": ["ss_retrans_total", "ss_rwnd_limited_ms_total", "ss_sndbuf_limited_ms_total"],
 }
 
 

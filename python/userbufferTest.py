@@ -146,6 +146,10 @@ TRAFFIC_GEN_KILL_TIMEOUT = 5      # seconds to wait after SIGKILL
 TRAFFIC_GEN_RAMP_SECS    = 5      # sleep after starting traffic-gen before stress phase
 MIN_DT_VALID             = 0.1    # minimum elapsed-time delta for rate calculation (s)
 
+# Plot splitting for long tests (avoids matplotlib memory exhaustion on multi-hour runs)
+PLOT_SPLIT_SECS          = 3600   # 0=no split; >0=produce per-chunk plots every N seconds
+PLOT_MAX_POINTS          = 1800   # max data points per metric before downsampling (0=no limit)
+
 
 # ---------------------------------------------------------------------------
 # Traceroute parsing
@@ -1734,6 +1738,10 @@ def parse_args():
     netmon.add_argument('--netmon-prefix', type=str, default='', metavar='PREFIX',
                         help='Command prefix for namespace/container execution '
                              '(e.g. "denter atg4g" or "ip netns exec ns1")')
+    netmon.add_argument('--netstat-prefix', type=str, nargs='*', default=None, metavar='PREFIX',
+                        help='Command prefix(es) for netstat monitoring (repeatable). '
+                             'Runs netstat -s -t, netstat -s -u, netstat -anu per prefix. '
+                             'If omitted, uses --netmon-prefix. Use "" for local.')
 
     return p.parse_args()
 
@@ -1766,7 +1774,7 @@ def _load_net_monitor():
         return None
 
 
-def netmon_start(net_monitor_mod, interface, cmd_prefix=''):
+def netmon_start(net_monitor_mod, interface, cmd_prefix='', netstat_prefixes=None):
     """Start net_monitor polling threads for one interface. Returns context dict."""
     nm = net_monitor_mod
 
@@ -1774,6 +1782,12 @@ def netmon_start(net_monitor_mod, interface, cmd_prefix=''):
     prefix = cmd_prefix.strip()
     pfx = (prefix + ' ') if prefix else ''
     nm.CMD_PREFIX = pfx
+
+    # Set netstat prefixes (independent from main CMD_PREFIX)
+    if netstat_prefixes is not None:
+        nm.NETSTAT_PREFIXES = [(p.strip() + ' ') if p.strip() else '' for p in netstat_prefixes]
+    else:
+        nm.NETSTAT_PREFIXES = [pfx]  # default: same as CMD_PREFIX
 
     # Reset module-level state for pre-flight
     nm.working_tools.clear()
@@ -1800,10 +1814,14 @@ def netmon_start(net_monitor_mod, interface, cmd_prefix=''):
     inst_lock = threading.Lock()
     inst_stop = threading.Event()
 
-    # Open CSV files
+    # Open CSV files (exclude netstat/SS — handled separately by netstat_start)
     csv_files = {}
     csv_writers = {}
+    _netstat_tools = {"Netstat_UDP", "Netstat_TCP", "Netstat_Sockets",
+                      "SS_Info", "SS_Queues", "SS_Summary"}
     for tool in instance_tools.keys():
+        if tool in _netstat_tools:
+            continue
         path = os.path.join(nm_out, f"{tool.lower()}_metrics.csv")
         f = open(path, 'w', newline='', encoding='utf-8')
         writer = csv.writer(f)
@@ -1908,14 +1926,71 @@ def netmon_start(net_monitor_mod, interface, cmd_prefix=''):
                         inst_buffer["cpu_iowait"] = float(res[5])
                         inst_buffer["cpu_softirq"] = float(res[7])
                         inst_buffer["cpu_idle"] = float(res[11])
+                elif tool_name == "Netstat_UDP":
+                    cmd = f"{prefix_str}netstat -s -u".split()
+                    res = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL)
+                    mapping = {
+                        r"(\d+)\s+packets\s+received": "ns_udp_in_datagrams",
+                        r"(\d+)\s+packets\s+to\s+unknown\s+port": "ns_udp_no_ports",
+                        r"(\d+)\s+packet\s+receive\s+errors": "ns_udp_in_errors",
+                        r"(\d+)\s+packets\s+sent": "ns_udp_out_datagrams",
+                        r"(\d+)\s+receive\s+buffer\s+errors": "ns_udp_rcvbuf_errors",
+                        r"(\d+)\s+send\s+buffer\s+errors": "ns_udp_sndbuf_errors",
+                        r"(\d+)\s+(?:InCsumErrors|checksum\s+errors)": "ns_udp_in_csum_errors",
+                    }
+                    with inst_lock:
+                        for pattern, metric in mapping.items():
+                            m = re.search(pattern, res, re.IGNORECASE)
+                            if m:
+                                inst_buffer[metric] = float(m.group(1))
+                elif tool_name == "Netstat_TCP":
+                    cmd = f"{prefix_str}netstat -s -t".split()
+                    res = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL)
+                    mapping = {
+                        r"(\d+)\s+active\s+connection(?:s)?\s+opening": "ns_tcp_active_opens",
+                        r"(\d+)\s+passive\s+connection(?:s)?\s+opening": "ns_tcp_passive_opens",
+                        r"(\d+)\s+segments\s+received": "ns_tcp_in_segs",
+                        r"(\d+)\s+segments\s+send\s+out": "ns_tcp_out_segs",
+                        r"(\d+)\s+segments\s+retransmit": "ns_tcp_retrans_segs",
+                        r"(\d+)\s+bad\s+segments\s+received": "ns_tcp_in_errs",
+                        r"(\d+)\s+resets\s+sent": "ns_tcp_out_rsts",
+                    }
+                    with inst_lock:
+                        for pattern, metric in mapping.items():
+                            m = re.search(pattern, res, re.IGNORECASE)
+                            if m:
+                                inst_buffer[metric] = float(m.group(1))
+                elif tool_name == "Netstat_Sockets":
+                    cmd = f"{prefix_str}netstat -anu".split()
+                    res = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL)
+                    udp_count = recv_q_total = recv_q_max = send_q_total = send_q_max = 0
+                    for line in res.splitlines():
+                        parts = line.split()
+                        if len(parts) >= 4 and parts[0] in ("udp", "udp6"):
+                            udp_count += 1
+                            rq, sq = int(parts[1]), int(parts[2])
+                            recv_q_total += rq
+                            send_q_total += sq
+                            recv_q_max = max(recv_q_max, rq)
+                            send_q_max = max(send_q_max, sq)
+                    with inst_lock:
+                        inst_buffer["ns_sock_udp_count"] = float(udp_count)
+                        inst_buffer["ns_sock_udp_recv_q_total"] = float(recv_q_total)
+                        inst_buffer["ns_sock_udp_recv_q_max"] = float(recv_q_max)
+                        inst_buffer["ns_sock_udp_send_q_total"] = float(send_q_total)
+                        inst_buffer["ns_sock_udp_send_q_max"] = float(send_q_max)
             except Exception:
                 pass
             dt = time.time() - t0
             time.sleep(max(0.05, nm.INTERVAL - dt))
 
-    # Start polling threads
+    # Start polling threads (exclude netstat/SS — those are namespace-wide, not per-interface)
     threads = []
+    netstat_tools = {"Netstat_UDP", "Netstat_TCP", "Netstat_Sockets",
+                     "SS_Info", "SS_Queues", "SS_Summary"}
     for tool in instance_tools.keys():
+        if tool in netstat_tools:
+            continue  # handled separately by netstat_start()
         t = threading.Thread(target=_inst_worker, args=(tool, interface, pfx), daemon=True)
         threads.append(t)
         t.start()
@@ -1988,6 +2063,379 @@ def netmon_stop(ctx):
     return aggregated_data
 
 
+# ---------------------------------------------------------------------------
+# Netstat monitoring (namespace-wide, independent from per-interface netmon)
+# ---------------------------------------------------------------------------
+_NETSTAT_TOOLS = ["Netstat_TCP", "Netstat_UDP", "Netstat_Sockets",
+                  "SS_Info", "SS_Queues", "SS_Summary"]
+
+
+def netstat_start(net_monitor_mod, prefixes):
+    """Start netstat polling for each prefix. Returns list of context dicts."""
+    nm = net_monitor_mod
+    contexts = []
+
+    # Pre-flight check commands for netstat/SS tools
+    _ns_checks = {
+        "Netstat_TCP": "netstat -s -t",
+        "Netstat_UDP": "netstat -s -u",
+        "Netstat_Sockets": "netstat -anu",
+        "SS_Info": "ss -tin",
+        "SS_Queues": "ss -tnp",
+        "SS_Summary": "ss -s",
+    }
+
+    for pfx_raw in prefixes:
+        pfx = (pfx_raw.strip() + ' ') if pfx_raw.strip() else ''
+        label = pfx_raw.strip() if pfx_raw.strip() else 'local'
+
+        # Run per-prefix pre-flight checks
+        print(f"\n{'='*80}")
+        print(f" NETSTAT/SS PRE-FLIGHT CHECKS [prefix: {label}]")
+        print("=" * 80)
+        working_ns_tools = []
+        for tool, cmd in _ns_checks.items():
+            full_cmd = f"{pfx}{cmd}"
+            print(f"Testing Profile: {tool:<18} | Command: {full_cmd}")
+            try:
+                res = subprocess.check_output(full_cmd.split(), text=True,
+                                             stderr=subprocess.STDOUT, timeout=5)
+                if "not found" in res.lower() or "command not found" in res.lower():
+                    print(f"--> Status  : \033[91mFAILED / NOT INSTALLED\033[0m\n")
+                else:
+                    print(f"--> Status  : \033[92mWORKING\033[0m\n")
+                    working_ns_tools.append(tool)
+            except Exception:
+                print(f"--> Status  : \033[91mFAILED / RESOURCE LOCKED\033[0m\n")
+        print(f"Active Netstat/SS tools for [{label}]: {working_ns_tools}")
+        print("=" * 80)
+
+        if not working_ns_tools:
+            print(f"[WARN] No netstat/SS tools available for prefix '{label}', skipping.",
+                  file=sys.stderr)
+            continue
+
+        # Output directory per prefix
+        safe_label = re.sub(r'[^\w\-]', '_', label)
+        ns_out = f"netstat_out_{safe_label}"
+        if os.path.exists(ns_out):
+            shutil.rmtree(ns_out)
+        os.makedirs(ns_out)
+
+        # Per-prefix buffer/lock/stop (only for working tools)
+        ns_buffer = {m: 0.0 for tool in working_ns_tools for m in nm.TOOL_METRICS[tool]}
+        ns_lock = threading.Lock()
+        ns_stop = threading.Event()
+
+        # CSV files
+        csv_files = {}
+        csv_writers = {}
+        for tool in working_ns_tools:
+            path = os.path.join(ns_out, f"{tool.lower()}_metrics.csv")
+            f = open(path, 'w', newline='', encoding='utf-8')
+            writer = csv.writer(f)
+            writer.writerow(["Timestamp"] + nm.TOOL_METRICS[tool])
+            csv_files[tool] = f
+            csv_writers[tool] = writer
+
+        # Worker function
+        def _ns_worker(tool_name, prefix_str, buf, lock, stop_ev):
+            while not stop_ev.is_set():
+                t0 = time.time()
+                try:
+                    if tool_name == "Netstat_UDP":
+                        cmd = f"{prefix_str}netstat -s -u".split()
+                        res = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL)
+                        mapping = {
+                            r"(\d+)\s+packets\s+received": "ns_udp_in_datagrams",
+                            r"(\d+)\s+packets\s+to\s+unknown\s+port": "ns_udp_no_ports",
+                            r"(\d+)\s+packet\s+receive\s+errors": "ns_udp_in_errors",
+                            r"(\d+)\s+packets\s+sent": "ns_udp_out_datagrams",
+                            r"(\d+)\s+receive\s+buffer\s+errors": "ns_udp_rcvbuf_errors",
+                            r"(\d+)\s+send\s+buffer\s+errors": "ns_udp_sndbuf_errors",
+                            r"(\d+)\s+(?:InCsumErrors|checksum\s+errors)": "ns_udp_in_csum_errors",
+                        }
+                        with lock:
+                            for pattern, metric in mapping.items():
+                                m = re.search(pattern, res, re.IGNORECASE)
+                                if m:
+                                    buf[metric] = float(m.group(1))
+                    elif tool_name == "Netstat_TCP":
+                        cmd = f"{prefix_str}netstat -s -t".split()
+                        res = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL)
+                        mapping = {
+                            r"(\d+)\s+active\s+connection(?:s)?\s+opening": "ns_tcp_active_opens",
+                            r"(\d+)\s+passive\s+connection(?:s)?\s+opening": "ns_tcp_passive_opens",
+                            r"(\d+)\s+segments\s+received": "ns_tcp_in_segs",
+                            r"(\d+)\s+segments\s+send\s+out": "ns_tcp_out_segs",
+                            r"(\d+)\s+segments\s+retransmit": "ns_tcp_retrans_segs",
+                            r"(\d+)\s+bad\s+segments\s+received": "ns_tcp_in_errs",
+                            r"(\d+)\s+resets\s+sent": "ns_tcp_out_rsts",
+                        }
+                        with lock:
+                            for pattern, metric in mapping.items():
+                                m = re.search(pattern, res, re.IGNORECASE)
+                                if m:
+                                    buf[metric] = float(m.group(1))
+                    elif tool_name == "Netstat_Sockets":
+                        cmd = f"{prefix_str}netstat -anu".split()
+                        res = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL)
+                        udp_count = recv_q_total = recv_q_max = send_q_total = send_q_max = 0
+                        for line in res.splitlines():
+                            parts = line.split()
+                            if len(parts) >= 4 and parts[0] in ("udp", "udp6"):
+                                udp_count += 1
+                                rq, sq = int(parts[1]), int(parts[2])
+                                recv_q_total += rq
+                                send_q_total += sq
+                                recv_q_max = max(recv_q_max, rq)
+                                send_q_max = max(send_q_max, sq)
+                        with lock:
+                            buf["ns_sock_udp_count"] = float(udp_count)
+                            buf["ns_sock_udp_recv_q_total"] = float(recv_q_total)
+                            buf["ns_sock_udp_recv_q_max"] = float(recv_q_max)
+                            buf["ns_sock_udp_send_q_total"] = float(send_q_total)
+                            buf["ns_sock_udp_send_q_max"] = float(send_q_max)
+                    elif tool_name == "SS_Info":
+                        cmd = f"{prefix_str}ss -tin".split()
+                        res = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL)
+                        cwnd_list = []
+                        ssthresh_list = []
+                        rtt_list = []
+                        retrans_total = 0
+                        pacing_list = []
+                        delivery_list = []
+                        busy_total = 0.0
+                        rwnd_limited_total = 0.0
+                        sndbuf_limited_total = 0.0
+                        conn_count = 0
+                        for line in res.splitlines():
+                            cw = re.search(r'\bcwnd:(\d+)', line)
+                            if cw:
+                                cwnd_list.append(int(cw.group(1)))
+                                conn_count += 1
+                            ss_m = re.search(r'\bssthresh:(\d+)', line)
+                            if ss_m:
+                                ssthresh_list.append(int(ss_m.group(1)))
+                            rtt_m = re.search(r'\brtt:([\d.]+)/', line)
+                            if rtt_m:
+                                rtt_list.append(float(rtt_m.group(1)))
+                            ret_m = re.search(r'\bretrans:\d+/(\d+)', line)
+                            if ret_m:
+                                retrans_total += int(ret_m.group(1))
+                            pace_m = re.search(r'pacing_rate\s+([\d.]+\w+)', line)
+                            if pace_m:
+                                pacing_list.append(nm._parse_ss_rate(pace_m.group(1)))
+                            del_m = re.search(r'delivery_rate\s+([\d.]+\w+)', line)
+                            if del_m:
+                                delivery_list.append(nm._parse_ss_rate(del_m.group(1)))
+                            busy_m = re.search(r'\bbusy:([\d.]+)ms', line)
+                            if busy_m:
+                                busy_total += float(busy_m.group(1))
+                            rwnd_m = re.search(r'\brwnd_limited:([\d.]+)ms', line)
+                            if rwnd_m:
+                                rwnd_limited_total += float(rwnd_m.group(1))
+                            sndbuf_m = re.search(r'\bsndbuf_limited:([\d.]+)ms', line)
+                            if sndbuf_m:
+                                sndbuf_limited_total += float(sndbuf_m.group(1))
+                        with lock:
+                            buf["ss_cwnd_avg"] = sum(cwnd_list) / len(cwnd_list) if cwnd_list else 0.0
+                            buf["ss_cwnd_min"] = min(cwnd_list) if cwnd_list else 0.0
+                            buf["ss_ssthresh_avg"] = sum(ssthresh_list) / len(ssthresh_list) if ssthresh_list else 0.0
+                            buf["ss_rtt_avg"] = sum(rtt_list) / len(rtt_list) if rtt_list else 0.0
+                            buf["ss_retrans_total"] = float(retrans_total)
+                            buf["ss_pacing_rate_avg"] = sum(pacing_list) / len(pacing_list) if pacing_list else 0.0
+                            buf["ss_delivery_rate_avg"] = sum(delivery_list) / len(delivery_list) if delivery_list else 0.0
+                            buf["ss_busy_ms_total"] = busy_total
+                            buf["ss_rwnd_limited_ms_total"] = rwnd_limited_total
+                            buf["ss_sndbuf_limited_ms_total"] = sndbuf_limited_total
+                            buf["ss_conn_count"] = float(conn_count)
+                    elif tool_name == "SS_Queues":
+                        tcp_count = tcp_sq_total = tcp_sq_max = tcp_rq_total = tcp_rq_max = 0
+                        udp_count = udp_sq_total = udp_sq_max = udp_rq_total = udp_rq_max = 0
+                        cmd_tcp = f"{prefix_str}ss -tnp".split()
+                        res_tcp = subprocess.check_output(cmd_tcp, text=True, stderr=subprocess.DEVNULL)
+                        for line in res_tcp.splitlines():
+                            parts = line.split()
+                            if len(parts) >= 5 and parts[0] in ("ESTAB", "CLOSE-WAIT",
+                                                                  "FIN-WAIT-1", "FIN-WAIT-2",
+                                                                  "TIME-WAIT", "SYN-SENT"):
+                                tcp_count += 1
+                                rq, sq = int(parts[1]), int(parts[2])
+                                tcp_rq_total += rq
+                                tcp_sq_total += sq
+                                tcp_rq_max = max(tcp_rq_max, rq)
+                                tcp_sq_max = max(tcp_sq_max, sq)
+                        cmd_udp = f"{prefix_str}ss -unp".split()
+                        res_udp = subprocess.check_output(cmd_udp, text=True, stderr=subprocess.DEVNULL)
+                        for line in res_udp.splitlines():
+                            parts = line.split()
+                            if len(parts) >= 5 and parts[0] in ("UNCONN", "ESTAB"):
+                                udp_count += 1
+                                rq, sq = int(parts[1]), int(parts[2])
+                                udp_rq_total += rq
+                                udp_sq_total += sq
+                                udp_rq_max = max(udp_rq_max, rq)
+                                udp_sq_max = max(udp_sq_max, sq)
+                        with lock:
+                            buf["ss_tcp_count"] = float(tcp_count)
+                            buf["ss_tcp_send_q_total"] = float(tcp_sq_total)
+                            buf["ss_tcp_send_q_max"] = float(tcp_sq_max)
+                            buf["ss_tcp_recv_q_total"] = float(tcp_rq_total)
+                            buf["ss_tcp_recv_q_max"] = float(tcp_rq_max)
+                            buf["ss_udp_count"] = float(udp_count)
+                            buf["ss_udp_send_q_total"] = float(udp_sq_total)
+                            buf["ss_udp_send_q_max"] = float(udp_sq_max)
+                            buf["ss_udp_recv_q_total"] = float(udp_rq_total)
+                            buf["ss_udp_recv_q_max"] = float(udp_rq_max)
+                    elif tool_name == "SS_Summary":
+                        cmd = f"{prefix_str}ss -s".split()
+                        res = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL)
+                        tcp_total = tcp_estab = tcp_closed = tcp_orphaned = tcp_timewait = 0
+                        udp_total = 0
+                        tcp_line = re.search(r'TCP:\s+(\d+)\s+\((.+?)\)', res)
+                        if tcp_line:
+                            tcp_total = int(tcp_line.group(1))
+                            detail = tcp_line.group(2)
+                            em = re.search(r'estab\s+(\d+)', detail)
+                            if em:
+                                tcp_estab = int(em.group(1))
+                            cm = re.search(r'closed\s+(\d+)', detail)
+                            if cm:
+                                tcp_closed = int(cm.group(1))
+                            om = re.search(r'orphaned\s+(\d+)', detail)
+                            if om:
+                                tcp_orphaned = int(om.group(1))
+                            tw = re.search(r'timewait\s+(\d+)', detail)
+                            if tw:
+                                tcp_timewait = int(tw.group(1))
+                        udp_line = re.search(r'UDP:\s+(\d+)', res)
+                        if udp_line:
+                            udp_total = int(udp_line.group(1))
+                        with lock:
+                            buf["ss_tcp_total"] = float(tcp_total)
+                            buf["ss_tcp_estab"] = float(tcp_estab)
+                            buf["ss_tcp_closed"] = float(tcp_closed)
+                            buf["ss_tcp_orphaned"] = float(tcp_orphaned)
+                            buf["ss_tcp_timewait"] = float(tcp_timewait)
+                            buf["ss_udp_total"] = float(udp_total)
+                except Exception:
+                    pass
+                dt = time.time() - t0
+                time.sleep(max(0.05, nm.INTERVAL - dt))
+
+        # CSV logger
+        log_stop = threading.Event()
+
+        def _ns_csv_logger(buf, lock, stop_ev, writers, files):
+            while not stop_ev.is_set():
+                time.sleep(nm.INTERVAL)
+                t_stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                with lock:
+                    snapshot = buf.copy()
+                for tool, writer in writers.items():
+                    row = [t_stamp] + [snapshot[m] for m in nm.TOOL_METRICS[tool]]
+                    writer.writerow(row)
+                    files[tool].flush()
+
+        # Start threads
+        threads = []
+        for tool in working_ns_tools:
+            t = threading.Thread(target=_ns_worker,
+                                 args=(tool, pfx, ns_buffer, ns_lock, ns_stop), daemon=True)
+            threads.append(t)
+            t.start()
+
+        log_t = threading.Thread(target=_ns_csv_logger,
+                                 args=(ns_buffer, ns_lock, log_stop, csv_writers, csv_files),
+                                 daemon=True)
+        log_t.start()
+
+        contexts.append({
+            'module': nm,
+            'prefix': pfx_raw.strip(),
+            'label': label,
+            'output_dir': ns_out,
+            'csv_files': csv_files,
+            'csv_writers': csv_writers,
+            'threads': threads,
+            'log_thread': log_t,
+            'log_stop': log_stop,
+            'ns_stop': ns_stop,
+            'tools': working_ns_tools,
+        })
+
+    return contexts
+
+
+def netstat_stop(contexts):
+    """Stop all netstat contexts and return aggregated data per prefix.
+    Returns: {prefix_label: {tool: {times: [...], data: {...}}}}
+    """
+    if not contexts:
+        return {}
+    nm = contexts[0]['module']
+    results = {}
+
+    for ctx in contexts:
+        ctx['ns_stop'].set()
+        ctx['log_stop'].set()
+        ctx['log_thread'].join(timeout=3)
+        for f in ctx['csv_files'].values():
+            f.close()
+
+        # Parse CSVs
+        label = ctx['label']
+        ns_out = ctx['output_dir']
+        aggregated = {}
+        for tool in ctx.get('tools', _NETSTAT_TOOLS):
+            csv_path = os.path.join(ns_out, f"{tool.lower()}_metrics.csv")
+            if not os.path.exists(csv_path):
+                continue
+            timestamps = []
+            metrics_lists = {m: [] for m in nm.TOOL_METRICS[tool]}
+            with open(csv_path, 'r', encoding='utf-8') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    timestamps.append(datetime.strptime(row["Timestamp"], "%Y-%m-%d %H:%M:%S"))
+                    for m in nm.TOOL_METRICS[tool]:
+                        metrics_lists[m].append(float(row[m]))
+            if timestamps:
+                aggregated[tool] = {"times": timestamps, "data": metrics_lists}
+
+        if aggregated:
+            results[label] = aggregated
+
+    return results
+
+
+def netstat_print_report(nm, netstat_data):
+    """Print netstat report per prefix."""
+    if not netstat_data:
+        return
+
+    for label, aggregated in netstat_data.items():
+        duration = 0
+        for tool, pkg in aggregated.items():
+            if len(pkg["times"]) > 1:
+                duration = (pkg["times"][-1] - pkg["times"][0]).total_seconds()
+                break
+
+        print(f"\n{'='*95}")
+        print(f" NETSTAT / SS PROTOCOL STATISTICS [prefix: {label}]  (stress: {duration:.0f}s)")
+        print(f"  \033[90m(Per-prefix: Netstat_TCP, Netstat_UDP, Netstat_Sockets, SS_Info, SS_Queues, SS_Summary)\033[0m")
+        print("=" * 95)
+        print("  \033[90m(Cumulative counters shown as session delta \u0394)\033[0m")
+
+        for tool, package in aggregated.items():
+            samples = len(package["times"])
+            dur = (package["times"][-1] - package["times"][0]).total_seconds() if samples > 1 else 0
+            print(f"\n  \033[1mSubsystem: [{tool}]\033[0m  |  Samples: {samples}  |  Duration: {dur:.0f}s")
+            cumul_keys = nm.CUMULATIVE_METRICS.get(tool, [])
+            metrics_data = {m: package["data"][m] for m in nm.TOOL_METRICS[tool]}
+            nm.print_stats_table(tool, metrics_data, cumul_keys)
+
+
 def netmon_print_report(nm, aggregated_data, interface):
     """Print the net_monitor report section."""
     if not aggregated_data:
@@ -1999,8 +2447,10 @@ def netmon_print_report(nm, aggregated_data, interface):
             duration = (pkg["times"][-1] - pkg["times"][0]).total_seconds()
             break
 
+    pfx_label = f" @ {nm.CMD_PREFIX.strip()}" if nm.CMD_PREFIX.strip() else ""
     print(f"\n{'='*95}")
-    print(f" SYSTEM INFRASTRUCTURE TELEMETRY (stress phase: {duration:.0f}s on {interface})")
+    print(f" SYSTEM INFRASTRUCTURE TELEMETRY [interface: {interface}{pfx_label}]  (stress: {duration:.0f}s)")
+    print(f"  \033[90m(Per-interface: TC, IP_Link, Softnet, VMstat, IOstat, MPstat)\033[0m")
     print("=" * 95)
 
     # Statistical tables
@@ -2064,7 +2514,7 @@ def netmon_print_report(nm, aggregated_data, interface):
 # ---------------------------------------------------------------------------
 
 def generate_full_plot(baseline_ts, stress_ts, owd_results=None, twamp_results=None,
-                       netmon_data=None, netmon_mod=None, output_path=None):
+                       netmon_data=None, netmon_mod=None, netstat_data=None, output_path=None):
     """Generate comprehensive matplotlib figure with all test data + stats."""
     try:
         import matplotlib
@@ -2094,10 +2544,10 @@ def generate_full_plot(baseline_ts, stress_ts, owd_results=None, twamp_results=N
         all_elapsed = _baseline_elapsed + _stress_elapsed
         all_labels = _baseline_ts_labels + _stress_ts_labels
         if _baseline_rtt_vals:
-            ax.plot(_baseline_elapsed, _baseline_rtt_vals, 'g-', lw=1.2, alpha=0.7, label='Baseline RTT')
+            ax.plot(_baseline_elapsed, _baseline_rtt_vals, 'g:', marker='.', markersize=3, lw=1.0, alpha=0.7, label='Baseline RTT')
         if _stress_rtt_vals:
-            ax.plot(_stress_elapsed, _stress_rtt_vals, 'r-', lw=1.5, label='Stress RTT')
-        # Dual x-axis: elapsed seconds + timestamps every ~5s
+            ax.plot(_stress_elapsed, _stress_rtt_vals, 'r:', marker='.', markersize=3, lw=1.2, label='Stress RTT')
+        # X-axis: only elapsed seconds, start time in xlabel
         if all_elapsed:
             step = max(1, len(all_elapsed) // 10)
             tick_idx = [i for i in range(len(all_elapsed)) if i % step == 0]
@@ -2105,11 +2555,13 @@ def generate_full_plot(baseline_ts, stress_ts, owd_results=None, twamp_results=N
                 tick_idx.append(len(all_elapsed) - 1)
             ax.set_xticks([all_elapsed[i] for i in tick_idx])
             ax.set_xticklabels(
-                [f"{all_elapsed[i]:.0f}s\n{all_labels[i]}" for i in tick_idx],
+                [f"{all_elapsed[i]:.0f}s" for i in tick_idx],
                 rotation=0, ha='center', fontsize=7)
-        ax.set_xlabel("Elapsed (s) / Time")
+        start_time = all_labels[0] if all_labels else ''
+        ax.set_xlabel(f"Elapsed (s)  [start: {start_time}]")
         ax.set_ylabel("RTT (ms)")
-        ax.legend(loc='upper right', fontsize=8)
+        if _baseline_rtt_vals or _stress_rtt_vals:
+            ax.legend(loc='upper right', fontsize=8)
         # Stats annotation
         if _stress_rtt_vals:
             s = _quick_stats(_stress_rtt_vals)
@@ -2128,13 +2580,14 @@ def generate_full_plot(baseline_ts, stress_ts, owd_results=None, twamp_results=N
     def _plot_throughput(ax):
         if _stress_dl_vals:
             ax.fill_between(_stress_tp_elapsed, _stress_dl_vals, alpha=0.3, color='blue', label='DL')
-            ax.plot(_stress_tp_elapsed, _stress_dl_vals, 'b-', lw=1.2)
+            ax.plot(_stress_tp_elapsed, _stress_dl_vals, 'b:', marker='.', markersize=3, lw=1.0)
         if _stress_ul_vals:
             ax.fill_between(_stress_tp_elapsed, _stress_ul_vals, alpha=0.2, color='orange', label='UL')
-            ax.plot(_stress_tp_elapsed, _stress_ul_vals, color='orange', lw=1.2)
+            ax.plot(_stress_tp_elapsed, _stress_ul_vals, color='orange', linestyle=':', marker='.', markersize=3, lw=1.0)
         ax.set_ylabel("Throughput (Mbps)")
-        ax.legend(loc='upper right', fontsize=8)
-        # Dual x-axis labels
+        if _stress_dl_vals or _stress_ul_vals:
+            ax.legend(loc='upper right', fontsize=8)
+        # X-axis: only elapsed seconds, start time in xlabel
         if _stress_tp_elapsed:
             step = max(1, len(_stress_tp_elapsed) // 10)
             tick_idx = [i for i in range(len(_stress_tp_elapsed)) if i % step == 0]
@@ -2142,9 +2595,10 @@ def generate_full_plot(baseline_ts, stress_ts, owd_results=None, twamp_results=N
                 tick_idx.append(len(_stress_tp_elapsed) - 1)
             ax.set_xticks([_stress_tp_elapsed[i] for i in tick_idx])
             ax.set_xticklabels(
-                [f"{_stress_tp_elapsed[i]:.0f}s\n{_stress_tp_labels[i]}" for i in tick_idx],
+                [f"{_stress_tp_elapsed[i]:.0f}s" for i in tick_idx],
                 rotation=0, ha='center', fontsize=7)
-        ax.set_xlabel("Elapsed (s) / Time")
+        start_time = _stress_tp_labels[0] if _stress_tp_labels else ''
+        ax.set_xlabel(f"Elapsed (s)  [start: {start_time}]")
         # Stats
         dl_vals = [v for v in _stress_dl_vals if v > 0]
         ul_vals = [v for v in _stress_ul_vals if v > 0]
@@ -2357,6 +2811,80 @@ def generate_full_plot(baseline_ts, stress_ts, owd_results=None, twamp_results=N
                 return _plot
             panels.append((f"Net Monitor: {panel_label}", _make_netmon_plot()))
 
+    # --- Netstat panels (namespace-wide, one panel per tool per prefix) ---
+    if netstat_data and netmon_mod:
+        nm = netmon_mod
+        for pfx_label, aggregated in netstat_data.items():
+            for tool, package in aggregated.items():
+                times = package["times"]
+                if not times:
+                    continue
+                t0 = times[0]
+                elapsed = [(t - t0).total_seconds() for t in times]
+
+                def _make_netstat_plot(tool=tool, package=package, elapsed=elapsed,
+                                      times=times, pfx_label=pfx_label):
+                    def _plot(ax):
+                        cumul_keys = nm.CUMULATIVE_METRICS.get(tool, [])
+                        if tool in nm.THROUGHPUT_METRICS:
+                            # Throughput on primary axis, events on secondary
+                            for m in nm.THROUGHPUT_METRICS[tool]:
+                                raw = package["data"][m]
+                                deltas = nm._compute_deltas(raw) if m in cumul_keys else raw
+                                lbl = m.replace("ns_", "").replace("_", " ").title()
+                                ax.plot(elapsed, deltas, lw=1.5, label=f"{lbl}/s")
+                            ax.set_ylabel("Rate/s")
+                            if tool in nm.EVENT_METRICS:
+                                ax2 = ax.twinx()
+                                for m in nm.EVENT_METRICS[tool]:
+                                    raw = package["data"][m]
+                                    deltas = nm._compute_deltas(raw) if m in cumul_keys else raw
+                                    lbl = m.replace("ns_", "").replace("_", " ").title()
+                                    ax2.plot(elapsed, deltas, '--', lw=1, alpha=0.7, label=f"{lbl}/s")
+                                ax2.set_ylabel("Events/s", color='tab:red', fontsize=8)
+                                ax2.tick_params(axis='y', labelcolor='tab:red')
+                                h1, l1 = ax.get_legend_handles_labels()
+                                h2, l2 = ax2.get_legend_handles_labels()
+                                ax.legend(h1 + h2, l1 + l2, loc='upper right', fontsize=7, ncol=2)
+                            else:
+                                ax.legend(loc='upper right', fontsize=7, ncol=2)
+                        else:
+                            # Sockets: instantaneous gauges
+                            for m in nm.TOOL_METRICS[tool]:
+                                lbl = m.replace("ns_sock_", "").replace("_", " ").title()
+                                ax.plot(elapsed, package["data"][m], lw=1.5, label=lbl)
+                            ax.set_ylabel("Count / Bytes")
+                            ax.legend(loc='upper right', fontsize=7, ncol=2)
+
+                        # Dual x-axis
+                        tick_idx = [i for i in range(len(elapsed)) if i % 5 == 0 or i == len(elapsed) - 1]
+                        ax.set_xticks([elapsed[i] for i in tick_idx])
+                        ax.set_xticklabels(
+                            [f"{elapsed[i]:.0f}s\n{times[i].strftime('%H:%M:%S')}" for i in tick_idx],
+                            rotation=0, ha='center', fontsize=7)
+                        ax.set_xlabel("Elapsed (s) / Time")
+
+                        # Stats annotation
+                        stats_lines = []
+                        for m in list(package["data"].keys())[:4]:
+                            raw = package["data"][m]
+                            vals = nm._compute_deltas(raw) if m in cumul_keys else raw
+                            if vals and any(v != 0 for v in vals):
+                                s = _quick_stats(vals)
+                                short_name = m.replace("ns_", "").replace("_", " ").title()
+                                if m in cumul_keys:
+                                    short_name += "/s"
+                                stats_lines.append(
+                                    f"{short_name}: min={s['min']:.1f} max={s['max']:.1f} "
+                                    f"avg={s['mean']:.1f} p95={s['p95']:.1f}")
+                        if stats_lines:
+                            ax.text(0.02, 0.95, "\n".join(stats_lines),
+                                    transform=ax.transAxes, fontsize=7, fontfamily='monospace',
+                                    va='top', bbox=dict(facecolor='white', alpha=0.8))
+
+                    return _plot
+                panels.append((f"Netstat: {tool} [{pfx_label}]", _make_netstat_plot()))
+
     # --- Build figure ---
     n_panels = len(panels)
     fig, axes = plt.subplots(n_panels, 1, figsize=(14, 3.8 * n_panels), sharex=False)
@@ -2533,6 +3061,11 @@ def main():
             shutil.rmtree(old)
         except OSError:
             pass
+    for old in glob.glob("netstat_out_*"):
+        try:
+            shutil.rmtree(old)
+        except OSError:
+            pass
     if os.path.exists("net_out"):
         try:
             shutil.rmtree("net_out")
@@ -2679,15 +3212,22 @@ def main():
     netmon_ctxs = []  # list of (interface, ctx) tuples
     netmon_mod = None
     netmon_all_aggregated = {}  # {interface: aggregated_data}
+    netstat_ctxs = []  # netstat contexts (namespace-wide)
+    netstat_all_data = {}  # {prefix_label: {tool: {times, data}}}
     if args.netmon:
         netmon_mod = _load_net_monitor()
         if netmon_mod:
             ifaces = args.netmon_interface or [interface or 'eth0']
             prefix = args.netmon_prefix or ''
+            # Netstat prefixes: independent list, defaults to same as netmon prefix
+            ns_prefixes = args.netstat_prefix if args.netstat_prefix is not None else [prefix]
             for nm_iface in ifaces:
-                ctx = netmon_start(netmon_mod, nm_iface, cmd_prefix=prefix)
+                ctx = netmon_start(netmon_mod, nm_iface, cmd_prefix=prefix,
+                                   netstat_prefixes=ns_prefixes)
                 if ctx:
                     netmon_ctxs.append((nm_iface, ctx))
+            # Start netstat separately (namespace-wide, not per-interface)
+            netstat_ctxs = netstat_start(netmon_mod, ns_prefixes)
 
     if owd_enabled:
         _owd_t = threading.Thread(
@@ -2725,6 +3265,16 @@ def main():
                 min_probe_depth=min_probe_depth,
                 max_rtt=args.max_rtt,
             )
+    except KeyboardInterrupt:
+        print("\n\033[93m[!] Ctrl+C — stopping early, generating report with collected data...\033[0m")
+        if 'stress_data' not in dir() or stress_data is None:
+            stress_data = {}
+        if 'stress_probes' not in dir():
+            stress_probes = 0
+        if 'stress_lost' not in dir():
+            stress_lost = 0
+        if 'stress_ts' not in dir() or stress_ts is None:
+            stress_ts = []
     finally:
         stop_traffic_gen(traffic_proc)
         # --- Net Monitor stop (all interfaces) ---
@@ -2732,10 +3282,13 @@ def main():
             agg = netmon_stop(ctx)
             if agg:
                 netmon_all_aggregated[nm_iface] = agg
+        # --- Netstat stop (namespace-wide) ---
+        if netstat_ctxs:
+            netstat_all_data = netstat_stop(netstat_ctxs)
         if owd_enabled:
-            _owd_t.join()
+            _owd_t.join(timeout=5)
         if twamp_enabled:
-            _twamp_t.join()
+            _twamp_t.join(timeout=5)
 
     # --- OWD post-processing ---
     if owd_enabled:
@@ -2807,6 +3360,10 @@ def main():
         for nm_iface, agg_data in netmon_all_aggregated.items():
             netmon_print_report(netmon_mod, agg_data, nm_iface)
 
+    # --- Netstat report (if collected) ---
+    if netstat_all_data and netmon_mod:
+        netstat_print_report(netmon_mod, netstat_all_data)
+
     # --- Auto-generate matplotlib plot (silent fail if not installed) ---
     # Merge all interface netmon data into combined dict for plotting (prefix keys with iface)
     combined_netmon = None
@@ -2814,22 +3371,174 @@ def main():
         combined_netmon = {}
         for nm_iface, agg_data in netmon_all_aggregated.items():
             for tool, pkg in agg_data.items():
-                panel_label = f"{tool} [{nm_iface}]" if len(netmon_all_aggregated) > 1 else tool
+                _pfx_tag = f" @ {args.netmon_prefix}" if args.netmon_prefix else ""
+                panel_label = f"{tool} [{nm_iface}{_pfx_tag}]"
                 combined_netmon[panel_label] = {
                     "tool_name": tool,
                     "panel_label": panel_label,
                     "times": pkg["times"],
                     "data": pkg["data"],
                 }
+
+    # --- Plot generation (with splitting for long tests) ---
+    def _downsample_list(lst, max_pts):
+        """Evenly downsample a list to at most max_pts entries."""
+        if not lst or max_pts <= 0 or len(lst) <= max_pts:
+            return lst
+        step = len(lst) / max_pts
+        return [lst[int(i * step)] for i in range(max_pts)]
+
+    def _downsample_pkg(pkg, max_pts):
+        """Downsample a netmon/netstat package dict {times, data, ...}."""
+        n = len(pkg["times"])
+        if max_pts <= 0 or n <= max_pts:
+            return pkg
+        step = n / max_pts
+        idx = [int(i * step) for i in range(max_pts)]
+        result = dict(pkg)  # shallow copy
+        result["times"] = [pkg["times"][i] for i in idx]
+        result["data"] = {m: [pkg["data"][m][i] for i in idx] for m in pkg["data"]}
+        return result
+
+    def _slice_ts(ts_list, start_s, end_s):
+        """Slice a timestamp list by elapsed range."""
+        if not ts_list:
+            return []
+        return [e for e in ts_list if start_s <= e.get('elapsed', 0) < end_s]
+
+    def _slice_owd(results, start_s, end_s):
+        """Slice OWD/TWAMP results by elapsed range."""
+        if not results:
+            return None
+        sliced = [r for r in results if start_s <= r.get('elapsed', 0) < end_s]
+        return sliced if sliced else None
+
+    def _slice_netmon(nm_data, start_s, end_s):
+        """Slice combined_netmon by time window (seconds from first sample)."""
+        if not nm_data:
+            return None
+        sliced = {}
+        for key, pkg in nm_data.items():
+            times = pkg["times"]
+            if not times:
+                continue
+            t0 = times[0]
+            idx = [i for i, t in enumerate(times)
+                   if start_s <= (t - t0).total_seconds() < end_s]
+            if idx:
+                sliced[key] = {
+                    "tool_name": pkg["tool_name"],
+                    "panel_label": pkg["panel_label"],
+                    "times": [times[i] for i in idx],
+                    "data": {m: [pkg["data"][m][i] for i in idx] for m in pkg["data"]},
+                }
+        return sliced if sliced else None
+
+    def _slice_netstat(ns_data, start_s, end_s):
+        """Slice netstat_all_data by time window."""
+        if not ns_data:
+            return None
+        sliced = {}
+        for label, aggregated in ns_data.items():
+            sliced_agg = {}
+            for tool, pkg in aggregated.items():
+                times = pkg["times"]
+                if not times:
+                    continue
+                t0 = times[0]
+                idx = [i for i, t in enumerate(times)
+                       if start_s <= (t - t0).total_seconds() < end_s]
+                if idx:
+                    sliced_agg[tool] = {
+                        "times": [times[i] for i in idx],
+                        "data": {m: [pkg["data"][m][i] for i in idx] for m in pkg["data"]},
+                    }
+            if sliced_agg:
+                sliced[label] = sliced_agg
+        return sliced if sliced else None
+
+    def _run_plot_generation():
+        # Determine stress duration
+        stress_duration = 0
+        if stress_ts and len(stress_ts) >= 2:
+            stress_duration = stress_ts[-1].get('elapsed', 0) - stress_ts[0].get('elapsed', 0)
+
+        should_split = (PLOT_SPLIT_SECS > 0 and stress_duration > PLOT_SPLIT_SECS)
+
+        if should_split:
+            n_chunks = int(stress_duration // PLOT_SPLIT_SECS)
+            remainder = stress_duration - (n_chunks * PLOT_SPLIT_SECS)
+            if remainder > 60:  # include partial chunk if > 1 min
+                n_chunks += 1
+
+            print(f"\n[+] Long test ({stress_duration/3600:.1f}h) — splitting into {n_chunks} chunk plots...")
+
+            for chunk_i in range(n_chunks):
+                start_s = chunk_i * PLOT_SPLIT_SECS
+                end_s = (chunk_i + 1) * PLOT_SPLIT_SECS
+                chunk_path = f"bufferbloat_analysis_h{chunk_i}-h{chunk_i+1}.png"
+
+                chunk_stress = _slice_ts(stress_ts, start_s, end_s)
+                chunk_owd = _slice_owd(owd_results if owd_enabled else None, start_s, end_s)
+                chunk_twamp = _slice_owd(twamp_results if twamp_enabled else None, start_s, end_s)
+                chunk_netmon = _slice_netmon(combined_netmon, start_s, end_s)
+                chunk_netstat = _slice_netstat(
+                    netstat_all_data if netstat_all_data else None, start_s, end_s)
+
+                print(f"  Generating: {chunk_path} ({start_s/60:.0f}m – {end_s/60:.0f}m)")
+                generate_full_plot(
+                    baseline_ts, chunk_stress,
+                    owd_results=chunk_owd,
+                    twamp_results=chunk_twamp,
+                    netmon_data=chunk_netmon,
+                    netmon_mod=netmon_mod,
+                    netstat_data=chunk_netstat,
+                    output_path=chunk_path,
+                )
+
+            # Combined plot with downsampled data
+            if PLOT_MAX_POINTS > 0:
+                print(f"  Generating combined plot (downsampled to {PLOT_MAX_POINTS} pts)...")
+                ds_stress = _downsample_list(stress_ts, PLOT_MAX_POINTS)
+                ds_owd = _downsample_list(owd_results, PLOT_MAX_POINTS) if owd_enabled else None
+                ds_twamp = _downsample_list(twamp_results, PLOT_MAX_POINTS) if twamp_enabled else None
+
+                ds_netmon = None
+                if combined_netmon:
+                    ds_netmon = {k: _downsample_pkg(v, PLOT_MAX_POINTS)
+                                 for k, v in combined_netmon.items()}
+                ds_netstat = None
+                if netstat_all_data:
+                    ds_netstat = {}
+                    for label, agg in netstat_all_data.items():
+                        ds_netstat[label] = {
+                            tool: _downsample_pkg(pkg, PLOT_MAX_POINTS)
+                            for tool, pkg in agg.items()
+                        }
+
+                generate_full_plot(
+                    baseline_ts, ds_stress,
+                    owd_results=ds_owd,
+                    twamp_results=ds_twamp,
+                    netmon_data=ds_netmon,
+                    netmon_mod=netmon_mod,
+                    netstat_data=ds_netstat,
+                    output_path="bufferbloat_analysis.png",
+                )
+        else:
+            # Short test — single plot, no splitting needed
+            generate_full_plot(
+                baseline_ts, stress_ts,
+                owd_results=owd_results if owd_enabled else None,
+                twamp_results=twamp_results if twamp_enabled else None,
+                netmon_data=combined_netmon,
+                netmon_mod=netmon_mod,
+                netstat_data=netstat_all_data if netstat_all_data else None,
+                output_path="bufferbloat_analysis.png",
+            )
+
     try:
-        generate_full_plot(
-            baseline_ts, stress_ts,
-            owd_results=owd_results if owd_enabled else None,
-            twamp_results=twamp_results if twamp_enabled else None,
-            netmon_data=combined_netmon,
-            netmon_mod=netmon_mod,
-            output_path="bufferbloat_analysis.png",
-        )
+        _run_plot_generation()
     except ImportError:
         pass  # matplotlib not installed
     except Exception as e:
