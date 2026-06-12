@@ -112,7 +112,7 @@ sudo python3 userbufferTest.py -T 8.8.8.8 --owd --twamp \
 # │       Optional second arg: command prefix for namespace/container.      │
 # └─────────────────────────────────────────────────────────────────────────┘
 sudo python3 net_monitor.py eth3
-sudo python3 net_monitor.py eth0 "denter atg4g"
+sudo python3 net_monitor.py eth0 "ip netns exec ns1"
 ```
 
 ---
@@ -207,7 +207,7 @@ bufferbloat with packet queuing, CPU stalls, and I/O contention.
 |------|---------|-------------|
 | `--netmon` | off | Enable system telemetry during stress phase |
 | `--netmon-interface` | auto | Interface(s) for TC qdisc / IP link stats (space-separated; defaults to `-I` interface) |
-| `--netmon-prefix` | *(empty)* | Command prefix for namespace/container execution (e.g. `denter atg4g` or `ip netns exec ns1`) |
+| `--netmon-prefix` | *(empty)* | Command prefix for namespace/container execution (e.g. `ip netns exec ns1` or `ip netns exec ns2`) |
 | `--netstat-prefix` | *(same as --netmon-prefix)* | Independent prefix(es) for netstat monitoring (repeatable, space-separated). Runs `netstat -s -t`, `netstat -s -u`, `netstat -anu` per prefix. Omit for local. |
 
 **Multiple interfaces:** Pass more than one interface to monitor all of them
@@ -219,17 +219,17 @@ sudo python3 userbufferTest.py -T 8.8.8.8 --netmon --netmon-interface eth0 eth3
 **Command prefix (namespace/container):** Use `--netmon-prefix` to run all
 monitoring commands inside a different namespace or container:
 ```bash
-# Monitor inside network namespace "atg4g"
+# Monitor inside network namespace "ns1"
 sudo python3 userbufferTest.py -T 8.8.8.8 --netmon --netmon-interface eth0 \
-    --netmon-prefix "denter atg4g"
+    --netmon-prefix "ip netns exec ns1"
 
-# Monitor inside ip netns
+# Monitor inside a second network namespace
 sudo python3 userbufferTest.py -T 8.8.8.8 --netmon --netmon-interface veth0 \
-    --netmon-prefix "ip netns exec myns"
+    --netmon-prefix "ip netns exec ns2"
 
 # Multi-interface + prefix + all OWD methods
 sudo python3 userbufferTest.py -T 1.1.1.1 --owd --twamp --twamp-server x.x.x.x \
-    --netmon --netmon-interface eth1 eth3 --netmon-prefix "denter atg4g" -b 10 -s 30
+    --netmon --netmon-interface eth1 eth3 --netmon-prefix "ip netns exec ns1" -b 10 -s 30
 ```
 
 **Netstat prefix (independent namespace monitoring):** Use `--netstat-prefix` to
@@ -238,33 +238,33 @@ Useful when you want TCP/UDP protocol stats from multiple containers:
 ```bash
 # Netstat in a specific namespace (TC/IP use the main prefix)
 sudo python3 userbufferTest.py -T 8.8.8.8 --netmon --netmon-interface eth1 \
-    --netmon-prefix "denter atg4g" --netstat-prefix "denter atg4g"
+    --netmon-prefix "ip netns exec ns1" --netstat-prefix "ip netns exec ns1"
 
 # Netstat in multiple namespaces simultaneously
 sudo python3 userbufferTest.py -T 8.8.8.8 --netmon --netmon-interface eth1 \
-    --netmon-prefix "denter atg4g" --netstat-prefix "denter atg4g" "denter ns2"
+    --netmon-prefix "ip netns exec ns1" --netstat-prefix "ip netns exec ns1" "ip netns exec ns2"
 
 # Local netstat (no prefix) + remote TC/IP monitoring
 sudo python3 userbufferTest.py -T 8.8.8.8 --netmon --netmon-interface eth1 \
-    --netmon-prefix "denter atg4g" --netstat-prefix ""
+    --netmon-prefix "ip netns exec ns1" --netstat-prefix ""
 ```
 
 **Subsystems monitored:**
 
-| Subsystem | What it reveals |
-|-----------|----------------|
-| TC (qdisc) | HTB/pfifo queue depth, drops, overlimits, requeues |
-| IP Link | NIC-level RX/TX bytes, drops, errors, overruns |
-| Softnet | Per-CPU backlog drops & softIRQ squeeze events |
-| VMstat | Run-queue, blocked procs, swap |
-| IOstat | Disk TPS, read/write throughput |
-| MPstat | CPU user/system/iowait/softirq/idle |
-| Netstat TCP | Active/passive opens, segments in/out, retransmits, resets |
-| Netstat UDP | Datagrams in/out, port unreachable, rcvbuf/sndbuf errors |
-| Netstat Sockets | Active UDP socket count, aggregate Recv-Q/Send-Q depths |
-| SS Info | TCP internal state: cwnd, ssthresh, RTT, retransmits, pacing/delivery rate, buffer-limited time |
-| SS Queues | Per-socket Send-Q/Recv-Q depths for TCP and UDP (kernel buffer pressure) |
-| SS Summary | Socket state counts: TCP estab/closed/orphaned/timewait, UDP total |
+| Subsystem | What it exposes | Helps identify |
+|-----------|-----------------|----------------|
+| TC (qdisc) | HTB/pfifo queue depth, drops, overlimits, requeues | Traffic-shaping queue bloat, burst drops, overlimit pressure |
+| IP Link | NIC-level RX/TX bytes, drops, errors, overruns | Driver/NIC ring overflow, link-layer loss, asymmetric traffic load |
+| Softnet | Per-CPU backlog drops & softIRQ squeeze events | CPU inability to drain packets fast enough, receive-path overload |
+| VMstat | Run-queue, blocked procs, swap | CPU or memory pressure affecting packet processing |
+| IOstat | Disk TPS, read/write throughput | Disk contention that can starve softIRQ / application processing |
+| MPstat | CPU user/system/iowait/softirq/idle | Whether networking pain is CPU-bound, softirq-bound, or iowait-bound |
+| Netstat TCP | Active/passive opens, segments in/out, retransmits, resets | TCP retransmission pressure, reset storms, session churn |
+| Netstat UDP | Datagrams in/out, port unreachable, rcvbuf/sndbuf errors | UDP buffer exhaustion, drops, or application receive/send bottlenecks |
+| Netstat Sockets | Active UDP socket count, aggregate Recv-Q/Send-Q depths | Socket queue buildup and backpressure at the UDP socket layer |
+| SS Info | TCP internal state: cwnd, ssthresh, RTT, retransmits, pacing/delivery rate, buffer-limited time | Congestion-window collapse, pacing mismatch, RTT inflation, sender/receiver buffer limiting |
+| SS Queues | Per-socket Send-Q/Recv-Q depths for TCP and UDP (kernel buffer pressure) | Kernel socket buffer pressure and which side is queuing data |
+| SS Summary | Socket state counts: TCP estab/closed/orphaned/timewait, UDP total | Connection-state buildup, orphan leaks, excessive TIME-WAIT or closed-state churn |
 
 **Report includes:**
 - Per-subsystem statistical table (min/max/mean/median/stdev/P95)
@@ -290,6 +290,10 @@ is **automatically generated** at the end of every test run. No flag needed.
 9. SS Queues — TCP/UDP kernel socket buffer depths (Send-Q/Recv-Q)
 10. SS Summary — connection state counts (estab, orphaned, timewait)
 
+**Legend help inside plots:**
+- Net Monitor / Netstat / SS panels keep metric names in the legend and now add a short legend title such as `Exposes: qdisc queue bloat/drops` or `Exposes: TCP cwnd/rtt/pacing health`.
+- This title tells you what that tool is for before you interpret the individual metric lines.
+
 **Panel labeling convention:**
 - **Per-interface** panels (TC, IP_Link, Softnet, VMstat, IOstat, MPstat):
   labeled `Tool [interface @ prefix]` — runs inside the namespace on specific NICs
@@ -297,8 +301,8 @@ is **automatically generated** at the end of every test run. No flag needed.
   labeled `Netstat: Tool [prefix]` — runs namespace-wide using `--netstat-prefix`, independent of interface
 
 **Report section labeling:**
-- `SYSTEM INFRASTRUCTURE TELEMETRY [interface: eth1 @ denter atg4g]` → per-interface tools
-- `NETSTAT / SS PROTOCOL STATISTICS [prefix: denter atg4g]` → per-prefix tools
+- `SYSTEM INFRASTRUCTURE TELEMETRY [interface: eth1 @ ip netns exec ns1]` → per-interface tools
+- `NETSTAT / SS PROTOCOL STATISTICS [prefix: ip netns exec ns1]` → per-prefix tools
 
 This makes it immediately clear from both the chart and the out.log which tools are
 tied to a specific NIC and which are namespace-wide protocol statistics.
@@ -417,11 +421,11 @@ sudo python3 userbufferTest.py -T 8.8.8.8 --netmon --netmon-interface eth0 eth3 
 
 # With command prefix (namespace/container)
 sudo python3 userbufferTest.py -T 8.8.8.8 --netmon --netmon-interface eth0 \
-    --netmon-prefix "denter atg4g" --twamp -b 30 -s 120
+    --netmon-prefix "ip netns exec ns1" --twamp -b 30 -s 120
 
 # Multi-interface + prefix
 sudo python3 userbufferTest.py -T 8.8.8.8 --netmon --netmon-interface eth1 eth3 \
-    --netmon-prefix "ip netns exec myns" --owd --twamp -b 30 -s 300
+    --netmon-prefix "ip netns exec ns2" --owd --twamp -b 30 -s 300
 
 # ── Specialised scenarios ────────────────────────────────────────────────────
 
@@ -445,7 +449,7 @@ sudo python3 userbufferTest.py -T 8.8.8.8 --owd --twamp --netmon --netmon-interf
 
 Run these commands manually (with your prefix) to verify all tools work before
 launching a full test. Replace `<PREFIX>` with your namespace/container command
-(e.g. `denter atg4g `, `ip netns exec myns `) or leave empty for local.
+(e.g. `ip netns exec ns1 `, `ip netns exec ns2 `) or leave empty for local.
 
 ```bash
 # ── Per-interface tools (replace eth3 with your interface) ───────────────────
@@ -499,8 +503,8 @@ launching a full test. Replace `<PREFIX>` with your namespace/container command
 ### Quick copy-paste test with a real prefix
 
 ```bash
-# Example: test all commands inside namespace "atg4g"
-PREFIX="denter atg4g "
+# Example: test all commands inside namespace "ns1"
+PREFIX="ip netns exec ns1 "
 
 ${PREFIX}tc -s qdisc show dev eth1
 ${PREFIX}ip -s link show dev eth1

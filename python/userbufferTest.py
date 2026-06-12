@@ -1741,7 +1741,7 @@ def parse_args():
                         help='Interface(s) for TC/IP_Link monitoring (space-separated; defaults to -I interface)')
     netmon.add_argument('--netmon-prefix', type=str, default='', metavar='PREFIX',
                         help='Command prefix for namespace/container execution '
-                             '(e.g. "denter atg4g" or "ip netns exec ns1")')
+                            '(e.g. "ip netns exec ns1" or "ip netns exec ns2")')
     netmon.add_argument('--netstat-prefix', type=str, nargs='*', default=None, metavar='PREFIX',
                         help='Command prefix(es) for netstat monitoring (repeatable). '
                              'Runs netstat -s -t, netstat -s -u, netstat -anu per prefix. '
@@ -2535,6 +2535,27 @@ def generate_full_plot(baseline_ts, stress_ts, owd_results=None, twamp_results=N
     # Collect all time-series datasets
     panels = []  # list of (title, plot_func) — each draws into an axes
 
+    TOOL_PLOT_HINTS = {
+        "TC": "qdisc queue bloat/drops",
+        "IP_Link": "NIC loss/overrun",
+        "Softnet": "CPU backlog/squeeze",
+        "VMstat": "CPU/memory pressure",
+        "IOstat": "disk contention",
+        "MPstat": "CPU softirq load",
+        "Netstat_TCP": "TCP retrans/reset pressure",
+        "Netstat_UDP": "UDP errors/buffer issues",
+        "Netstat_Sockets": "UDP socket queue pressure",
+        "SS_Info": "TCP cwnd/rtt/pacing health",
+        "SS_Queues": "socket buffer pressure",
+        "SS_Summary": "connection state buildup",
+    }
+
+    def _legend_with_hint(ax, *args, hint=None, **kwargs):
+        if hint:
+            kwargs.setdefault("title", f"Exposes: {hint}")
+            kwargs.setdefault("title_fontsize", 6)
+        return ax.legend(*args, **kwargs)
+
     # --- Panel 1: RTT over time ---
     # Collect elapsed + timestamps for dual x-axis labeling
     _baseline_elapsed = [e['elapsed'] for e in baseline_ts if e['e2e_rtt'] is not None]
@@ -2708,6 +2729,7 @@ def generate_full_plot(baseline_ts, stress_ts, owd_results=None, twamp_results=N
             def _make_netmon_plot(base_tool=base_tool, panel_label=panel_label, package=package, elapsed=elapsed, times=times):
                 def _plot(ax):
                     cumul_keys = nm.CUMULATIVE_METRICS.get(base_tool, [])
+                    legend_hint = TOOL_PLOT_HINTS.get(base_tool)
 
                     if base_tool == "TC":
                         # TC: check if backlog has any non-zero values
@@ -2739,9 +2761,12 @@ def generate_full_plot(baseline_ts, stress_ts, owd_results=None, twamp_results=N
                                 ax2.tick_params(axis='y', labelcolor='tab:red')
                                 h1, l1 = ax.get_legend_handles_labels()
                                 h2, l2 = ax2.get_legend_handles_labels()
-                                ax.legend(h1 + h2, l1 + l2, loc='upper right', fontsize=7, ncol=2)
+                                _legend_with_hint(ax, h1 + h2, l1 + l2,
+                                                  loc='upper right', fontsize=7, ncol=2,
+                                                  hint=legend_hint)
                             else:
-                                ax.legend(loc='upper right', fontsize=7, ncol=2)
+                                _legend_with_hint(ax, loc='upper right', fontsize=7, ncol=2,
+                                                  hint=legend_hint)
                         else:
                             # No backlog — show ALL metrics as rates on single axis
                             for m in nm.TOOL_METRICS[base_tool]:
@@ -2750,7 +2775,8 @@ def generate_full_plot(baseline_ts, stress_ts, owd_results=None, twamp_results=N
                                 lbl = m.replace("tc_", "").replace("_", " ").title()
                                 ax.plot(elapsed, deltas, lw=1.5, label=f"{lbl}/s")
                             ax.set_ylabel("TC Rate/s")
-                            ax.legend(loc='upper right', fontsize=7, ncol=2)
+                            _legend_with_hint(ax, loc='upper right', fontsize=7, ncol=2,
+                                              hint=legend_hint)
 
                     elif base_tool in nm.THROUGHPUT_METRICS:
                         # IP_Link / Softnet: throughput on primary, events on secondary
@@ -2771,16 +2797,20 @@ def generate_full_plot(baseline_ts, stress_ts, owd_results=None, twamp_results=N
                             ax2.tick_params(axis='y', labelcolor='tab:red')
                             h1, l1 = ax.get_legend_handles_labels()
                             h2, l2 = ax2.get_legend_handles_labels()
-                            ax.legend(h1 + h2, l1 + l2, loc='upper right', fontsize=7, ncol=2)
+                            _legend_with_hint(ax, h1 + h2, l1 + l2,
+                                              loc='upper right', fontsize=7, ncol=2,
+                                              hint=legend_hint)
                         else:
-                            ax.legend(loc='upper right', fontsize=7, ncol=2)
+                            _legend_with_hint(ax, loc='upper right', fontsize=7, ncol=2,
+                                              hint=legend_hint)
                     else:
                         # VMstat/IOstat/MPstat: instantaneous gauge values
                         for m in nm.TOOL_METRICS[base_tool]:
                             lbl = m.replace("vm_", "").replace("io_", "").replace("cpu_", "").replace("_", " ").title()
                             ax.plot(elapsed, package["data"][m], lw=1.5, label=lbl)
                         ax.set_ylabel("Value")
-                        ax.legend(loc='upper right', fontsize=7, ncol=2)
+                        _legend_with_hint(ax, loc='upper right', fontsize=7, ncol=2,
+                                          hint=legend_hint)
                     # X-axis: adaptive ticks, elapsed-only, start time in xlabel
                     step = max(1, len(elapsed) // 10)
                     tick_idx = [i for i in range(len(elapsed)) if i % step == 0]
@@ -2839,6 +2869,7 @@ def generate_full_plot(baseline_ts, stress_ts, owd_results=None, twamp_results=N
                                       times=times, pfx_label=pfx_label):
                     def _plot(ax):
                         cumul_keys = nm.CUMULATIVE_METRICS.get(tool, [])
+                        legend_hint = TOOL_PLOT_HINTS.get(tool)
                         if tool in nm.THROUGHPUT_METRICS:
                             # Throughput on primary axis, events on secondary
                             for m in nm.THROUGHPUT_METRICS[tool]:
@@ -2858,16 +2889,20 @@ def generate_full_plot(baseline_ts, stress_ts, owd_results=None, twamp_results=N
                                 ax2.tick_params(axis='y', labelcolor='tab:red')
                                 h1, l1 = ax.get_legend_handles_labels()
                                 h2, l2 = ax2.get_legend_handles_labels()
-                                ax.legend(h1 + h2, l1 + l2, loc='upper right', fontsize=7, ncol=2)
+                                _legend_with_hint(ax, h1 + h2, l1 + l2,
+                                                  loc='upper right', fontsize=7, ncol=2,
+                                                  hint=legend_hint)
                             else:
-                                ax.legend(loc='upper right', fontsize=7, ncol=2)
+                                _legend_with_hint(ax, loc='upper right', fontsize=7, ncol=2,
+                                                  hint=legend_hint)
                         else:
                             # Sockets: instantaneous gauges
                             for m in nm.TOOL_METRICS[tool]:
                                 lbl = m.replace("ns_sock_", "").replace("_", " ").title()
                                 ax.plot(elapsed, package["data"][m], lw=1.5, label=lbl)
                             ax.set_ylabel("Count / Bytes")
-                            ax.legend(loc='upper right', fontsize=7, ncol=2)
+                            _legend_with_hint(ax, loc='upper right', fontsize=7, ncol=2,
+                                              hint=legend_hint)
 
                         # X-axis: adaptive ticks, elapsed-only, start time in xlabel
                         step = max(1, len(elapsed) // 10)

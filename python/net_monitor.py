@@ -121,7 +121,7 @@ except ImportError:
 INTERVAL = 1.0
 OUTPUT_DIR = "net_out"
 
-# Command prefix for namespace/container execution (e.g. "ip netns exec ns1" or "denter atg4g")
+# Command prefix for namespace/container execution (e.g. "ip netns exec ns1" or "ip netns exec ns2")
 # Set externally before calling pre_flight_checks() / worker()
 CMD_PREFIX = ""
 
@@ -1198,7 +1198,7 @@ if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Usage: sudo python3 net_monitor.py <interface_name> [cmd_prefix]")
         print("  Example: sudo python3 net_monitor.py eth3")
-        print("  Example: sudo python3 net_monitor.py eth0 'denter atg4g '")
+        print("  Example: sudo python3 net_monitor.py eth0 'ip netns exec ns1 '")
         sys.exit(1)
         
     iface = sys.argv[1]
