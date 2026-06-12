@@ -386,10 +386,11 @@ def collect_latency_samples(target, duration_sec, interval_sec, timeout,
           f"(interval={interval_sec}s, rate={method_label})")
     print(f"{'='*72}")
 
-    while time.time() < end_time:
+    try:
+      while time.time() < end_time:
         now = time.time()
         sample_count += 1
-        ts = datetime.now().strftime("%H:%M:%S")
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         hops = run_traceroute(target, timeout, max_rtt)
         total_probes += 1
 
@@ -493,6 +494,9 @@ def collect_latency_samples(target, duration_sec, interval_sec, timeout,
         sleep_left = next_sample - time.time()
         if sleep_left > 0 and time.time() < end_time:
             time.sleep(min(sleep_left, end_time - time.time()))
+    except KeyboardInterrupt:
+        print(f"\n  Collected {sample_count} samples ({lost_probes} lost) [interrupted]")
+        return hop_data, total_probes, lost_probes, time_series
 
     print(f"  Collected {sample_count} samples ({lost_probes} lost)")
     return hop_data, total_probes, lost_probes, time_series
@@ -2777,13 +2781,22 @@ def generate_full_plot(baseline_ts, stress_ts, owd_results=None, twamp_results=N
                             ax.plot(elapsed, package["data"][m], lw=1.5, label=lbl)
                         ax.set_ylabel("Value")
                         ax.legend(loc='upper right', fontsize=7, ncol=2)
-                    # Dual x-axis: elapsed seconds + system timestamps
-                    tick_idx = [i for i in range(len(elapsed)) if i % 5 == 0 or i == len(elapsed) - 1]
+                    # X-axis: adaptive ticks, elapsed-only, start time in xlabel
+                    step = max(1, len(elapsed) // 10)
+                    tick_idx = [i for i in range(len(elapsed)) if i % step == 0]
+                    if len(elapsed) - 1 not in tick_idx:
+                        tick_idx.append(len(elapsed) - 1)
                     ax.set_xticks([elapsed[i] for i in tick_idx])
                     ax.set_xticklabels(
-                        [f"{elapsed[i]:.0f}s\n{times[i].strftime('%H:%M:%S')}" for i in tick_idx],
-                        rotation=0, ha='center', fontsize=7)
-                    ax.set_xlabel("Elapsed (s) / Time")
+                        [f"{elapsed[i]:.0f}s" for i in tick_idx],
+                        rotation=0, ha='center', fontsize=6)
+                    # Minor grid: dotted vertical lines every 5s
+                    if elapsed:
+                        minor_ticks = [t for t in range(0, int(elapsed[-1]) + 1, 5)]
+                        ax.set_xticks(minor_ticks, minor=True)
+                        ax.grid(which='minor', axis='x', linestyle=':', linewidth=0.5, alpha=0.4)
+                    start_time = times[0].strftime('%Y-%m-%d %H:%M:%S') if times else ''
+                    ax.set_xlabel(f"Elapsed (s)  [start: {start_time}]")
 
                     # Stats annotation for key metrics
                     stats_lines = []
@@ -2856,13 +2869,22 @@ def generate_full_plot(baseline_ts, stress_ts, owd_results=None, twamp_results=N
                             ax.set_ylabel("Count / Bytes")
                             ax.legend(loc='upper right', fontsize=7, ncol=2)
 
-                        # Dual x-axis
-                        tick_idx = [i for i in range(len(elapsed)) if i % 5 == 0 or i == len(elapsed) - 1]
+                        # X-axis: adaptive ticks, elapsed-only, start time in xlabel
+                        step = max(1, len(elapsed) // 10)
+                        tick_idx = [i for i in range(len(elapsed)) if i % step == 0]
+                        if len(elapsed) - 1 not in tick_idx:
+                            tick_idx.append(len(elapsed) - 1)
                         ax.set_xticks([elapsed[i] for i in tick_idx])
                         ax.set_xticklabels(
-                            [f"{elapsed[i]:.0f}s\n{times[i].strftime('%H:%M:%S')}" for i in tick_idx],
-                            rotation=0, ha='center', fontsize=7)
-                        ax.set_xlabel("Elapsed (s) / Time")
+                            [f"{elapsed[i]:.0f}s" for i in tick_idx],
+                            rotation=0, ha='center', fontsize=6)
+                        # Minor grid: dotted vertical lines every 5s
+                        if elapsed:
+                            minor_ticks = [t for t in range(0, int(elapsed[-1]) + 1, 5)]
+                            ax.set_xticks(minor_ticks, minor=True)
+                            ax.grid(which='minor', axis='x', linestyle=':', linewidth=0.5, alpha=0.4)
+                        start_time = times[0].strftime('%Y-%m-%d %H:%M:%S') if times else ''
+                        ax.set_xlabel(f"Elapsed (s)  [start: {start_time}]")
 
                         # Stats annotation
                         stats_lines = []
