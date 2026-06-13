@@ -27,6 +27,8 @@ per-direction one-way delay (OWD) using TCP Timestamps or TWAMP-Light UDP probes
 | `--owd` | root or `CAP_NET_RAW`, `pip install scapy` |
 | `--twamp` | No root required, no extra packages (stdlib `socket`/`struct` only) |
 | `--netmon` | root (for `tc`, `/proc/net/softnet_stat`); `vmstat`, `iostat`, `mpstat`, `netstat`, `ss` binaries |
+| `--rate-monitor` (sysfs) | No root required; Linux `/sys/class/net/` (any user) |
+| `--rate-monitor --rate-backend iftop` | root/sudo, `iftop` binary (`apt install iftop`) |
 | Matplotlib charts | `pip install matplotlib` (auto-generated if available, skipped silently if not) |
 | `traffic-gen.py` | `pip install requests h2` |
 
@@ -270,6 +272,76 @@ sudo python3 userbufferTest.py -T 8.8.8.8 --netmon --netmon-interface eth1 \
 - Per-subsystem statistical table (min/max/mean/median/stdev/P95)
 - Burst analysis (peak rates, squeeze detection)
 - Live `sysctl` queue/burst parameter snapshot with tuning explanations
+
+### Rate Monitoring & Auto-Restart (`--rate-monitor`)
+
+Monitors interface-level TX/RX throughput rates during the stress phase using
+one of two backends. Optionally auto-restarts `traffic-gen.py` if rates drop
+below a configurable threshold for a sustained duration.
+
+**Backend comparison:**
+
+| Backend | Root? | Overhead | How it works | When to use |
+|---------|-------|----------|--------------|-------------|
+| `sysfs` (default) | No | Near-zero | Reads `/sys/class/net/<iface>/statistics/` kernel byte counters | General use — fast, reliable, no dependencies |
+| `iftop` | Yes | High | Runs `iftop -t` (libpcap per-packet capture) | Need per-connection detail or pcap-level accuracy |
+
+**Requirements:**
+
+| Backend | Requirement |
+|---------|-------------|
+| `sysfs` | Linux with `/sys/class/net/` (any user, no root) |
+| `iftop` | root/sudo, `iftop` binary (`apt install iftop`) |
+
+**CLI Flags:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--rate-monitor IFACE` | *(off)* | Enable rate monitoring on the specified interface (e.g. `eth0`) |
+| `--rate-backend {sysfs,iftop}` | `sysfs` | Backend to use for rate measurement |
+| `--iftop-monitor IFACE` | *(off)* | **[Deprecated]** Alias for `--rate-monitor IFACE --rate-backend iftop` |
+| `--auto-restart` | off | Auto-restart traffic-gen on sustained rate drop (requires `--rate-monitor`) |
+
+**Configurable constants** (edit at top of `userbufferTest.py`):
+
+| Constant | Default | Description |
+|----------|---------|-------------|
+| `RATEMON_SAMPLE_SECS` | `2` | Seconds between rate samples |
+| `RATEMON_DROP_THRESHOLD_MBPS` | `1.0` | Minimum acceptable TX/RX rate (Mbps) |
+| `RATEMON_DROP_DURATION_SECS` | `10` | Consecutive seconds below threshold before restart |
+| `RATEMON_MAX_RESTARTS` | `3` | Maximum restart attempts (0 = unlimited) |
+
+**Behavior:**
+- A "RATE MONITOR PRE-FLIGHT CHECK" validates the selected backend before the test
+- If the interface does not exist or the backend fails, the test continues without monitoring
+- Rate data is shown in:
+  - A dedicated console summary (TX/RX avg/min/max/P95 + restart events table)
+  - A dedicated plot panel (TX blue line, RX orange line, threshold red dashed horizontal)
+  - Restart markers appear as vertical red dashed lines in RTT, Throughput, and Rate panels
+- When `--auto-restart` is enabled and rate drops below threshold for the configured duration:
+  - Traffic-gen is stopped and restarted with the remaining test duration
+  - All other monitoring threads (traceroute, OWD, TWAMP, netmon) continue uninterrupted
+  - Throughput counters are bridged (offset applied) so the time-series remains continuous
+  - A single unified report and plot are generated (no separate per-restart files)
+
+**Examples:**
+```bash
+# Monitor interface rates using sysfs (default, no root needed)
+python3 userbufferTest.py -T 8.8.8.8 --rate-monitor eth0
+
+# Monitor using iftop backend (needs root)
+sudo python3 userbufferTest.py -T 8.8.8.8 --rate-monitor eth0 --rate-backend iftop
+
+# Monitor + auto-restart traffic-gen on rate drop
+python3 userbufferTest.py -T 8.8.8.8 --rate-monitor eth0 --auto-restart
+
+# Combined with all other features
+sudo python3 userbufferTest.py -T 8.8.8.8 --owd --twamp --netmon \
+    --netmon-interface eth0 --rate-monitor eth0 --auto-restart -b 30 -s 120
+
+# Backward-compatible (deprecated) — uses iftop backend
+sudo python3 userbufferTest.py -T 8.8.8.8 --iftop-monitor eth0 --auto-restart
+```
 
 ### Matplotlib Graphical Output
 

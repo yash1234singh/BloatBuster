@@ -150,6 +150,12 @@ MIN_DT_VALID             = 0.1    # minimum elapsed-time delta for rate calculat
 PLOT_SPLIT_SECS          = 3600   # 0=no split; >0=produce per-chunk plots every N seconds
 PLOT_MAX_POINTS          = 1800   # max data points per metric before downsampling (0=no limit)
 
+# Rate monitoring & auto-restart (shared by sysfs and iftop backends)
+RATEMON_SAMPLE_SECS       = 2      # seconds between rate samples
+RATEMON_DROP_THRESHOLD_MBPS = 1.0  # minimum acceptable rate (Mbps) in either direction
+RATEMON_DROP_DURATION_SECS = 10    # consecutive seconds below threshold before restart
+RATEMON_MAX_RESTARTS      = 3      # max traffic-gen restart attempts (0=unlimited)
+
 
 # ---------------------------------------------------------------------------
 # Traceroute parsing
@@ -387,113 +393,108 @@ def collect_latency_samples(target, duration_sec, interval_sec, timeout,
     print(f"{'='*72}")
 
     try:
-      while time.time() < end_time:
-        now = time.time()
-        sample_count += 1
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        hops = run_traceroute(target, timeout, max_rtt)
-        total_probes += 1
+        while time.time() < end_time:
+            now = time.time()
+            sample_count += 1
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            hops = run_traceroute(target, timeout, max_rtt)
+            total_probes += 1
 
-        e2e_rtt = None
-        if not hops:
-            lost_probes += 1
-            rtt_str = "TIMEOUT"
-        else:
-            # Find last responding hop for end-to-end RTT
-            last_hop_num = 0
-            for hop_num, _, h_rtt in reversed(hops):
-                if h_rtt is not None:
-                    if e2e_rtt is None:
-                        e2e_rtt = h_rtt
-                        last_hop_num = hop_num
-            # Shallow probe: probe didn't reach expected network depth under congestion
-            # (e.g. only hop 1 at 0.1ms responded — not a valid e2e measurement)
-            if min_probe_depth > 0 and last_hop_num < min_probe_depth:
-                e2e_rtt = None
+            e2e_rtt = None
+            if not hops:
                 lost_probes += 1
-                rtt_str = f"SHALLOW ({last_hop_num}/{min_probe_depth} hops)"
+                rtt_str = "TIMEOUT"
             else:
-                rtt_str = f"{e2e_rtt:.1f}ms" if e2e_rtt else "*"
-            for hop_num, ip, rtt in hops:
-                hop_data[hop_num].append((ip, rtt))
-
-        # Read throughput snapshot
-        dl_bytes = ul_bytes = 0
-        dl_rate = ul_rate = 0.0
-        snap = None
-
-        if rate_mode == 'procnetdev' and interface:
-            snap = read_procnetdev(interface)
-            if snap:
-                t_snap = time.time()
-                raw_dl_bytes, raw_ul_bytes = snap  # rx = DL, tx = UL
-                dt = t_snap - prev_time
-                if dt > MIN_DT_VALID:
-                    dl_rate = (raw_dl_bytes - prev_dl) * 8 / dt / BITS_PER_MBPS
-                    ul_rate = (raw_ul_bytes - prev_ul) * 8 / dt / BITS_PER_MBPS
-                    prev_dl, prev_ul = raw_dl_bytes, raw_ul_bytes
-                    prev_time = t_snap
-                dl_bytes = max(0, raw_dl_bytes - start_dl)
-                ul_bytes = max(0, raw_ul_bytes - start_ul)
-        elif rate_mode == 'ss':
-            snap = read_ss_hybrid(interface)
-            if snap:
-                t_snap = time.time()
-                raw_dl_bytes, raw_ul_bytes = snap
-                dt = t_snap - prev_time
-                if dt > MIN_DT_VALID:
-                    dl_rate = (raw_dl_bytes - prev_dl) * 8 / dt / BITS_PER_MBPS
-                    ul_rate = (raw_ul_bytes - prev_ul) * 8 / dt / BITS_PER_MBPS
-                    prev_dl, prev_ul = raw_dl_bytes, raw_ul_bytes
-                    prev_time = t_snap
-                dl_bytes = max(0, raw_dl_bytes - start_dl)
-                ul_bytes = max(0, raw_ul_bytes - start_ul)
-        elif stats_file:
-            snap = read_throughput_snapshot(stats_file)
-            if snap:
-                sample_elapsed, raw_dl_bytes, raw_ul_bytes = snap
-                if prev_sample_elapsed is None:
-                    prev_sample_elapsed = sample_elapsed
-                    prev_dl, prev_ul = raw_dl_bytes, raw_ul_bytes
-                    start_dl, start_ul = raw_dl_bytes, raw_ul_bytes
-                dt = sample_elapsed - prev_sample_elapsed
-                if dt >= DEFAULT_OWD_INTERVAL:
-                    # Simple per-interval delta rate.  traffic-gen.py now
-                    # reports bytes progressively (counted as they flow
-                    # through the pipe), so the counter increments smoothly
-                    # every second instead of jumping on curl completion.
-                    dl_rate = (raw_dl_bytes - prev_dl) * 8 / dt / BITS_PER_MBPS
-                    ul_rate = (raw_ul_bytes - prev_ul) * 8 / dt / BITS_PER_MBPS
-                    prev_dl, prev_ul = raw_dl_bytes, raw_ul_bytes
-                    prev_sample_elapsed = sample_elapsed
+                # Find last responding hop for end-to-end RTT
+                last_hop_num = 0
+                for hop_num, _, h_rtt in reversed(hops):
+                    if h_rtt is not None:
+                        if e2e_rtt is None:
+                            e2e_rtt = h_rtt
+                            last_hop_num = hop_num
+                # Shallow probe: probe didn't reach expected network depth
+                if min_probe_depth > 0 and last_hop_num < min_probe_depth:
+                    e2e_rtt = None
+                    lost_probes += 1
+                    rtt_str = f"SHALLOW ({last_hop_num}/{min_probe_depth} hops)"
                 else:
-                    # Stale snapshot — file hasn't been updated yet
-                    snap = None
-                dl_bytes = max(0, raw_dl_bytes - start_dl)
-                ul_bytes = max(0, raw_ul_bytes - start_ul)
+                    rtt_str = f"{e2e_rtt:.1f}ms" if e2e_rtt else "*"
+                for hop_num, ip, rtt in hops:
+                    hop_data[hop_num].append((ip, rtt))
 
-        elapsed = time.time() - start_time
-        time_series.append({
-            'ts': ts,
-            'elapsed': elapsed,
-            'e2e_rtt': e2e_rtt,
-            'dl_bytes': dl_bytes,
-            'ul_bytes': ul_bytes,
-            'dl_rate_mbps': max(0, dl_rate),
-            'ul_rate_mbps': max(0, ul_rate),
-        })
+            # Read throughput snapshot
+            dl_bytes = ul_bytes = 0
+            dl_rate = ul_rate = 0.0
+            snap = None
 
-        if snap:
-            print(f"  [{ts}] #{sample_count:>4} RTT: {rtt_str:>10}  "
-                  f"DL: {dl_rate:5.1f} Mbps  UL: {ul_rate:5.1f} Mbps")
-        else:
-            print(f"  [{ts}] #{sample_count:>4} RTT: {rtt_str:>10}")
+            if rate_mode == 'procnetdev' and interface:
+                snap = read_procnetdev(interface)
+                if snap:
+                    t_snap = time.time()
+                    raw_dl_bytes, raw_ul_bytes = snap  # rx = DL, tx = UL
+                    dt = t_snap - prev_time
+                    if dt > MIN_DT_VALID:
+                        dl_rate = (raw_dl_bytes - prev_dl) * 8 / dt / BITS_PER_MBPS
+                        ul_rate = (raw_ul_bytes - prev_ul) * 8 / dt / BITS_PER_MBPS
+                        prev_dl, prev_ul = raw_dl_bytes, raw_ul_bytes
+                        prev_time = t_snap
+                    dl_bytes = max(0, raw_dl_bytes - start_dl)
+                    ul_bytes = max(0, raw_ul_bytes - start_ul)
+            elif rate_mode == 'ss':
+                snap = read_ss_hybrid(interface)
+                if snap:
+                    t_snap = time.time()
+                    raw_dl_bytes, raw_ul_bytes = snap
+                    dt = t_snap - prev_time
+                    if dt > MIN_DT_VALID:
+                        dl_rate = (raw_dl_bytes - prev_dl) * 8 / dt / BITS_PER_MBPS
+                        ul_rate = (raw_ul_bytes - prev_ul) * 8 / dt / BITS_PER_MBPS
+                        prev_dl, prev_ul = raw_dl_bytes, raw_ul_bytes
+                        prev_time = t_snap
+                    dl_bytes = max(0, raw_dl_bytes - start_dl)
+                    ul_bytes = max(0, raw_ul_bytes - start_ul)
+            elif stats_file:
+                snap = read_throughput_snapshot(stats_file)
+                if snap:
+                    sample_elapsed, raw_dl_bytes, raw_ul_bytes = snap
+                    if prev_sample_elapsed is None:
+                        prev_sample_elapsed = sample_elapsed
+                        prev_dl, prev_ul = raw_dl_bytes, raw_ul_bytes
+                        start_dl, start_ul = raw_dl_bytes, raw_ul_bytes
+                    dt = sample_elapsed - prev_sample_elapsed
+                    if dt >= DEFAULT_OWD_INTERVAL:
+                        dl_rate = (raw_dl_bytes - prev_dl) * 8 / dt / BITS_PER_MBPS
+                        ul_rate = (raw_ul_bytes - prev_ul) * 8 / dt / BITS_PER_MBPS
+                        prev_dl, prev_ul = raw_dl_bytes, raw_ul_bytes
+                        prev_sample_elapsed = sample_elapsed
+                    else:
+                        # Stale snapshot — file hasn't been updated yet
+                        snap = None
+                    dl_bytes = max(0, raw_dl_bytes - start_dl)
+                    ul_bytes = max(0, raw_ul_bytes - start_ul)
 
-        # Sleep remainder of interval
-        next_sample = now + interval_sec
-        sleep_left = next_sample - time.time()
-        if sleep_left > 0 and time.time() < end_time:
-            time.sleep(min(sleep_left, end_time - time.time()))
+            elapsed = time.time() - start_time
+            time_series.append({
+                'ts': ts,
+                'elapsed': elapsed,
+                'e2e_rtt': e2e_rtt,
+                'dl_bytes': dl_bytes,
+                'ul_bytes': ul_bytes,
+                'dl_rate_mbps': max(0, dl_rate),
+                'ul_rate_mbps': max(0, ul_rate),
+            })
+
+            if snap:
+                print(f"  [{ts}] #{sample_count:>4} RTT: {rtt_str:>10}  "
+                      f"DL: {dl_rate:5.1f} Mbps  UL: {ul_rate:5.1f} Mbps")
+            else:
+                print(f"  [{ts}] #{sample_count:>4} RTT: {rtt_str:>10}")
+
+            # Sleep remainder of interval
+            next_sample = now + interval_sec
+            sleep_left = next_sample - time.time()
+            if sleep_left > 0 and time.time() < end_time:
+                time.sleep(min(sleep_left, end_time - time.time()))
     except KeyboardInterrupt:
         print(f"\n  Collected {sample_count} samples ({lost_probes} lost) [interrupted]")
         return hop_data, total_probes, lost_probes, time_series
@@ -1646,6 +1647,251 @@ def stop_traffic_gen(proc):
 
 
 # ---------------------------------------------------------------------------
+# Rate Monitoring & Auto-Restart (sysfs + iftop backends)
+# ---------------------------------------------------------------------------
+
+def _read_sysfs_bytes(interface):
+    """Read TX/RX byte counters from /sys/class/net/<iface>/statistics.
+
+    Returns (tx_bytes, rx_bytes) or (None, None) on failure.
+    No root required — sysfs counters are world-readable.
+    """
+    base = f'/sys/class/net/{interface}/statistics'
+    try:
+        with open(f'{base}/tx_bytes', 'r') as f:
+            tx = int(f.read().strip())
+        with open(f'{base}/rx_bytes', 'r') as f:
+            rx = int(f.read().strip())
+        return (tx, rx)
+    except (OSError, ValueError):
+        return (None, None)
+
+
+def _run_iftop_snapshot(interface):
+    """Run a single iftop text-mode snapshot and return (tx_mbps, rx_mbps).
+
+    Runs: iftop -t -s <RATEMON_SAMPLE_SECS> -i <interface> -n -N
+    Parses 'Total send rate' and 'Total receive rate' lines.
+    Returns (None, None) on any failure.
+    Uses Popen+kill because iftop often hangs when piped.
+    """
+    cmd = ['iftop', '-t', '-s', str(RATEMON_SAMPLE_SECS),
+           '-i', interface, '-n', '-N']
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True)
+        try:
+            stdout, stderr = proc.communicate(timeout=RATEMON_SAMPLE_SECS + 10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            stdout, stderr = proc.communicate()
+        output = stdout + stderr
+    except OSError:
+        return (None, None)
+
+    tx_mbps = rx_mbps = None
+    for line in output.splitlines():
+        m_send = re.match(r'Total\s+send\s+rate:\s+([\d.]+)(K|M|G)?b/s', line.strip())
+        m_recv = re.match(r'Total\s+receive\s+rate:\s+([\d.]+)(K|M|G)?b/s', line.strip())
+        if m_send:
+            val = float(m_send.group(1))
+            unit = m_send.group(2) or ''
+            if unit == 'K':
+                tx_mbps = val / 1000.0
+            elif unit == 'G':
+                tx_mbps = val * 1000.0
+            else:
+                tx_mbps = val
+        if m_recv:
+            val = float(m_recv.group(1))
+            unit = m_recv.group(2) or ''
+            if unit == 'K':
+                rx_mbps = val / 1000.0
+            elif unit == 'G':
+                rx_mbps = val * 1000.0
+            else:
+                rx_mbps = val
+
+    return (tx_mbps, rx_mbps)
+
+
+def rate_monitor_worker(interface, stop_event, iftop_results, restart_events,
+                        restart_callback, auto_restart, stress_start_time,
+                        backend='sysfs'):
+    """Daemon thread: monitors interface rate and triggers restart on sustained drop.
+
+    Supports two backends:
+      'sysfs' — reads /sys/class/net/<iface>/statistics (no root, near-zero overhead)
+      'iftop' — runs iftop text-mode snapshots (per-connection detail, requires root)
+
+    Args:
+        interface:         Network interface name
+        stop_event:        threading.Event — set to stop this worker
+        iftop_results:     list — appends {elapsed, tx_mbps, rx_mbps, timestamp}
+        restart_events:    list — appends {elapsed, reason} on each restart
+        restart_callback:  callable() — called to restart traffic-gen (thread-safe)
+        auto_restart:      bool — whether to actually trigger restarts
+        stress_start_time: float — time.time() when stress phase started
+        backend:           'sysfs' or 'iftop'
+    """
+    consecutive_low_secs = 0.0
+    restarts_done = 0
+
+    # sysfs backend needs previous counter state for delta calculation
+    if backend == 'sysfs':
+        prev_tx, prev_rx = _read_sysfs_bytes(interface)
+        prev_time = time.time()
+
+    # Wait one sample interval before first measurement
+    stop_event.wait(timeout=RATEMON_SAMPLE_SECS)
+
+    while not stop_event.is_set():
+        now = time.time()
+        elapsed = now - stress_start_time
+        ts = datetime.now().strftime("%H:%M:%S")
+
+        tx_mbps = rx_mbps = None
+        if backend == 'sysfs':
+            cur_tx, cur_rx = _read_sysfs_bytes(interface)
+            if (cur_tx is not None and prev_tx is not None and
+                    cur_rx is not None and prev_rx is not None):
+                dt = now - prev_time
+                if dt > 0.1:
+                    tx_mbps = (cur_tx - prev_tx) * 8 / dt / 1_000_000
+                    rx_mbps = (cur_rx - prev_rx) * 8 / dt / 1_000_000
+            prev_tx, prev_rx = cur_tx, cur_rx
+            prev_time = now
+        else:  # iftop backend
+            tx_mbps, rx_mbps = _run_iftop_snapshot(interface)
+
+        if tx_mbps is not None and rx_mbps is not None:
+            iftop_results.append({
+                'elapsed': elapsed,
+                'tx_mbps': tx_mbps,
+                'rx_mbps': rx_mbps,
+                'timestamp': ts,
+            })
+
+            below = (tx_mbps < RATEMON_DROP_THRESHOLD_MBPS or
+                     rx_mbps < RATEMON_DROP_THRESHOLD_MBPS)
+            if below:
+                consecutive_low_secs += RATEMON_SAMPLE_SECS
+            else:
+                consecutive_low_secs = 0.0
+
+            if (auto_restart and
+                    consecutive_low_secs >= RATEMON_DROP_DURATION_SECS and
+                    (RATEMON_MAX_RESTARTS == 0 or restarts_done < RATEMON_MAX_RESTARTS)):
+                reason = (f"TX={tx_mbps:.2f} RX={rx_mbps:.2f} Mbps "
+                          f"< {RATEMON_DROP_THRESHOLD_MBPS} Mbps for "
+                          f"{consecutive_low_secs:.0f}s")
+                print(f"\n  \033[93m[RATE] Drop detected at {ts} "
+                      f"(elapsed {elapsed:.0f}s): {reason}\033[0m")
+                restart_events.append({'elapsed': elapsed, 'reason': reason})
+                try:
+                    restart_callback()
+                    restarts_done += 1
+                    consecutive_low_secs = 0.0
+                    print(f"  \033[92m[RATE] Restart #{restarts_done} completed. "
+                          f"Monitoring continues.\033[0m")
+                except Exception as exc:
+                    print(f"  \033[91m[RATE] Restart failed: {exc}\033[0m")
+            elif (auto_restart and
+                  consecutive_low_secs >= RATEMON_DROP_DURATION_SECS and
+                  RATEMON_MAX_RESTARTS > 0 and restarts_done >= RATEMON_MAX_RESTARTS):
+                if consecutive_low_secs == RATEMON_DROP_DURATION_SECS:
+                    print(f"  \033[91m[RATE] Max restarts ({RATEMON_MAX_RESTARTS}) reached. "
+                          f"Monitoring only.\033[0m")
+
+        # Wait for next sample interval
+        stop_event.wait(timeout=RATEMON_SAMPLE_SECS)
+
+
+def _do_restart_traffic_gen(traffic_ctx, dl_clients, ul_clients,
+                            duration_remaining, log_file, stats_file,
+                            restart_lock):
+    """Stop and restart traffic-gen, updating the shared context.
+
+    Args:
+        traffic_ctx:        dict with 'proc' key (mutable container)
+        dl_clients:         int
+        ul_clients:         int
+        duration_remaining: int seconds
+        log_file:           str
+        stats_file:         str
+        restart_lock:       threading.Lock
+    """
+    with restart_lock:
+        old_proc = traffic_ctx.get('proc')
+
+        # Save bridge offsets before killing
+        snap = read_throughput_snapshot(stats_file) if stats_file else None
+        if snap:
+            _, last_dl, last_ul = snap
+            traffic_ctx['bridge_offset_dl'] = (
+                traffic_ctx.get('bridge_offset_dl', 0) + last_dl)
+            traffic_ctx['bridge_offset_ul'] = (
+                traffic_ctx.get('bridge_offset_ul', 0) + last_ul)
+
+        stop_traffic_gen(old_proc)
+        time.sleep(1)
+
+        new_proc = start_traffic_gen(
+            dl_clients=dl_clients,
+            ul_clients=ul_clients,
+            duration_secs=max(60, duration_remaining),
+            log_file=log_file,
+            stats_file=stats_file,
+        )
+        traffic_ctx['proc'] = new_proc
+        traffic_ctx['restart_count'] = traffic_ctx.get('restart_count', 0) + 1
+
+        print(f"  Waiting {TRAFFIC_GEN_RAMP_SECS}s for traffic to ramp up...")
+        time.sleep(TRAFFIC_GEN_RAMP_SECS)
+
+
+def print_rate_summary(iftop_results, restart_events):
+    """Print rate monitoring summary table."""
+    print(f"\n{'='*72}")
+    print(f"{'RATE MONITORING SUMMARY':^72}")
+    print(f"{'='*72}")
+
+    if not iftop_results:
+        print("  (No rate data collected)")
+        return
+
+    tx_vals = [r['tx_mbps'] for r in iftop_results if r['tx_mbps'] is not None]
+    rx_vals = [r['rx_mbps'] for r in iftop_results if r['rx_mbps'] is not None]
+
+    def _fmt_stats(vals, label):
+        if not vals:
+            return f"  {label:<6}: no data"
+        avg = sum(vals) / len(vals)
+        mn = min(vals)
+        mx = max(vals)
+        p95 = percentile(vals, 95)
+        return (f"  {label:<6}: avg={avg:6.2f}  min={mn:6.2f}  "
+                f"max={mx:6.2f}  P95={p95:6.2f} Mbps")
+
+    print(_fmt_stats(tx_vals, "TX"))
+    print(_fmt_stats(rx_vals, "RX"))
+    print(f"  Samples: {len(iftop_results)}  "
+          f"Duration: {iftop_results[-1]['elapsed'] - iftop_results[0]['elapsed']:.0f}s")
+    print(f"  Threshold: {RATEMON_DROP_THRESHOLD_MBPS} Mbps  "
+          f"Drop window: {RATEMON_DROP_DURATION_SECS}s")
+
+    if restart_events:
+        print(f"\n  {'RESTART EVENTS':^60}")
+        print(f"  {'-'*60}")
+        print(f"  {'#':<4} {'Elapsed':>8}  {'Reason'}")
+        print(f"  {'-'*60}")
+        for i, ev in enumerate(restart_events, 1):
+            print(f"  {i:<4} {ev['elapsed']:>7.0f}s  {ev['reason']}")
+    else:
+        print(f"  Restarts: 0")
+
+
+# ---------------------------------------------------------------------------
 # CLI and entry point
 # ---------------------------------------------------------------------------
 
@@ -1746,6 +1992,29 @@ def parse_args():
                         help='Command prefix(es) for netstat monitoring (repeatable). '
                              'Runs netstat -s -t, netstat -s -u, netstat -anu per prefix. '
                              'If omitted, uses --netmon-prefix. Use "" for local.')
+
+    # --- Rate Monitoring & Auto-Restart ---
+    ratemon_grp = p.add_argument_group(
+        'Rate Monitoring & Auto-Restart',
+        'Monitors interface-level TX/RX rates during the stress phase using '
+        'either sysfs kernel counters (default, no root) or iftop (per-connection, '
+        'needs root). Optionally restarts traffic-gen if rates drop below a '
+        'configurable threshold for a sustained duration.')
+    ratemon_grp.add_argument('--rate-monitor', type=str, default=None, metavar='IFACE',
+                             help='Enable rate monitoring on the specified interface '
+                                  '(e.g. eth0, wlan0). Default backend: sysfs (no root).')
+    ratemon_grp.add_argument('--rate-backend', type=str, default='sysfs',
+                             choices=['sysfs', 'iftop'],
+                             help='Rate monitoring backend: sysfs (kernel counters, '
+                                  'no root, zero-overhead) or iftop (libpcap per-packet, '
+                                  'needs root). Default: sysfs')
+    ratemon_grp.add_argument('--iftop-monitor', type=str, default=None, metavar='IFACE',
+                             help='[Deprecated] Alias for --rate-monitor IFACE '
+                                  '--rate-backend iftop')
+    ratemon_grp.add_argument('--auto-restart', action='store_true',
+                             help='Auto-restart traffic-gen if TX or RX rate drops below '
+                                  f'{RATEMON_DROP_THRESHOLD_MBPS} Mbps for '
+                                  f'{RATEMON_DROP_DURATION_SECS}s (requires --rate-monitor)')
 
     return p.parse_args()
 
@@ -2518,7 +2787,8 @@ def netmon_print_report(nm, aggregated_data, interface):
 # ---------------------------------------------------------------------------
 
 def generate_full_plot(baseline_ts, stress_ts, owd_results=None, twamp_results=None,
-                       netmon_data=None, netmon_mod=None, netstat_data=None, output_path=None):
+                       netmon_data=None, netmon_mod=None, netstat_data=None,
+                       iftop_data=None, restart_events=None, output_path=None):
     """Generate comprehensive matplotlib figure with all test data + stats."""
     try:
         import matplotlib
@@ -2638,6 +2908,63 @@ def generate_full_plot(baseline_ts, stress_ts, owd_results=None, twamp_results=N
                     bbox=dict(facecolor='white', alpha=0.8))
 
     panels.append(("Throughput (Stress Phase)", _plot_throughput))
+
+    # --- Panel: Rate Monitor (if available) ---
+    if iftop_data:
+        _iftop_elapsed = [r['elapsed'] for r in iftop_data]
+        _iftop_tx = [r['tx_mbps'] for r in iftop_data]
+        _iftop_rx = [r['rx_mbps'] for r in iftop_data]
+
+        def _plot_iftop(ax):
+            if _iftop_tx:
+                ax.plot(_iftop_elapsed, _iftop_tx, 'b-', lw=1.2, alpha=0.8, label='TX (send)')
+            if _iftop_rx:
+                ax.plot(_iftop_elapsed, _iftop_rx, color='orange', lw=1.2, alpha=0.8, label='RX (recv)')
+            # Threshold line
+            ax.axhline(y=RATEMON_DROP_THRESHOLD_MBPS, color='red', linestyle='--',
+                       lw=1.0, alpha=0.6, label=f'Threshold ({RATEMON_DROP_THRESHOLD_MBPS} Mbps)')
+            # Restart markers
+            if restart_events:
+                for ev in restart_events:
+                    ax.axvline(x=ev['elapsed'], color='red', linestyle='--',
+                               lw=1.5, alpha=0.7)
+                # Label only the first one to avoid legend clutter
+                ax.axvline(x=restart_events[0]['elapsed'], color='red', linestyle='--',
+                           lw=0, alpha=0, label=f'Restart ({len(restart_events)}x)')
+            ax.set_ylabel("Rate (Mbps)")
+            ax.set_xlabel("Elapsed (s)")
+            ax.legend(loc='upper right', fontsize=7)
+            # Stats
+            tx_v = [v for v in _iftop_tx if v is not None]
+            rx_v = [v for v in _iftop_rx if v is not None]
+            txt = ""
+            if tx_v:
+                txt += _stats_annotation("TX", _quick_stats(tx_v), "Mbps") + "\n"
+            if rx_v:
+                txt += _stats_annotation("RX", _quick_stats(rx_v), "Mbps")
+            if txt:
+                ax.text(0.02, 0.95, txt.strip(), transform=ax.transAxes, fontsize=7,
+                        fontfamily='monospace', va='top',
+                        bbox=dict(facecolor='white', alpha=0.8))
+
+        panels.append(("Rate Monitor", _plot_iftop))
+
+    # Draw restart markers on RTT and Throughput panels if restart_events exist
+    if restart_events:
+        _orig_plot_rtt = _plot_rtt
+        def _plot_rtt_with_markers(ax):
+            _orig_plot_rtt(ax)
+            for ev in restart_events:
+                ax.axvline(x=ev['elapsed'], color='red', linestyle='--', lw=1.0, alpha=0.5)
+        # Replace the RTT panel entry
+        panels[0] = (panels[0][0], _plot_rtt_with_markers)
+
+        _orig_plot_tp = _plot_throughput
+        def _plot_tp_with_markers(ax):
+            _orig_plot_tp(ax)
+            for ev in restart_events:
+                ax.axvline(x=ev['elapsed'], color='red', linestyle='--', lw=1.0, alpha=0.5)
+        panels[1] = (panels[1][0], _plot_tp_with_markers)
 
     # --- Panel 3: OWD if available ---
     if owd_results:
@@ -3161,6 +3488,11 @@ def main():
         _nm_ifaces = args.netmon_interface or [interface or 'eth0']
         _nm_pfx = f"  prefix='{args.netmon_prefix}'" if args.netmon_prefix else ''
         print(f"  Net Monitor  : enabled (interface={','.join(_nm_ifaces)}{_nm_pfx})")
+    if args.rate_monitor:
+        print(f"  Rate Monitor : enabled (interface={args.rate_monitor}  "
+              f"backend={args.rate_backend}  "
+              f"threshold={RATEMON_DROP_THRESHOLD_MBPS} Mbps  "
+              f"auto-restart={'yes' if args.auto_restart else 'no'})")
     print("=" * 72)
 
     # Discover route depth before baseline — used to filter shallow probes in BOTH phases
@@ -3213,6 +3545,81 @@ def main():
 
     twamp_attempt_stats = {}
 
+    # --- Handle deprecated --iftop-monitor alias ---
+    if args.iftop_monitor and not args.rate_monitor:
+        args.rate_monitor = args.iftop_monitor
+        args.rate_backend = 'iftop'
+
+    # --- Rate monitor pre-flight check ---
+    ratemon_enabled = False
+    ratemon_iface = args.rate_monitor
+    ratemon_backend = args.rate_backend if ratemon_iface else None
+    if ratemon_iface:
+        print(f"\n{'='*80}")
+        print(f" RATE MONITOR PRE-FLIGHT CHECK")
+        print("=" * 80)
+        print(f"  Interface    : {ratemon_iface}")
+        print(f"  Backend      : {ratemon_backend}")
+        if ratemon_backend == 'sysfs':
+            print(f"  Source       : /sys/class/net/{ratemon_iface}/statistics/")
+        else:
+            print(f"  Source       : iftop -t -s {RATEMON_SAMPLE_SECS} -i {ratemon_iface} -n -N")
+        print(f"  Poll interval: {RATEMON_SAMPLE_SECS}s")
+        print(f"  Threshold    : {RATEMON_DROP_THRESHOLD_MBPS} Mbps")
+        print(f"  Drop duration: {RATEMON_DROP_DURATION_SECS}s")
+        print(f"  Auto-restart : {'enabled' if args.auto_restart else 'disabled'}"
+              + (f" (max {RATEMON_MAX_RESTARTS})" if args.auto_restart else ""))
+
+        if ratemon_backend == 'sysfs':
+            sysfs_path = f'/sys/class/net/{ratemon_iface}/statistics/tx_bytes'
+            if os.path.exists(sysfs_path):
+                tx, rx = _read_sysfs_bytes(ratemon_iface)
+                if tx is not None and rx is not None:
+                    print(f"  Counters     : TX={tx:,} bytes  RX={rx:,} bytes")
+                    print(f"  --> Status   : \033[92mWORKING\033[0m")
+                    ratemon_enabled = True
+                else:
+                    print(f"  --> Status   : \033[91mREAD FAILED\033[0m")
+                    print(f"  [WARN] Could not read sysfs counters. Rate monitoring disabled.",
+                          file=sys.stderr)
+            else:
+                print(f"  --> Status   : \033[91mINTERFACE NOT FOUND\033[0m")
+                print(f"  [WARN] {sysfs_path} does not exist. "
+                      f"Check interface name. Rate monitoring disabled.",
+                      file=sys.stderr)
+        else:  # iftop backend
+            try:
+                _proc = subprocess.Popen(
+                    ['iftop', '-t', '-s', '1', '-i', ratemon_iface, '-n', '-N'],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                try:
+                    _stdout, _stderr = _proc.communicate(timeout=10)
+                except subprocess.TimeoutExpired:
+                    _proc.kill()
+                    _stdout, _stderr = _proc.communicate()
+                _combined = _stdout + _stderr
+                if 'Total' in _combined:
+                    print(f"  --> Status   : \033[92mWORKING\033[0m")
+                    ratemon_enabled = True
+                elif 'permission' in _combined.lower() or 'operation not permitted' in _combined.lower():
+                    print(f"  --> Status   : \033[91mPERMISSION DENIED\033[0m")
+                    print(f"  [WARN] iftop requires root/sudo. Rate monitoring disabled.",
+                          file=sys.stderr)
+                elif _combined.strip():
+                    print(f"  --> Status   : \033[91mFAILED\033[0m (exit code {_proc.returncode})")
+                    print(f"  [WARN] iftop check failed. Rate monitoring disabled.",
+                          file=sys.stderr)
+                    print(f"  Output: {_combined.strip()[:200]}")
+                else:
+                    print(f"  --> Status   : \033[91mTIMEOUT / NO OUTPUT\033[0m")
+                    print(f"  [WARN] iftop produced no output. Rate monitoring disabled.",
+                          file=sys.stderr)
+            except FileNotFoundError:
+                print(f"  --> Status   : \033[91mNOT INSTALLED\033[0m")
+                print(f"  [WARN] iftop not found. Install: apt install iftop. "
+                      f"Rate monitoring disabled.", file=sys.stderr)
+        print("=" * 80)
+
     # --- Phase 1: Baseline ---
     if owd_enabled:
         _owd_t = threading.Thread(
@@ -3261,6 +3668,15 @@ def main():
         stats_file=stats_file,
     )
 
+    # Mutable container for traffic proc (allows iftop restart callback to swap it)
+    _restart_lock = threading.Lock()
+    traffic_ctx = {
+        'proc': traffic_proc,
+        'bridge_offset_dl': 0,
+        'bridge_offset_ul': 0,
+        'restart_count': 0,
+    }
+
     # Give traffic-gen a few seconds to ramp up
     print(f"  Waiting {TRAFFIC_GEN_RAMP_SECS}s for traffic to ramp up...")
     time.sleep(TRAFFIC_GEN_RAMP_SECS)
@@ -3308,6 +3724,30 @@ def main():
         )
         _twamp_t.start()
 
+    # --- Rate monitor start (if enabled) ---
+    iftop_results = []
+    restart_events = []
+    _iftop_stop = threading.Event()
+    _iftop_t = None
+    _stress_start_time = time.time()
+
+    if ratemon_enabled:
+        def _ratemon_restart_cb():
+            """Callback invoked by rate monitor worker to restart traffic-gen."""
+            remaining = args.stress - (time.time() - _stress_start_time)
+            _do_restart_traffic_gen(
+                traffic_ctx, args.dl_clients, args.ul_clients,
+                int(remaining), traffic_log, stats_file, _restart_lock)
+
+        _iftop_t = threading.Thread(
+            target=rate_monitor_worker,
+            args=(ratemon_iface, _iftop_stop, iftop_results, restart_events,
+                  _ratemon_restart_cb, args.auto_restart, _stress_start_time),
+            kwargs={'backend': ratemon_backend},
+            daemon=True,
+        )
+        _iftop_t.start()
+
     try:
         stress_data, stress_probes, stress_lost, stress_ts = \
             collect_latency_samples(
@@ -3333,7 +3773,11 @@ def main():
         if 'stress_ts' not in dir() or stress_ts is None:
             stress_ts = []
     finally:
-        stop_traffic_gen(traffic_proc)
+        # Stop iftop monitor
+        _iftop_stop.set()
+        if _iftop_t:
+            _iftop_t.join(timeout=5)
+        stop_traffic_gen(traffic_ctx['proc'])
         # --- Net Monitor stop (all interfaces) ---
         for nm_iface, ctx in netmon_ctxs:
             agg = netmon_stop(ctx)
@@ -3398,6 +3842,10 @@ def main():
                       owd_results=owd_results if owd_enabled else None,
                       twamp_results=twamp_results if twamp_enabled else None)
     print_traffic_summary(traffic_log)
+
+    # --- Rate monitor summary (if collected) ---
+    if iftop_results:
+        print_rate_summary(iftop_results, restart_events)
 
     # --- Save results ---
     if args.output:
@@ -3543,6 +3991,11 @@ def main():
                     netstat_all_data if netstat_all_data else None, start_s, end_s)
 
                 print(f"  Generating: {chunk_path} ({start_s/60:.0f}m – {end_s/60:.0f}m)")
+                # Slice iftop data for this chunk
+                chunk_iftop = [r for r in iftop_results
+                               if start_s <= r['elapsed'] < end_s] if iftop_results else None
+                chunk_restarts = [ev for ev in restart_events
+                                  if start_s <= ev['elapsed'] < end_s] if restart_events else None
                 generate_full_plot(
                     baseline_ts, chunk_stress,
                     owd_results=chunk_owd,
@@ -3550,6 +4003,8 @@ def main():
                     netmon_data=chunk_netmon,
                     netmon_mod=netmon_mod,
                     netstat_data=chunk_netstat,
+                    iftop_data=chunk_iftop if chunk_iftop else None,
+                    restart_events=chunk_restarts if chunk_restarts else None,
                     output_path=chunk_path,
                 )
 
@@ -3580,6 +4035,8 @@ def main():
                     netmon_data=ds_netmon,
                     netmon_mod=netmon_mod,
                     netstat_data=ds_netstat,
+                    iftop_data=_downsample_list(iftop_results, PLOT_MAX_POINTS) if iftop_results else None,
+                    restart_events=restart_events if restart_events else None,
                     output_path="bufferbloat_analysis.png",
                 )
         else:
@@ -3591,6 +4048,8 @@ def main():
                 netmon_data=combined_netmon,
                 netmon_mod=netmon_mod,
                 netstat_data=netstat_all_data if netstat_all_data else None,
+                iftop_data=iftop_results if iftop_results else None,
+                restart_events=restart_events if restart_events else None,
                 output_path="bufferbloat_analysis.png",
             )
 
