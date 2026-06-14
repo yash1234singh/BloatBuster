@@ -2930,7 +2930,7 @@ def generate_full_plot(baseline_ts, stress_ts, owd_results=None, twamp_results=N
                                lw=1.5, alpha=0.7)
                 # Label only the first one to avoid legend clutter
                 ax.axvline(x=restart_events[0]['elapsed'], color='red', linestyle='--',
-                           lw=0, alpha=0, label=f'Restart ({len(restart_events)}x)')
+                           lw=0.001, alpha=0, label=f'Restart ({len(restart_events)}x)')
             ax.set_ylabel("Rate (Mbps)")
             ax.set_xlabel("Elapsed (s)")
             ax.legend(loc='upper right', fontsize=7)
