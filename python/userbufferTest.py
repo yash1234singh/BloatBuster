@@ -1787,7 +1787,7 @@ def rate_monitor_worker(interface, stop_event, iftop_results, restart_events,
                           f"{consecutive_low_secs:.0f}s")
                 print(f"\n  \033[93m[RATE] Drop detected at {ts} "
                       f"(elapsed {elapsed:.0f}s): {reason}\033[0m")
-                restart_events.append({'elapsed': elapsed, 'reason': reason})
+                restart_events.append({'elapsed': elapsed, 'reason': reason, 'timestamp': ts})
                 try:
                     restart_callback()
                     restarts_done += 1
@@ -2928,6 +2928,11 @@ def generate_full_plot(baseline_ts, stress_ts, owd_results=None, twamp_results=N
                 for ev in restart_events:
                     ax.axvline(x=ev['elapsed'], color='red', linestyle='--',
                                lw=1.5, alpha=0.7)
+                    ts_label = ev.get('timestamp', '')
+                    if ts_label:
+                        ax.text(ev['elapsed'], ax.get_ylim()[1] * 0.95, ts_label,
+                                color='red', fontsize=7, rotation=90,
+                                va='top', ha='right', alpha=0.85)
                 # Label only the first one to avoid legend clutter
                 ax.axvline(x=restart_events[0]['elapsed'], color='red', linestyle='--',
                            lw=0.001, alpha=0, label=f'Restart ({len(restart_events)}x)')
@@ -2956,6 +2961,11 @@ def generate_full_plot(baseline_ts, stress_ts, owd_results=None, twamp_results=N
             _orig_plot_rtt(ax)
             for ev in restart_events:
                 ax.axvline(x=ev['elapsed'], color='red', linestyle='--', lw=1.0, alpha=0.5)
+                ts_label = ev.get('timestamp', '')
+                if ts_label:
+                    ax.text(ev['elapsed'], ax.get_ylim()[1] * 0.95, ts_label,
+                            color='red', fontsize=7, rotation=90,
+                            va='top', ha='right', alpha=0.85)
         # Replace the RTT panel entry
         panels[0] = (panels[0][0], _plot_rtt_with_markers)
 
@@ -2964,6 +2974,11 @@ def generate_full_plot(baseline_ts, stress_ts, owd_results=None, twamp_results=N
             _orig_plot_tp(ax)
             for ev in restart_events:
                 ax.axvline(x=ev['elapsed'], color='red', linestyle='--', lw=1.0, alpha=0.5)
+                ts_label = ev.get('timestamp', '')
+                if ts_label:
+                    ax.text(ev['elapsed'], ax.get_ylim()[1] * 0.95, ts_label,
+                            color='red', fontsize=7, rotation=90,
+                            va='top', ha='right', alpha=0.85)
         panels[1] = (panels[1][0], _plot_tp_with_markers)
 
     # --- Panel 3: OWD if available ---
