@@ -78,7 +78,7 @@ DEFAULT_BASELINE_SEC  = 30
 DEFAULT_STRESS_SEC    = 120
 DEFAULT_POLL_INTERVAL = 1
 DEFAULT_TIMEOUT       = 2
-DEFAULT_DL_CLIENTS    = 30
+DEFAULT_DL_CLIENTS    = 80
 DEFAULT_UL_CLIENTS    = 50
 DEFAULT_CHART_WIDTH   = 80
 DEFAULT_CHART_HEIGHT  = 20
@@ -147,14 +147,17 @@ TRAFFIC_GEN_RAMP_SECS    = 5      # sleep after starting traffic-gen before stre
 MIN_DT_VALID             = 0.1    # minimum elapsed-time delta for rate calculation (s)
 
 # Plot splitting for long tests (avoids matplotlib memory exhaustion on multi-hour runs)
-PLOT_SPLIT_SECS          = 3600   # 0=no split; >0=produce per-chunk plots every N seconds
-PLOT_MAX_POINTS          = 1800   # max data points per metric before downsampling (0=no limit)
+#PLOT_SPLIT_SECS          = 3600   # 0=no split; >0=produce per-chunk plots every N seconds
+#PLOT_MAX_POINTS          = 1800   # max data points per metric before downsampling (0=no limit)
+PLOT_SPLIT_SECS          = 0   # 0=no split; >0=produce per-chunk plots every N seconds
+PLOT_MAX_POINTS          = 0   # max data points per metric before downsampling (0=no limit)
+
 
 # Rate monitoring & auto-restart (shared by sysfs and iftop backends)
 RATEMON_SAMPLE_SECS       = 2      # seconds between rate samples
 RATEMON_DROP_THRESHOLD_MBPS = 1.0  # minimum acceptable rate (Mbps) in either direction
 RATEMON_DROP_DURATION_SECS = 10    # consecutive seconds below threshold before restart
-RATEMON_MAX_RESTARTS      = 3      # max traffic-gen restart attempts (0=unlimited)
+RATEMON_MAX_RESTARTS      = 10      # max traffic-gen restart attempts (0=unlimited)
 
 
 # ---------------------------------------------------------------------------
@@ -2866,23 +2869,19 @@ def generate_full_plot(baseline_ts, stress_ts, owd_results=None, twamp_results=N
 
     panels.append(("End-to-End RTT", _plot_rtt))
 
-    # --- Panel 2: Throughput over time ---
+    # --- Panel 2: Download Throughput over time ---
     _stress_tp_elapsed = [e['elapsed'] for e in stress_ts]
     _stress_tp_labels = [e['ts'] for e in stress_ts]
     _stress_dl_vals = [e['dl_rate_mbps'] for e in stress_ts]
     _stress_ul_vals = [e['ul_rate_mbps'] for e in stress_ts]
 
-    def _plot_throughput(ax):
+    def _plot_dl_throughput(ax):
         if _stress_dl_vals:
             ax.fill_between(_stress_tp_elapsed, _stress_dl_vals, alpha=0.3, color='blue', label='DL')
             ax.plot(_stress_tp_elapsed, _stress_dl_vals, 'b:', marker='.', markersize=3, lw=1.0)
-        if _stress_ul_vals:
-            ax.fill_between(_stress_tp_elapsed, _stress_ul_vals, alpha=0.2, color='orange', label='UL')
-            ax.plot(_stress_tp_elapsed, _stress_ul_vals, color='orange', linestyle=':', marker='.', markersize=3, lw=1.0)
-        ax.set_ylabel("Throughput (Mbps)")
-        if _stress_dl_vals or _stress_ul_vals:
+        ax.set_ylabel("DL Throughput (Mbps)")
+        if _stress_dl_vals:
             ax.legend(loc='upper right', fontsize=8)
-        # X-axis: only elapsed seconds, start time in xlabel
         if _stress_tp_elapsed:
             step = max(1, len(_stress_tp_elapsed) // 10)
             tick_idx = [i for i in range(len(_stress_tp_elapsed)) if i % step == 0]
@@ -2894,31 +2893,84 @@ def generate_full_plot(baseline_ts, stress_ts, owd_results=None, twamp_results=N
                 rotation=0, ha='center', fontsize=7)
         start_time = _stress_tp_labels[0] if _stress_tp_labels else ''
         ax.set_xlabel(f"Elapsed (s)  [start: {start_time}]")
-        # Stats
         dl_vals = [v for v in _stress_dl_vals if v > 0]
-        ul_vals = [v for v in _stress_ul_vals if v > 0]
-        txt = ""
         if dl_vals:
-            txt += _stats_annotation("DL", _quick_stats(dl_vals), "Mbps") + "\n"
-        if ul_vals:
-            txt += _stats_annotation("UL", _quick_stats(ul_vals), "Mbps")
-        if txt:
-            ax.text(0.02, 0.95, txt.strip(), transform=ax.transAxes, fontsize=7,
+            txt = _stats_annotation("DL", _quick_stats(dl_vals), "Mbps")
+            ax.text(0.02, 0.95, txt, transform=ax.transAxes, fontsize=7,
                     fontfamily='monospace', va='top',
                     bbox=dict(facecolor='white', alpha=0.8))
 
-    panels.append(("Throughput (Stress Phase)", _plot_throughput))
+    panels.append(("DL Throughput (Stress Phase)", _plot_dl_throughput))
 
-    # --- Panel: Rate Monitor (if available) ---
+    # --- Panel 3: Upload Throughput over time ---
+    def _plot_ul_throughput(ax):
+        if _stress_ul_vals:
+            ax.fill_between(_stress_tp_elapsed, _stress_ul_vals, alpha=0.2, color='orange', label='UL')
+            ax.plot(_stress_tp_elapsed, _stress_ul_vals, color='orange', linestyle=':', marker='.', markersize=3, lw=1.0)
+        ax.set_ylabel("UL Throughput (Mbps)")
+        if _stress_ul_vals:
+            ax.legend(loc='upper right', fontsize=8)
+        if _stress_tp_elapsed:
+            step = max(1, len(_stress_tp_elapsed) // 10)
+            tick_idx = [i for i in range(len(_stress_tp_elapsed)) if i % step == 0]
+            if len(_stress_tp_elapsed) - 1 not in tick_idx:
+                tick_idx.append(len(_stress_tp_elapsed) - 1)
+            ax.set_xticks([_stress_tp_elapsed[i] for i in tick_idx])
+            ax.set_xticklabels(
+                [f"{_stress_tp_elapsed[i]:.0f}s" for i in tick_idx],
+                rotation=0, ha='center', fontsize=7)
+        start_time = _stress_tp_labels[0] if _stress_tp_labels else ''
+        ax.set_xlabel(f"Elapsed (s)  [start: {start_time}]")
+        ul_vals = [v for v in _stress_ul_vals if v > 0]
+        if ul_vals:
+            txt = _stats_annotation("UL", _quick_stats(ul_vals), "Mbps")
+            ax.text(0.02, 0.95, txt, transform=ax.transAxes, fontsize=7,
+                    fontfamily='monospace', va='top',
+                    bbox=dict(facecolor='white', alpha=0.8))
+
+    panels.append(("UL Throughput (Stress Phase)", _plot_ul_throughput))
+
+    # --- Panel: Rate Monitor TX (if available) ---
     if iftop_data:
         _iftop_elapsed = [r['elapsed'] for r in iftop_data]
         _iftop_tx = [r['tx_mbps'] for r in iftop_data]
         _iftop_rx = [r['rx_mbps'] for r in iftop_data]
 
-        def _plot_iftop(ax):
+        def _plot_iftop_tx(ax):
             if _iftop_tx:
+                ax.fill_between(_iftop_elapsed, _iftop_tx, alpha=0.2, color='blue')
                 ax.plot(_iftop_elapsed, _iftop_tx, 'b-', lw=1.2, alpha=0.8, label='TX (send)')
+            # Threshold line
+            ax.axhline(y=RATEMON_DROP_THRESHOLD_MBPS, color='red', linestyle='--',
+                       lw=1.0, alpha=0.6, label=f'Threshold ({RATEMON_DROP_THRESHOLD_MBPS} Mbps)')
+            # Restart markers
+            if restart_events:
+                for ev in restart_events:
+                    ax.axvline(x=ev['elapsed'], color='red', linestyle='--',
+                               lw=1.5, alpha=0.7)
+                    ts_label = ev.get('timestamp', '')
+                    if ts_label:
+                        ax.text(ev['elapsed'], ax.get_ylim()[1] * 0.95, ts_label,
+                                color='red', fontsize=7, rotation=90,
+                                va='top', ha='right', alpha=0.85)
+                ax.axvline(x=restart_events[0]['elapsed'], color='red', linestyle='--',
+                           lw=0.001, alpha=0, label=f'Restart ({len(restart_events)}x)')
+            ax.set_ylabel("TX Rate (Mbps)")
+            ax.set_xlabel("Elapsed (s)")
+            ax.legend(loc='upper right', fontsize=7)
+            tx_v = [v for v in _iftop_tx if v is not None]
+            if tx_v:
+                txt = _stats_annotation("TX", _quick_stats(tx_v), "Mbps")
+                ax.text(0.02, 0.95, txt, transform=ax.transAxes, fontsize=7,
+                        fontfamily='monospace', va='top',
+                        bbox=dict(facecolor='white', alpha=0.8))
+
+        panels.append(("Rate Monitor \u2014 TX (send)", _plot_iftop_tx))
+
+        # --- Panel: Rate Monitor RX ---
+        def _plot_iftop_rx(ax):
             if _iftop_rx:
+                ax.fill_between(_iftop_elapsed, _iftop_rx, alpha=0.2, color='orange')
                 ax.plot(_iftop_elapsed, _iftop_rx, color='orange', lw=1.2, alpha=0.8, label='RX (recv)')
             # Threshold line
             ax.axhline(y=RATEMON_DROP_THRESHOLD_MBPS, color='red', linestyle='--',
@@ -2933,26 +2985,19 @@ def generate_full_plot(baseline_ts, stress_ts, owd_results=None, twamp_results=N
                         ax.text(ev['elapsed'], ax.get_ylim()[1] * 0.95, ts_label,
                                 color='red', fontsize=7, rotation=90,
                                 va='top', ha='right', alpha=0.85)
-                # Label only the first one to avoid legend clutter
                 ax.axvline(x=restart_events[0]['elapsed'], color='red', linestyle='--',
                            lw=0.001, alpha=0, label=f'Restart ({len(restart_events)}x)')
-            ax.set_ylabel("Rate (Mbps)")
+            ax.set_ylabel("RX Rate (Mbps)")
             ax.set_xlabel("Elapsed (s)")
             ax.legend(loc='upper right', fontsize=7)
-            # Stats
-            tx_v = [v for v in _iftop_tx if v is not None]
             rx_v = [v for v in _iftop_rx if v is not None]
-            txt = ""
-            if tx_v:
-                txt += _stats_annotation("TX", _quick_stats(tx_v), "Mbps") + "\n"
             if rx_v:
-                txt += _stats_annotation("RX", _quick_stats(rx_v), "Mbps")
-            if txt:
-                ax.text(0.02, 0.95, txt.strip(), transform=ax.transAxes, fontsize=7,
+                txt = _stats_annotation("RX", _quick_stats(rx_v), "Mbps")
+                ax.text(0.02, 0.95, txt, transform=ax.transAxes, fontsize=7,
                         fontfamily='monospace', va='top',
                         bbox=dict(facecolor='white', alpha=0.8))
 
-        panels.append(("Rate Monitor", _plot_iftop))
+        panels.append(("Rate Monitor \u2014 RX (recv)", _plot_iftop_rx))
 
     # Draw restart markers on RTT and Throughput panels if restart_events exist
     if restart_events:
@@ -2969,9 +3014,9 @@ def generate_full_plot(baseline_ts, stress_ts, owd_results=None, twamp_results=N
         # Replace the RTT panel entry
         panels[0] = (panels[0][0], _plot_rtt_with_markers)
 
-        _orig_plot_tp = _plot_throughput
-        def _plot_tp_with_markers(ax):
-            _orig_plot_tp(ax)
+        _orig_plot_dl = _plot_dl_throughput
+        def _plot_dl_with_markers(ax):
+            _orig_plot_dl(ax)
             for ev in restart_events:
                 ax.axvline(x=ev['elapsed'], color='red', linestyle='--', lw=1.0, alpha=0.5)
                 ts_label = ev.get('timestamp', '')
@@ -2979,7 +3024,19 @@ def generate_full_plot(baseline_ts, stress_ts, owd_results=None, twamp_results=N
                     ax.text(ev['elapsed'], ax.get_ylim()[1] * 0.95, ts_label,
                             color='red', fontsize=7, rotation=90,
                             va='top', ha='right', alpha=0.85)
-        panels[1] = (panels[1][0], _plot_tp_with_markers)
+        panels[1] = (panels[1][0], _plot_dl_with_markers)
+
+        _orig_plot_ul = _plot_ul_throughput
+        def _plot_ul_with_markers(ax):
+            _orig_plot_ul(ax)
+            for ev in restart_events:
+                ax.axvline(x=ev['elapsed'], color='red', linestyle='--', lw=1.0, alpha=0.5)
+                ts_label = ev.get('timestamp', '')
+                if ts_label:
+                    ax.text(ev['elapsed'], ax.get_ylim()[1] * 0.95, ts_label,
+                            color='red', fontsize=7, rotation=90,
+                            va='top', ha='right', alpha=0.85)
+        panels[2] = (panels[2][0], _plot_ul_with_markers)
 
     # --- Panel 3: OWD if available ---
     if owd_results:
